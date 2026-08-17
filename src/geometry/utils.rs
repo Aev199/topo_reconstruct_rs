@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use glam::DVec3;
 use hashbrown::HashMap;
 
@@ -13,7 +15,7 @@ pub fn canonicalize_nodes(nodes: &HashMap<u32, DVec3>, precision: u32) -> HashMa
             (pt.y * factor).round() as i64,
             (pt.z * factor).round() as i64,
         );
-        let &canon_id = coord_map.entry(key).or_insert(nid);
+        let canon_id = *coord_map.entry(key).or_insert(nid);
         canonical_map.insert(nid, canon_id);
     }
     canonical_map

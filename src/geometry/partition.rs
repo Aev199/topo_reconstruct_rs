@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use crate::models::ElementData;
 use glam::DVec3;
 use hashbrown::HashMap;
