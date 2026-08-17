@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_imports, unused_variables, unused_assignments)]
 
 use crate::config::ReconstructionConfig;
+use crate::geometry::partition::extract_cutting_edge_nodes_for_slab;
 use crate::geometry::utils::{clean_polygon_coords_3d, get_plane_basis};
 use crate::models::{ElementData, MacroPanel, MeshData, PanelType};
 use glam::DVec3;
@@ -17,7 +18,7 @@ struct ParsedShell {
     normal: DVec3,
     d: f64,
     centroid: DVec3,
-    ordered_nodes: Vec<u32>,
+    unique_nodes: Vec<u32>,
 }
 
 struct PlaneCluster {
@@ -30,7 +31,7 @@ struct PlaneCluster {
 }
 
 impl PanelReconstructor {
-    /// Высокоскоростная параллельная реконструкция плит и стен за O(N)
+    /// Высокоскоростная параллельная реконструкция плит и стен с единым базисом плоскости
     pub fn reconstruct(
         mesh_data: &MeshData,
         canonical_nodes: &HashMap<u32, u32>,
@@ -42,7 +43,7 @@ impl PanelReconstructor {
             .filter(|e| e.nodes.len() >= 3)
             .collect();
 
-        // 1. Парсинг и локальная CCW-сортировка узлов каждого КЭ вокруг СОБСТВЕННОГО центроида
+        // 1. Первичный парсинг элементов и определение их ориентации
         let parsed_shells: Vec<ParsedShell> = shell_elems
             .into_iter()
             .filter_map(|el| {
@@ -67,8 +68,7 @@ impl PanelReconstructor {
                     return None;
                 }
 
-                // Собственный центроид данного элемента
-                let elem_centroid = pts.iter().copied().sum::<DVec3>() / (pts.len() as f64);
+                let centroid = pts.iter().copied().sum::<DVec3>() / (pts.len() as f64);
                 let v1 = pts[1] - pts[0];
                 let v2 = pts[2] - pts[0];
                 let mut norm = v1.cross(v2);
@@ -86,40 +86,22 @@ impl PanelReconstructor {
 
                 norm /= n_len;
 
-                // Каноническая ориентация нормали
-                if norm.x.abs() > 1e-4 {
-                    if norm.x < 0.0 { norm = -norm; }
-                } else if norm.y.abs() > 1e-4 {
-                    if norm.y < 0.0 { norm = -norm; }
-                } else if norm.z < 0.0 {
-                    norm = -norm;
+                // Для плит нормаль строго +Z
+                if norm.z.abs() > 0.85 {
+                    norm = DVec3::new(0.0, 0.0, 1.0);
+                } else if norm.z < -0.85 {
+                    norm = DVec3::new(0.0, 0.0, 1.0);
                 }
 
-                let d = -norm.dot(elem_centroid);
-                let (u_axis, v_axis) = get_plane_basis(norm);
-
-                // Сортировка узлов строго вокруг СОБСТВЕННОГО центра КЭ
-                let mut angle_nodes: Vec<(f64, u32)> = pts
-                    .iter()
-                    .zip(unique_nodes)
-                    .map(|(&p, nid)| {
-                        let rel = p - elem_centroid;
-                        let u = rel.dot(u_axis);
-                        let v = rel.dot(v_axis);
-                        (v.atan2(u), nid)
-                    })
-                    .collect();
-
-                angle_nodes.sort_by(|a, b| a.0.total_cmp(&b.0));
-                let ordered_nodes: Vec<u32> = angle_nodes.into_iter().map(|(_, nid)| nid).collect();
+                let d = -norm.dot(centroid);
 
                 Some(ParsedShell {
                     id: el.id,
                     stiff_id: el.stiff_id,
                     normal: norm,
                     d,
-                    centroid: elem_centroid,
-                    ordered_nodes,
+                    centroid,
+                    unique_nodes,
                 })
             })
             .collect();
@@ -158,39 +140,102 @@ impl PanelReconstructor {
             if let Some(idx) = matched_idx {
                 clusters[idx].elements.push(el);
             } else {
+                let cluster_norm = if is_horiz {
+                    DVec3::new(0.0, 0.0, 1.0)
+                } else if is_vert {
+                    let n2d = el.normal.truncate().normalize();
+                    DVec3::new(n2d.x, n2d.y, 0.0)
+                } else {
+                    el.normal
+                };
+
                 clusters.push(PlaneCluster {
                     is_horiz,
                     is_vert,
                     z: if is_horiz { Some(el.centroid.z) } else { None },
-                    normal: el.normal,
+                    normal: cluster_norm,
                     d: el.d,
                     elements: vec![el],
                 });
             }
         }
 
-        // 3. Параллельное извлечение макропанелей через Half-Edges (Rayon)
+        // 3. Параллельная реконструкция кластеров (Rayon)
         let panels_results: Vec<Vec<MacroPanel>> = clusters
             .into_par_iter()
             .enumerate()
             .map(|(cl_idx, cl)| {
-                let norm = cl.normal;
-                let elem_by_id: HashMap<u32, &ParsedShell> = cl.elements.iter().map(|e| (e.id, e)).collect();
+                let cluster_norm = cl.normal;
+                let (u_axis, v_axis) = get_plane_basis(cluster_norm);
+
+                // Извлечение режущих ребер для плит
+                let cutting_edges = if cl.is_horiz {
+                    extract_cutting_edge_nodes_for_slab(
+                        &mesh_data.elements,
+                        &mesh_data.nodes,
+                        canonical_nodes,
+                        cl.z.unwrap_or(0.0),
+                        config.tol_dist,
+                        config.split_slabs_by_walls,
+                        config.split_slabs_by_beams,
+                    )
+                } else {
+                    HashSet::new()
+                };
+
+                // Упорядочивание узлов каждого КЭ в ЕДИНОМ базисе плоскости кластера
+                let ordered_elements: Vec<(u32, u32, Vec<u32>)> = cl
+                    .elements
+                    .iter()
+                    .map(|el| {
+                        let pts: Vec<DVec3> = el
+                            .unique_nodes
+                            .iter()
+                            .filter_map(|cid| mesh_data.nodes.get(cid).copied())
+                            .collect();
+
+                        let elem_centroid = el.centroid;
+
+                        let mut angle_nodes: Vec<(f64, u32)> = pts
+                            .iter()
+                            .zip(&el.unique_nodes)
+                            .map(|(&p, &nid)| {
+                                let rel = p - elem_centroid;
+                                let u = rel.dot(u_axis);
+                                let v = rel.dot(v_axis);
+                                (v.atan2(u), nid)
+                            })
+                            .collect();
+
+                        angle_nodes.sort_by(|a, b| a.0.total_cmp(&b.0));
+                        let ordered_nodes: Vec<u32> = angle_nodes.into_iter().map(|(_, nid)| nid).collect();
+
+                        (el.id, el.stiff_id, ordered_nodes)
+                    })
+                    .collect();
+
+                let elem_by_id: HashMap<u32, &(u32, u32, Vec<u32>)> =
+                    ordered_elements.iter().map(|e| (e.0, e)).collect();
 
                 // Построение графа смежности КЭ
                 let mut edge_to_elems: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
-                for el in &cl.elements {
-                    let n_len = el.ordered_nodes.len();
+                for &(elem_id, _, ref nodes) in &ordered_elements {
+                    let n_len = nodes.len();
                     for i in 0..n_len {
-                        let a = el.ordered_nodes[i];
-                        let b = el.ordered_nodes[(i + 1) % n_len];
+                        let a = nodes[i];
+                        let b = nodes[(i + 1) % n_len];
                         let edge = if a < b { (a, b) } else { (b, a) };
-                        edge_to_elems.entry(edge).or_default().push(el.id);
+                        edge_to_elems.entry(edge).or_default().push(elem_id);
                     }
                 }
 
                 let mut elem_adj: HashMap<u32, Vec<u32>> = HashMap::new();
-                for e_ids in edge_to_elems.values() {
+                for (&edge, e_ids) in &edge_to_elems {
+                    // Если ребро является режущим — не объединяем элементы через него
+                    if cutting_edges.contains(&edge) {
+                        continue;
+                    }
+
                     if e_ids.len() > 1 {
                         for i in 0..e_ids.len() {
                             for j in (i + 1)..e_ids.len() {
@@ -206,20 +251,20 @@ impl PanelReconstructor {
                 let mut local_panels = Vec::new();
                 let mut sub_id = 1;
 
-                for start_el in &cl.elements {
-                    if visited_elems.contains(&start_el.id) {
+                for &(start_id, _, _) in &ordered_elements {
+                    if visited_elems.contains(&start_id) {
                         continue;
                     }
 
                     let mut comp_elems = Vec::new();
                     let mut queue = VecDeque::new();
 
-                    queue.push_back(start_el.id);
-                    visited_elems.insert(start_el.id);
+                    queue.push_back(start_id);
+                    visited_elems.insert(start_id);
 
                     while let Some(curr_id) = queue.pop_front() {
-                        if let Some(&el) = elem_by_id.get(&curr_id) {
-                            comp_elems.push(el);
+                        if let Some(&el_tuple) = elem_by_id.get(&curr_id) {
+                            comp_elems.push(el_tuple);
                             if let Some(neighbors) = elem_adj.get(&curr_id) {
                                 for &nbr in neighbors {
                                     if visited_elems.insert(nbr) {
@@ -230,8 +275,14 @@ impl PanelReconstructor {
                         }
                     }
 
-                    // 4. Трассировка контуров через Half-Edges для компоненты
-                    let polygons = Self::extract_cycles_from_elements(&comp_elems, mesh_data);
+                    // 4. Трассировка контуров через Half-Edges
+                    let polygons = Self::extract_cycles_from_elements(
+                        &comp_elems,
+                        mesh_data,
+                        u_axis,
+                        v_axis,
+                    );
+
                     if polygons.is_empty() {
                         continue;
                     }
@@ -247,8 +298,8 @@ impl PanelReconstructor {
                     local_panels.push(MacroPanel {
                         id: (cl_idx * 1000 + sub_id) as u32,
                         panel_type,
-                        stiffness_id: comp_elems[0].stiff_id,
-                        plane_normal: [norm.x, norm.y, norm.z],
+                        stiffness_id: comp_elems[0].1,
+                        plane_normal: [cluster_norm.x, cluster_norm.y, cluster_norm.z],
                         plane_d: cl.d,
                         polygons,
                         fe_count: comp_elems.len(),
@@ -266,21 +317,23 @@ impl PanelReconstructor {
 
     /// Трассировка замкнутых циклов (периметр и проемы) по направленным полуребрам за O(N)
     fn extract_cycles_from_elements(
-        elements: &[&ParsedShell],
+        elements: &[&(u32, u32, Vec<u32>)],
         mesh_data: &MeshData,
+        u_axis: DVec3,
+        v_axis: DVec3,
     ) -> Vec<Vec<[f64; 3]>> {
         // Подсчет направленных полуребер
         let mut dir_edge_count: HashMap<(u32, u32), u32> = HashMap::new();
-        for el in elements {
-            let n_len = el.ordered_nodes.len();
+        for (_, _, nodes) in elements {
+            let n_len = nodes.len();
             for i in 0..n_len {
-                let u = el.ordered_nodes[i];
-                let v = el.ordered_nodes[(i + 1) % n_len];
+                let u = nodes[i];
+                let v = nodes[(i + 1) % n_len];
                 *dir_edge_count.entry((u, v)).or_insert(0) += 1;
             }
         }
 
-        // Фильтрация граничных полуребер (отсутствует противоположное ребро)
+        // Граничные полуребра (нет противоположного B -> A)
         let mut out_edges: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut boundary_edges = Vec::new();
         for (&(u, v), &count) in &dir_edge_count {
@@ -338,10 +391,25 @@ impl PanelReconstructor {
                     .filter_map(|nid| mesh_data.nodes.get(nid).copied())
                     .collect();
 
-                // Удаление промежуточных коллинеарных вершин
-                let clean_3d = clean_polygon_coords_3d(&raw_3d, 0.9995);
-                if clean_3d.len() >= 3 {
-                    result_polygons.push(clean_3d.into_iter().map(|p| [p.x, p.y, p.z]).collect());
+                // Вычисление площади для фильтрации вырожденных микропетель
+                let mut area_2d = 0.0;
+                let n_pts = raw_3d.len();
+                for i in 0..n_pts {
+                    let p1 = raw_3d[i];
+                    let p2 = raw_3d[(i + 1) % n_pts];
+                    let x1 = p1.dot(u_axis);
+                    let y1 = p1.dot(v_axis);
+                    let x2 = p2.dot(u_axis);
+                    let y2 = p2.dot(v_axis);
+                    area_2d += (x1 * y2) - (x2 * y1);
+                }
+                area_2d = (area_2d * 0.5).abs();
+
+                if area_2d > 0.05 {
+                    let clean_3d = clean_polygon_coords_3d(&raw_3d, 0.9995);
+                    if clean_3d.len() >= 3 {
+                        result_polygons.push(clean_3d.into_iter().map(|p| [p.x, p.y, p.z]).collect());
+                    }
                 }
             }
         }

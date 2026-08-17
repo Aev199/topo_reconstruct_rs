@@ -1,11 +1,11 @@
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports, unused_variables)]
 
 use crate::models::ElementData;
 use glam::DVec3;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
-/// Извлечение 3D-отрезков ребер стен и балок, лежащих на высотной отметке перекрытия Z
-pub fn extract_cutting_segments_for_slab(
+/// Извлечение пар канонических узлов (ребер) стен и балок на отметке перекрытия Z
+pub fn extract_cutting_edge_nodes_for_slab(
     elements: &[ElementData],
     nodes: &HashMap<u32, DVec3>,
     canonical_nodes: &HashMap<u32, u32>,
@@ -13,8 +13,8 @@ pub fn extract_cutting_segments_for_slab(
     tol_dist: f64,
     split_by_walls: bool,
     split_by_beams: bool,
-) -> Vec<(DVec3, DVec3)> {
-    let mut cutting_segments = Vec::new();
+) -> HashSet<(u32, u32)> {
+    let mut cutting_edges = HashSet::new();
 
     // 1. Ребра стен на отметке плиты
     if split_by_walls {
@@ -39,39 +39,35 @@ pub fn extract_cutting_segments_for_slab(
                 continue;
             }
 
-            let n_len = pts.len();
+            let n_len = el.nodes.len();
             for i in 0..n_len {
-                let p_a = pts[i];
-                let p_b = pts[(i + 1) % n_len];
+                let n_a = canonical_nodes.get(&el.nodes[i]).copied().unwrap_or(el.nodes[i]);
+                let n_b = canonical_nodes.get(&el.nodes[(i + 1) % n_len]).copied().unwrap_or(el.nodes[(i + 1) % n_len]);
 
-                if (p_a.z - z_slab).abs() < tol_dist && (p_b.z - z_slab).abs() < tol_dist {
-                    if (p_b - p_a).length_squared() > 1e-6 {
-                        cutting_segments.push((p_a, p_b));
+                if let (Some(pa), Some(pb)) = (nodes.get(&n_a), nodes.get(&n_b)) {
+                    if (pa.z - z_slab).abs() < tol_dist && (pb.z - z_slab).abs() < tol_dist {
+                        let edge = if n_a < n_b { (n_a, n_b) } else { (n_b, n_a) };
+                        cutting_edges.insert(edge);
                     }
                 }
             }
         }
     }
 
-    // 2. Оси балок на отметке плиты
+    // 2. Ребра балок на отметке плиты
     if split_by_beams {
         for el in elements.iter().filter(|e| e.nodes.len() == 2) {
-            let p_a = canonical_nodes
-                .get(&el.nodes[0])
-                .and_then(|cid| nodes.get(cid).copied());
-            let p_b = canonical_nodes
-                .get(&el.nodes[1])
-                .and_then(|cid| nodes.get(cid).copied());
+            let n_a = canonical_nodes.get(&el.nodes[0]).copied().unwrap_or(el.nodes[0]);
+            let n_b = canonical_nodes.get(&el.nodes[1]).copied().unwrap_or(el.nodes[1]);
 
-            if let (Some(pa), Some(pb)) = (p_a, p_b) {
+            if let (Some(pa), Some(pb)) = (nodes.get(&n_a), nodes.get(&n_b)) {
                 if (pa.z - z_slab).abs() < tol_dist && (pb.z - z_slab).abs() < tol_dist {
-                    if (pb - pa).length_squared() > 1e-6 {
-                        cutting_segments.push((pa, pb));
-                    }
+                    let edge = if n_a < n_b { (n_a, n_b) } else { (n_b, n_a) };
+                    cutting_edges.insert(edge);
                 }
             }
         }
     }
 
-    cutting_segments
+    cutting_edges
 }
