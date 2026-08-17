@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod config;
+mod geometry;
 mod models;
 mod parsers;
 
@@ -49,6 +50,15 @@ fn main() {
             );
             println!("   -> Узлов: {}", mesh_data.nodes.len());
             println!("   -> Конечных элементов: {}", mesh_data.elements.len());
+
+            // 2. Тест канонизации узлов
+            let canon_start = Instant::now();
+            let canonical_map = geometry::canonicalize_nodes(&mesh_data.nodes, config.canonical_precision);
+            println!(
+                "   [OK] Канонизация узлов выполнена за {:.2?}: сшито {} узлов",
+                canon_start.elapsed(),
+                canonical_map.len()
+            );
         }
         Err(e) => {
             eprintln!("   [ERROR] Ошибка при чтении файла: {}", e);
