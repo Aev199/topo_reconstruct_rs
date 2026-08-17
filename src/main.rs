@@ -1,13 +1,17 @@
 #![allow(dead_code, unused_imports, unused_variables)]
 
 mod config;
+mod exporters;
 mod geometry;
 mod models;
 mod parsers;
+mod reconstructors;
 
 use clap::Parser;
 use config::ReconstructionConfig;
+use exporters::{DxfExporter, JsonExporter};
 use parsers::LiraParser;
+use reconstructors::TopologyPipeline;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
@@ -32,37 +36,60 @@ fn main() {
 
     println!("=== RECONSTRUCT TOPOLOGY CORE (RUST) ===");
     println!("Входной файл: {}", args.input);
-    println!(
-        "Допуск по высоте: {} м, Допуск упрощения: {} м",
-        config.tol_dist, config.simplify_tol
-    );
 
-    // 1. Замер скорости параллельного парсинга
-    println!("\n1. Чтение и парсинг расчетной схемы...");
+    let total_start = Instant::now();
+
+    // 1. Чтение и парсинг
+    println!("\n1. Чтение и параллельный парсинг расчетной схемы...");
     let parse_start = Instant::now();
-
-    match LiraParser::parse(&args.input) {
-        Ok(mesh_data) => {
-            let parse_elapsed = parse_start.elapsed();
+    let mesh_data = match LiraParser::parse(&args.input) {
+        Ok(data) => {
             println!(
-                "   [OK] Схема успешно загружена за {:.2?}:",
-                parse_elapsed
+                "   [OK] Загружено за {:.2?}: {} узлов, {} КЭ",
+                parse_start.elapsed(),
+                mesh_data.nodes.len(),
+                mesh_data.elements.len()
             );
-            println!("   -> Узлов: {}", mesh_data.nodes.len());
-            println!("   -> Конечных элементов: {}", mesh_data.elements.len());
-
-            // 2. Тест канонизации узлов
-            let canon_start = Instant::now();
-            let canonical_map = geometry::utils::canonicalize_nodes(&mesh_data.nodes, config.canonical_precision);
-            println!(
-                "   [OK] Канонизация узлов выполнена за {:.2?}: сшито {} узлов",
-                canon_start.elapsed(),
-                canonical_map.len()
-            );
+            data
         }
         Err(e) => {
             eprintln!("   [ERROR] Ошибка при чтении файла: {}", e);
             std::process::exit(1);
         }
+    };
+
+    // 2. Реконструкция топологии
+    println!("\n2. Параллельная реконструкция макроэлементов (Rayon)...");
+    let recon_start = Instant::now();
+    let pipeline = TopologyPipeline::new(&mesh_data, &config);
+    let report = pipeline.run();
+    println!("   [OK] Реконструкция завершена за {:.2?}", recon_start.elapsed());
+
+    println!("\n--- РЕЗУЛЬТАТЫ РЕКОНСТРУКЦИИ ---");
+    println!("   Плит перекрытий (Slabs):   {}", report.slabs_count);
+    println!("   Стен / пилонов (Walls):     {}", report.walls_count);
+    println!("   Наклонных панелей:          {}", report.inclined_panels_count);
+    println!("   Колонн (Columns):           {}", report.columns_count);
+    println!("   Балок (Beams):              {}", report.beams_count);
+    println!("   Связей / Раскосов (Braces): {}", report.braces_count);
+
+    // 3. Экспорт
+    println!("\n3. Экспорт результатов...");
+    let exp_start = Instant::now();
+    if let Err(e) = JsonExporter::export(&report, &args.json) {
+        eprintln!("   [ERROR] Ошибка экспорта JSON: {}", e);
+    } else {
+        println!("   [OK] JSON сохранен: {}", args.json);
     }
+
+    if let Err(e) = DxfExporter::export(&report, &args.dxf) {
+        eprintln!("   [ERROR] Ошибка экспорта DXF: {}", e);
+    } else {
+        println!("   [OK] CAD DXF сохранен: {}", args.dxf);
+    }
+    println!("   Экспорт выполнен за {:.2?}", exp_start.elapsed());
+
+    println!("\n==========================================");
+    println!("ИТОГОВОЕ ВРЕМЯ ВЫПОЛНЕНИЯ: {:.2?}", total_start.elapsed());
+    println!("==========================================");
 }
