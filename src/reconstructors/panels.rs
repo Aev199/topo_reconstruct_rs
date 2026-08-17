@@ -99,13 +99,12 @@ impl PanelReconstructor {
             let is_horiz = nz.abs() > 0.85;
             let is_vert = nz.abs() < 0.15;
 
-            let mut matched = false;
-            for cl in &mut clusters {
+            let mut matched_idx = None;
+            for (idx, cl) in clusters.iter().enumerate() {
                 if is_horiz && cl.is_horiz {
                     if let Some(cl_z) = cl.z {
                         if (el.centroid.z - cl_z).abs() < config.tol_dist {
-                            cl.elements.push(el);
-                            matched = true;
+                            matched_idx = Some(idx);
                             break;
                         }
                     }
@@ -113,20 +112,20 @@ impl PanelReconstructor {
                     let n2d_el = el.normal.truncate().normalize();
                     let n2d_cl = cl.normal.truncate().normalize();
                     if n2d_el.dot(n2d_cl) > 0.98 && (el.d - cl.d).abs() < config.tol_dist {
-                        cl.elements.push(el);
-                        matched = true;
+                        matched_idx = Some(idx);
                         break;
                     }
                 } else if !is_horiz && !is_vert && !cl.is_horiz && !cl.is_vert {
                     if el.normal.dot(cl.normal) > 0.98 && (el.d - cl.d).abs() < config.tol_dist {
-                        cl.elements.push(el);
-                        matched = true;
+                        matched_idx = Some(idx);
                         break;
                     }
                 }
             }
 
-            if !matched {
+            if let Some(idx) = matched_idx {
+                clusters[idx].elements.push(el);
+            } else {
                 clusters.push(PlaneCluster {
                     is_horiz,
                     is_vert,
