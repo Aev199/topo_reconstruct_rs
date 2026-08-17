@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports, unused_variables, unused_assignments)]
+
 use crate::config::ReconstructionConfig;
 use crate::geometry::utils::{clean_polygon_coords_3d, get_plane_basis};
 use crate::models::{ElementData, MacroPanel, MeshData, PanelType};
@@ -302,30 +304,28 @@ impl PanelReconstructor {
             }
 
             let mut cycle = vec![start_u];
-            let mut curr_u = start_u;
-            let mut curr_v = start_v;
-            visited_half_edges.insert((curr_u, curr_v));
+            let mut curr = start_v;
+            visited_half_edges.insert((start_u, start_v));
 
             let mut closed = false;
-            while let Some(neighbors) = out_edges.get(&curr_v) {
-                cycle.push(curr_v);
-                if curr_v == start_u {
+            while let Some(neighbors) = out_edges.get(&curr) {
+                cycle.push(curr);
+                if curr == start_u {
                     closed = true;
                     break;
                 }
 
                 let mut next_node = None;
                 for &nxt in neighbors {
-                    if !visited_half_edges.contains(&(curr_v, nxt)) {
+                    if !visited_half_edges.contains(&(curr, nxt)) {
                         next_node = Some(nxt);
                         break;
                     }
                 }
 
                 if let Some(nxt) = next_node {
-                    visited_half_edges.insert((curr_v, nxt));
-                    curr_u = curr_v;
-                    curr_v = nxt;
+                    visited_half_edges.insert((curr, nxt));
+                    curr = nxt;
                 } else {
                     break;
                 }
