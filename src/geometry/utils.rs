@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports, unused_variables)]
 
 use glam::DVec3;
 use hashbrown::HashMap;
@@ -31,6 +31,69 @@ pub fn get_plane_basis(normal: DVec3) -> (DVec3, DVec3) {
     };
     let v = norm.cross(u).normalize();
     (u, v)
+}
+
+/// Проекция 2D-точки P на отрезок AB с возвратом спроецированной точки и расстояния
+pub fn project_point_to_segment_2d(p: DVec3, a: DVec3, b: DVec3) -> (DVec3, f64) {
+    let ab = DVec3::new(b.x - a.x, b.y - a.y, 0.0);
+    let len_sq = ab.length_squared();
+    if len_sq < 1e-8 {
+        let d = (DVec3::new(p.x, p.y, 0.0) - DVec3::new(a.x, a.y, 0.0)).length();
+        return (DVec3::new(a.x, a.y, p.z), d);
+    }
+    let ap = DVec3::new(p.x - a.x, p.y - a.y, 0.0);
+    let t = (ap.dot(ab) / len_sq).clamp(0.0, 1.0);
+    let proj_2d = DVec3::new(a.x + t * ab.x, a.y + t * ab.y, p.z);
+    let dist = (DVec3::new(p.x, p.y, 0.0) - DVec3::new(proj_2d.x, proj_2d.y, 0.0)).length();
+    (proj_2d, dist)
+}
+
+/// Дотягивание (snapping) вершин контура плиты до опорных линий стен
+pub fn snap_loop_to_wall_lines(
+    loop_pts: &[DVec3],
+    wall_segments: &[(DVec3, DVec3)],
+    snap_tol: f64,
+) -> Vec<DVec3> {
+    if loop_pts.is_empty() || wall_segments.is_empty() {
+        return loop_pts.to_vec();
+    }
+
+    let mut snapped = Vec::with_capacity(loop_pts.len());
+    for &pt in loop_pts {
+        let mut best_pt = pt;
+        let mut min_dist = snap_tol;
+
+        for &(w_a, w_b) in wall_segments {
+            let (proj, dist) = project_point_to_segment_2d(pt, w_a, w_b);
+            if dist < min_dist {
+                min_dist = dist;
+                best_pt = proj;
+            }
+        }
+        snapped.push(best_pt);
+    }
+    snapped
+}
+
+/// Удаление паразитных микросегментов (длиной < min_len)
+pub fn remove_short_edges_3d(pts: &[DVec3], min_len: f64) -> Vec<DVec3> {
+    if pts.len() < 3 {
+        return pts.to_vec();
+    }
+    let mut result = Vec::with_capacity(pts.len());
+    let n = pts.len();
+    for i in 0..n {
+        let p_curr = pts[i];
+        let p_next = pts[(i + 1) % n];
+        if (p_next - p_curr).length() >= min_len {
+            result.push(p_curr);
+        }
+    }
+    if result.len() >= 3 {
+        result
+    } else {
+        pts.to_vec()
+    }
 }
 
 /// Удаление промежуточных коллинеарных узлов КЭ на прямых гранях в 3D
@@ -68,7 +131,6 @@ pub fn clean_polygon_coords_3d(pts: &[DVec3], tol_collinear: f64) -> Vec<DVec3> 
             // Если векторы сонаправлены (скалярное произведение близко к 1.0) — точка на прямой
             if d1.dot(d2) > tol_collinear {
                 changed = true;
-                // Пропускаем p_curr
             } else {
                 next_pts.push(p_curr);
             }

@@ -2,7 +2,9 @@
 
 use crate::config::ReconstructionConfig;
 use crate::geometry::partition::extract_cutting_edge_nodes_for_slab;
-use crate::geometry::utils::{clean_polygon_coords_3d, get_plane_basis};
+use crate::geometry::utils::{
+    clean_polygon_coords_3d, get_plane_basis, remove_short_edges_3d, snap_loop_to_wall_lines,
+};
 use crate::models::{ElementData, MacroPanel, MeshData, PanelType};
 use glam::DVec3;
 use hashbrown::{HashMap, HashSet};
@@ -31,7 +33,7 @@ struct PlaneCluster {
 }
 
 impl PanelReconstructor {
-    /// Высокоскоростная параллельная реконструкция плит и стен с единым базисом плоскости
+    /// Высокоскоростная параллельная реконструкция плит и стен с дотягиванием до стен
     pub fn reconstruct(
         mesh_data: &MeshData,
         canonical_nodes: &HashMap<u32, u32>,
@@ -43,7 +45,10 @@ impl PanelReconstructor {
             .filter(|e| e.nodes.len() >= 3)
             .collect();
 
-        // 1. Первичный парсинг элементов и определение их ориентации
+        // 1. Извлечение опорных линий вертикальных стен для дотягивания плит
+        let wall_segments_by_z = Self::extract_wall_datum_lines(mesh_data, canonical_nodes, config.tol_dist);
+
+        // 2. Первичный парсинг элементов и определение их ориентации
         let parsed_shells: Vec<ParsedShell> = shell_elems
             .into_iter()
             .filter_map(|el| {
@@ -106,7 +111,7 @@ impl PanelReconstructor {
             })
             .collect();
 
-        // 2. Кластеризация элементов по плоскостям
+        // 3. Кластеризация элементов по плоскостям
         let mut clusters: Vec<PlaneCluster> = Vec::new();
         for el in parsed_shells {
             let nz = el.normal.z;
@@ -160,7 +165,7 @@ impl PanelReconstructor {
             }
         }
 
-        // 3. Параллельная реконструкция кластеров (Rayon)
+        // 4. Параллельная реконструкция кластеров (Rayon)
         let panels_results: Vec<Vec<MacroPanel>> = clusters
             .into_par_iter()
             .enumerate()
@@ -168,7 +173,6 @@ impl PanelReconstructor {
                 let cluster_norm = cl.normal;
                 let (u_axis, v_axis) = get_plane_basis(cluster_norm);
 
-                // Извлечение режущих ребер для плит
                 let cutting_edges = if cl.is_horiz {
                     extract_cutting_edge_nodes_for_slab(
                         &mesh_data.elements,
@@ -183,7 +187,18 @@ impl PanelReconstructor {
                     HashSet::new()
                 };
 
-                // Упорядочивание узлов каждого КЭ в ЕДИНОМ базисе плоскости кластера
+                let relevant_wall_lines = if cl.is_horiz {
+                    let slab_z = cl.z.unwrap_or(0.0);
+                    wall_segments_by_z
+                        .iter()
+                        .filter(|(z, _)| (z - slab_z).abs() < config.tol_dist)
+                        .map(|(_, seg)| *seg)
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+
+                // Упорядочивание узлов КЭ в едином базисе кластера
                 let ordered_elements: Vec<(u32, u32, Vec<u32>)> = cl
                     .elements
                     .iter()
@@ -231,7 +246,6 @@ impl PanelReconstructor {
 
                 let mut elem_adj: HashMap<u32, Vec<u32>> = HashMap::new();
                 for (&edge, e_ids) in &edge_to_elems {
-                    // Если ребро является режущим — не объединяем элементы через него
                     if cutting_edges.contains(&edge) {
                         continue;
                     }
@@ -275,12 +289,14 @@ impl PanelReconstructor {
                         }
                     }
 
-                    // 4. Трассировка контуров через Half-Edges
+                    // 5. Трассировка контуров с дотягиванием до стен
                     let polygons = Self::extract_cycles_from_elements(
                         &comp_elems,
                         mesh_data,
                         u_axis,
                         v_axis,
+                        &relevant_wall_lines,
+                        config.tol_dist,
                     );
 
                     if polygons.is_empty() {
@@ -315,14 +331,15 @@ impl PanelReconstructor {
         panels_results.into_iter().flatten().collect()
     }
 
-    /// Трассировка замкнутых циклов (периметр и проемы) по направленным полуребрам за O(N)
+    /// Трассировка контуров по Half-Edges с дотягиванием до линий стен
     fn extract_cycles_from_elements(
         elements: &[&(u32, u32, Vec<u32>)],
         mesh_data: &MeshData,
         u_axis: DVec3,
         v_axis: DVec3,
+        wall_segments: &[(DVec3, DVec3)],
+        snap_tol: f64,
     ) -> Vec<Vec<[f64; 3]>> {
-        // Подсчет направленных полуребер
         let mut dir_edge_count: HashMap<(u32, u32), u32> = HashMap::new();
         for (_, _, nodes) in elements {
             let n_len = nodes.len();
@@ -333,7 +350,6 @@ impl PanelReconstructor {
             }
         }
 
-        // Граничные полуребра (нет противоположного B -> A)
         let mut out_edges: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut boundary_edges = Vec::new();
         for (&(u, v), &count) in &dir_edge_count {
@@ -347,7 +363,6 @@ impl PanelReconstructor {
             return Vec::new();
         }
 
-        // Сборка замкнутых контуров
         let mut visited_half_edges: HashSet<(u32, u32)> = HashSet::new();
         let mut result_polygons = Vec::new();
 
@@ -391,12 +406,18 @@ impl PanelReconstructor {
                     .filter_map(|nid| mesh_data.nodes.get(nid).copied())
                     .collect();
 
-                // Вычисление площади для фильтрации вырожденных микропетель
+                // 1. Дотягивание точек контура плиты до опорных линий стен
+                let snapped_3d = snap_loop_to_wall_lines(&raw_3d, wall_segments, snap_tol);
+
+                // 2. Схлопывание паразитных микросегментов (< 3 см)
+                let fused_3d = remove_short_edges_3d(&snapped_3d, 0.03);
+
+                // 3. Вычисление площади для фильтрации вырожденных микропетель
                 let mut area_2d = 0.0;
-                let n_pts = raw_3d.len();
+                let n_pts = fused_3d.len();
                 for i in 0..n_pts {
-                    let p1 = raw_3d[i];
-                    let p2 = raw_3d[(i + 1) % n_pts];
+                    let p1 = fused_3d[i];
+                    let p2 = fused_3d[(i + 1) % n_pts];
                     let x1 = p1.dot(u_axis);
                     let y1 = p1.dot(v_axis);
                     let x2 = p2.dot(u_axis);
@@ -405,8 +426,9 @@ impl PanelReconstructor {
                 }
                 area_2d = (area_2d * 0.5).abs();
 
-                if area_2d > 0.05 {
-                    let clean_3d = clean_polygon_coords_3d(&raw_3d, 0.9995);
+                if area_2d > 0.10 {
+                    // 4. Окончательное выпрямление прямых линий (удаление всех промежуточных узлов)
+                    let clean_3d = clean_polygon_coords_3d(&fused_3d, 0.9995);
                     if clean_3d.len() >= 3 {
                         result_polygons.push(clean_3d.into_iter().map(|p| [p.x, p.y, p.z]).collect());
                     }
@@ -415,6 +437,46 @@ impl PanelReconstructor {
         }
 
         result_polygons
+    }
+
+    /// Сбор опорных линий (отрезков) всех вертикальных стен с привязкой к отметкам Z
+    fn extract_wall_datum_lines(
+        mesh_data: &MeshData,
+        canonical_nodes: &HashMap<u32, u32>,
+        tol_dist: f64,
+    ) -> Vec<(f64, (DVec3, DVec3))> {
+        let mut datum_lines = Vec::new();
+        for el in mesh_data.elements.iter().filter(|e| e.nodes.len() >= 3) {
+            let pts: Vec<DVec3> = el
+                .nodes
+                .iter()
+                .filter_map(|nid| canonical_nodes.get(nid).and_then(|cid| mesh_data.nodes.get(cid).copied()))
+                .collect();
+
+            if pts.len() < 3 {
+                continue;
+            }
+
+            let v1 = pts[1] - pts[0];
+            let v2 = pts[2] - pts[0];
+            let norm = v1.cross(v2);
+            let norm_len = norm.length();
+
+            // Только вертикальные стены
+            if norm_len < 1e-7 || (norm.z / norm_len).abs() > 0.15 {
+                continue;
+            }
+
+            let n_len = pts.len();
+            for i in 0..n_len {
+                let pa = pts[i];
+                let pb = pts[(i + 1) % n_len];
+                if (pa.z - pb.z).abs() < tol_dist && (pb - pa).length_squared() > 1e-4 {
+                    datum_lines.push((pa.z, (pa, pb)));
+                }
+            }
+        }
+        datum_lines
     }
 
     /// Извлечение уникальных высотных отметок плит перекрытий
