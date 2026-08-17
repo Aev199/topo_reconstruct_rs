@@ -2,9 +2,11 @@
 
 mod config;
 mod models;
+mod parsers;
 
 use clap::Parser;
 use config::ReconstructionConfig;
+use parsers::LiraParser;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
@@ -29,9 +31,28 @@ fn main() {
 
     println!("=== RECONSTRUCT TOPOLOGY CORE (RUST) ===");
     println!("Входной файл: {}", args.input);
-    println!("Допуск по высоте: {} м, Допуск упрощения: {} м", config.tol_dist, config.simplify_tol);
+    println!(
+        "Допуск по высоте: {} м, Допуск упрощения: {} м",
+        config.tol_dist, config.simplify_tol
+    );
 
-    let start_time = Instant::now();
+    // 1. Замер скорости параллельного парсинга
+    println!("\n1. Чтение и парсинг расчетной схемы...");
+    let parse_start = Instant::now();
 
-    println!("Инициализация завершена за {:?}", start_time.elapsed());
+    match LiraParser::parse(&args.input) {
+        Ok(mesh_data) => {
+            let parse_elapsed = parse_start.elapsed();
+            println!(
+                "   [OK] Схема успешно загружена за {:.2?}:",
+                parse_elapsed
+            );
+            println!("   -> Узлов: {}", mesh_data.nodes.len());
+            println!("   -> Конечных элементов: {}", mesh_data.elements.len());
+        }
+        Err(e) => {
+            eprintln!("   [ERROR] Ошибка при чтении файла: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
