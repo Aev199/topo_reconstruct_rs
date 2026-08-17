@@ -163,7 +163,7 @@ impl PanelReconstructor {
                         .collect();
 
                     // Сортировка по углу (CCW) против диагональных крестов
-                    pts_2d.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap());
+                    pts_2d.sort_by(|a, b| a.2.total_cmp(&b.2));
 
                     let mut coords: Vec<Coord<f64>> = pts_2d
                         .iter()
@@ -208,8 +208,9 @@ impl PanelReconstructor {
                     let mut panel_polygons_3d = Vec::new();
 
                     // Внешний контур
-                    let ext_coords = geom.exterior().coords();
+                    let ext_coords: Vec<Coord<f64>> = geom.exterior().coords().copied().collect();
                     let raw_ext: Vec<DVec3> = ext_coords
+                        .iter()
                         .take(ext_coords.len().saturating_sub(1))
                         .map(|c| orig + c.x * u_axis + c.y * v_axis)
                         .collect();
@@ -221,8 +222,9 @@ impl PanelReconstructor {
 
                     // Внутренние проемы
                     for hole in geom.interiors() {
-                        let hole_coords = hole.coords();
+                        let hole_coords: Vec<Coord<f64>> = hole.coords().copied().collect();
                         let raw_hole: Vec<DVec3> = hole_coords
+                            .iter()
                             .take(hole_coords.len().saturating_sub(1))
                             .map(|c| orig + c.x * u_axis + c.y * v_axis)
                             .collect();
@@ -257,7 +259,7 @@ impl PanelReconstructor {
 
     /// Извлечение уникальных высотных отметок плит перекрытий
     pub fn extract_slab_elevations(panels: &[MacroPanel], tol_dist: f64) -> Vec<f64> {
-        let mut slab_z = Vec::new();
+        let mut slab_z: Vec<f64> = Vec::new();
         for p in panels {
             if p.panel_type == PanelType::Slab {
                 for poly in &p.polygons {
@@ -268,8 +270,8 @@ impl PanelReconstructor {
             }
         }
 
-        slab_z.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mut unique_levels = Vec::new();
+        slab_z.sort_by(|a, b| a.total_cmp(b));
+        let mut unique_levels: Vec<f64> = Vec::new();
         for z in slab_z {
             if unique_levels.is_empty()
                 || (z - unique_levels[unique_levels.len() - 1]).abs() > tol_dist

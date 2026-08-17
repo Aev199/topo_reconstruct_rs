@@ -47,8 +47,8 @@ fn main() {
             println!(
                 "   [OK] Загружено за {:.2?}: {} узлов, {} КЭ",
                 parse_start.elapsed(),
-                mesh_data.nodes.len(),
-                mesh_data.elements.len()
+                data.nodes.len(),
+                data.elements.len()
             );
             data
         }
