@@ -1,0 +1,36 @@
+[package]
+name = "topo_reconstruct_rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Параллелизм и многопоточность на всех ядрах CPU
+rayon = "1.10"
+
+# Быстрая SIMD-векторная математика
+glam = "0.29"
+
+# Быстрый парсинг чисел с плавающей точкой из ASCII
+fast-float = "0.2"
+
+# Memory-mapped IO для мгновенного чтения гигабайтных файлов
+memmap2 = "0.9"
+
+# Высокопроизводительные хэш-таблицы (SwissTable)
+hashbrown = { version = "0.15", features = ["rayon"] }
+
+# 2D вычислительная геометрия и булевы операции
+geo = "0.29"
+
+# Сериализация в JSON
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI аргументы командной строки
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
