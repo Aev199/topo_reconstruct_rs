@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports, unused_variables)]
 
 mod config;
 mod geometry;
@@ -53,7 +53,7 @@ fn main() {
 
             // 2. Тест канонизации узлов
             let canon_start = Instant::now();
-            let canonical_map = geometry::canonicalize_nodes(&mesh_data.nodes, config.canonical_precision);
+            let canonical_map = geometry::utils::canonicalize_nodes(&mesh_data.nodes, config.canonical_precision);
             println!(
                 "   [OK] Канонизация узлов выполнена за {:.2?}: сшито {} узлов",
                 canon_start.elapsed(),
