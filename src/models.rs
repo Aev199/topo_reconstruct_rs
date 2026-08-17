@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use glam::DVec3;
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};

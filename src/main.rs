@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 mod config;
 mod models;
 
@@ -31,6 +33,5 @@ fn main() {
 
     let start_time = Instant::now();
 
-    // Проверка компиляции базового скелета
     println!("Инициализация завершена за {:?}", start_time.elapsed());
 }
