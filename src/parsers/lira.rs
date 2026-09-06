@@ -15,96 +15,101 @@ impl LiraParser {
     pub fn parse<P: AsRef<Path>>(filepath: P) -> io::Result<MeshData> {
         let file = File::open(filepath)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let content = &mmap[..];
+        Self::parse_bytes(&mmap)
+    }
 
-        // 1. Поиск блоков ( 4/ ... ) для узлов и ( 1/ ... ) для КЭ
-        let block_4_data = Self::extract_block(content, b"4")
-            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Блок координат узлов (4/) не найден"))?;
-
-        let block_1_data = Self::extract_block(content, b"1")
+    fn parse_bytes(content: &[u8]) -> io::Result<MeshData> {
+        let nodes = Self::extract_block(content, b"4").ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "Блок координат узлов (4/) не найден",
+            )
+        })?;
+        let elements = Self::extract_block(content, b"1")
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Блок элементов (1/) не найден"))?;
-
-        // 2. Параллельный парсинг узлов (Rayon)
-        let raw_node_chunks: Vec<&[u8]> = block_4_data
+        let node_rows: Vec<_> = nodes
             .split(|&b| b == b'/')
-            .filter(|chunk| !Self::is_empty_or_ws(chunk))
+            .filter(|r| !Self::is_empty_or_ws(r))
             .collect();
-
-        let parsed_nodes: Vec<(u32, DVec3)> = raw_node_chunks
+        let parsed_nodes: io::Result<Vec<(u32, DVec3)>> = node_rows
             .par_iter()
             .enumerate()
-            .filter_map(|(idx, chunk)| {
-                let mut coords = [0.0f64; 3];
-                let mut count = 0;
-
-                // Читаем 3 координаты (x, y, z)
-                for word in Self::split_ascii_whitespace_bytes(chunk) {
-                    if count < 3 {
-                        if let Ok(val) = fast_parse_f64::<f64, _>(word) {
-                            coords[count] = val;
-                            count += 1;
-                        }
-                    } else {
-                        break;
+            .map(|(i, row)| {
+                let words: Vec<_> = Self::split_ascii_whitespace_bytes(row).collect();
+                let error = || {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("Узел {}: ожидаются три конечные координаты", i + 1),
+                    )
+                };
+                if words.len() != 3 {
+                    return Err(error());
+                }
+                let mut xyz = [0.0; 3];
+                for j in 0..3 {
+                    xyz[j] = fast_parse_f64::<f64, _>(words[j]).map_err(|_| error())?;
+                    if !xyz[j].is_finite() {
+                        return Err(error());
                     }
                 }
-
-                if count >= 3 {
-                    let node_id = (idx + 1) as u32;
-                    Some((node_id, DVec3::new(coords[0], coords[1], coords[2])))
-                } else {
-                    None
-                }
+                Ok(((i + 1) as u32, DVec3::from_array(xyz)))
             })
             .collect();
-
-        let mut nodes_map = HashMap::with_capacity(parsed_nodes.len());
-        for (id, pt) in parsed_nodes {
-            nodes_map.insert(id, pt);
-        }
-
-        // 3. Параллельный парсинг элементов (Rayon)
-        let raw_elem_chunks: Vec<&[u8]> = block_1_data
+        let nodes: HashMap<u32, DVec3> = parsed_nodes?.into_iter().collect();
+        let element_rows: Vec<_> = elements
             .split(|&b| b == b'/')
-            .filter(|chunk| !Self::is_empty_or_ws(chunk))
+            .filter(|r| !Self::is_empty_or_ws(r))
             .collect();
-
-        let elements: Vec<ElementData> = raw_elem_chunks
+        let parsed_elements: io::Result<Vec<ElementData>> = element_rows
             .par_iter()
             .enumerate()
-            .filter_map(|(idx, chunk)| {
-                let mut ints = Vec::with_capacity(8);
-
-                for word in Self::split_ascii_whitespace_bytes(chunk) {
-                    // Быстрый парсинг u32
-                    if let Ok(s) = std::str::from_utf8(word) {
-                        if let Ok(val) = s.parse::<u32>() {
-                            ints.push(val);
-                        }
-                    }
-                }
-
-                if ints.len() >= 4 {
-                    let elem_id = (idx + 1) as u32;
-                    let elem_type = ints[0];
-                    let stiff_id = ints[1];
-                    let elem_nodes = ints[2..].to_vec();
-
-                    Some(ElementData {
-                        id: elem_id,
-                        elem_type,
-                        stiff_id,
-                        nodes: elem_nodes,
+            .map(|(i, row)| {
+                let error = || {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("КЭ {}: неверная запись типа, жесткости или узлов", i + 1),
+                    )
+                };
+                let ints: io::Result<Vec<u32>> = Self::split_ascii_whitespace_bytes(row)
+                    .map(|w| {
+                        std::str::from_utf8(w)
+                            .map_err(|_| error())?
+                            .parse::<u32>()
+                            .map_err(|_| error())
                     })
-                } else {
-                    None
+                    .collect();
+                let ints = ints?;
+                if ints.len() < 3 {
+                    return Err(error());
                 }
+                if ints[2..].iter().any(|id| !nodes.contains_key(id)) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("КЭ {}: ссылка на отсутствующий узел", i + 1),
+                    ));
+                }
+                let element = ElementData {
+                    id: (i + 1) as u32,
+                    elem_type: ints[0],
+                    stiff_id: ints[1],
+                    nodes: ints[2..].to_vec(),
+                };
+                let expected = match element.elem_type {
+                    10 => Some(2),
+                    41 | 44 => Some(4),
+                    42 => Some(3),
+                    56 => Some(1),
+                    _ => None,
+                };
+                if expected.is_some_and(|n| n != element.nodes.len()) {
+                    return Err(error());
+                }
+                Ok(element)
             })
             .collect();
-
         Ok(MeshData {
-            nodes: nodes_map,
-            elements,
+            nodes,
+            elements: parsed_elements?,
         })
     }
 
@@ -117,7 +122,12 @@ impl LiraParser {
             if content[i] == b'(' {
                 let mut j = i + 1;
                 // Пропускаем пробелы после '('
-                while j < len && (content[j] == b' ' || content[j] == b'\t' || content[j] == b'\r' || content[j] == b'\n') {
+                while j < len
+                    && (content[j] == b' '
+                        || content[j] == b'\t'
+                        || content[j] == b'\r'
+                        || content[j] == b'\n')
+                {
                     j += 1;
                 }
 
@@ -125,7 +135,12 @@ impl LiraParser {
                 if j + block_id.len() < len && &content[j..j + block_id.len()] == block_id {
                     let mut k = j + block_id.len();
                     // Пропускаем пробелы перед '/'
-                    while k < len && (content[k] == b' ' || content[k] == b'\t' || content[k] == b'\r' || content[k] == b'\n') {
+                    while k < len
+                        && (content[k] == b' '
+                            || content[k] == b'\t'
+                            || content[k] == b'\r'
+                            || content[k] == b'\n')
+                    {
                         k += 1;
                     }
 
@@ -155,7 +170,9 @@ impl LiraParser {
 
     /// Проверка, пустой ли слайс байт
     fn is_empty_or_ws(slice: &[u8]) -> bool {
-        slice.iter().all(|&b| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
+        slice
+            .iter()
+            .all(|&b| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
     }
 
     /// Итератор по непустым словам (whitespace-separated bytes)
@@ -165,7 +182,9 @@ impl LiraParser {
 
         std::iter::from_fn(move || {
             // Пропуск начальных пробелов
-            while i < len && (slice[i] == b' ' || slice[i] == b'\t' || slice[i] == b'\r' || slice[i] == b'\n') {
+            while i < len
+                && (slice[i] == b' ' || slice[i] == b'\t' || slice[i] == b'\r' || slice[i] == b'\n')
+            {
                 i += 1;
             }
             if i >= len {
@@ -173,10 +192,46 @@ impl LiraParser {
             }
             let start = i;
             // Поиск конца слова
-            while i < len && !(slice[i] == b' ' || slice[i] == b'\t' || slice[i] == b'\r' || slice[i] == b'\n') {
+            while i < len
+                && !(slice[i] == b' '
+                    || slice[i] == b'\t'
+                    || slice[i] == b'\r'
+                    || slice[i] == b'\n')
+            {
                 i += 1;
             }
             Some(&slice[start..i])
         })
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preserves_single_node_and_unknown_elements_without_renumbering() {
+        let mesh = LiraParser::parse_bytes(
+            b"(4/0 0 0/1 0 0/0 1 0/)(1/56 1 1/200 1 1 2 3/42 2 1 2 3/10 3 1 2/)",
+        )
+        .unwrap();
+        assert_eq!(mesh.elements.len(), 4);
+        assert_eq!(mesh.elements[2].id, 3);
+        assert!(!mesh.elements[1].is_shell());
+        assert!(!mesh.elements[1].is_bar());
+        assert!(mesh.elements[2].is_shell());
+    }
+    #[test]
+    fn malformed_tokens_and_references_fail_instead_of_shifting_geometry() {
+        for content in [
+            "(4/0 junk 0 0/)(1/56 1 1/)",
+            "(4/NaN 0 0/)(1/56 1 1/)",
+            "(4/0 0 0/)(1/56 junk 1 1/)",
+            "(4/0 0 0/)(1/56 1 2/)",
+            "(4/0 0 0/)(1/42 1 1/)",
+        ] {
+            assert!(
+                LiraParser::parse_bytes(content.as_bytes()).is_err(),
+                "{content}"
+            );
+        }
     }
 }

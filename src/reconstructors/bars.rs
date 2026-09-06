@@ -13,17 +13,20 @@ impl BarReconstructor {
         slab_elevations: &[f64],
         config: &ReconstructionConfig,
     ) -> Vec<MacroBar> {
-        let bar_elems: Vec<&ElementData> = mesh_data
-            .elements
-            .iter()
-            .filter(|e| e.nodes.len() == 2)
-            .collect();
+        let bar_elems: Vec<&ElementData> =
+            mesh_data.elements.iter().filter(|e| e.is_bar()).collect();
 
         // Граф смежности: node -> [(neighbor_node, elem_id, stiff_id)]
         let mut adj: HashMap<u32, Vec<(u32, u32, u32)>> = HashMap::new();
         for el in &bar_elems {
-            let n1 = canonical_nodes.get(&el.nodes[0]).copied().unwrap_or(el.nodes[0]);
-            let n2 = canonical_nodes.get(&el.nodes[1]).copied().unwrap_or(el.nodes[1]);
+            let n1 = canonical_nodes
+                .get(&el.nodes[0])
+                .copied()
+                .unwrap_or(el.nodes[0]);
+            let n2 = canonical_nodes
+                .get(&el.nodes[1])
+                .copied()
+                .unwrap_or(el.nodes[1]);
             adj.entry(n1).or_default().push((n2, el.id, el.stiff_id));
             adj.entry(n2).or_default().push((n1, el.id, el.stiff_id));
         }
@@ -37,10 +40,17 @@ impl BarReconstructor {
             }
 
             let stiff = el.stiff_id;
-            let n1 = canonical_nodes.get(&el.nodes[0]).copied().unwrap_or(el.nodes[0]);
-            let n2 = canonical_nodes.get(&el.nodes[1]).copied().unwrap_or(el.nodes[1]);
+            let n1 = canonical_nodes
+                .get(&el.nodes[0])
+                .copied()
+                .unwrap_or(el.nodes[0]);
+            let n2 = canonical_nodes
+                .get(&el.nodes[1])
+                .copied()
+                .unwrap_or(el.nodes[1]);
 
-            let (Some(&p1), Some(&p2)) = (mesh_data.nodes.get(&n1), mesh_data.nodes.get(&n2)) else {
+            let (Some(&p1), Some(&p2)) = (mesh_data.nodes.get(&n1), mesh_data.nodes.get(&n2))
+            else {
                 continue;
             };
 
@@ -61,7 +71,10 @@ impl BarReconstructor {
                     let mut next_found = None;
                     if let Some(neighbors) = adj.get(&curr) {
                         for &(next_node, next_elem_id, next_stiff) in neighbors {
-                            if next_node == prev || visited.contains(&next_elem_id) || next_stiff != stiff {
+                            if next_node == prev
+                                || visited.contains(&next_elem_id)
+                                || next_stiff != stiff
+                            {
                                 continue;
                             }
 
@@ -141,7 +154,10 @@ impl BarReconstructor {
                     let z_node = mesh_data.nodes.get(&node).map(|p| p.z).unwrap_or(0.0);
                     current_sub.push(node);
 
-                    if slab_elevations.iter().any(|&sz| (z_node - sz).abs() < config.tol_dist) {
+                    if slab_elevations
+                        .iter()
+                        .any(|&sz| (z_node - sz).abs() < config.tol_dist)
+                    {
                         if current_sub.len() >= 2 {
                             sub_chains.push(current_sub);
                             current_sub = vec![node];

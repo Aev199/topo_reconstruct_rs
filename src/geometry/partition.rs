@@ -18,11 +18,15 @@ pub fn extract_cutting_edge_nodes_for_slab(
 
     // 1. Ребра стен на отметке плиты
     if split_by_walls {
-        for el in elements.iter().filter(|e| e.nodes.len() >= 3) {
+        for el in elements.iter().filter(|e| e.is_shell()) {
             let pts: Vec<DVec3> = el
                 .nodes
                 .iter()
-                .filter_map(|nid| canonical_nodes.get(nid).and_then(|cid| nodes.get(cid).copied()))
+                .filter_map(|nid| {
+                    canonical_nodes
+                        .get(nid)
+                        .and_then(|cid| nodes.get(cid).copied())
+                })
                 .collect();
 
             if pts.len() < 3 {
@@ -41,8 +45,14 @@ pub fn extract_cutting_edge_nodes_for_slab(
 
             let n_len = el.nodes.len();
             for i in 0..n_len {
-                let n_a = canonical_nodes.get(&el.nodes[i]).copied().unwrap_or(el.nodes[i]);
-                let n_b = canonical_nodes.get(&el.nodes[(i + 1) % n_len]).copied().unwrap_or(el.nodes[(i + 1) % n_len]);
+                let n_a = canonical_nodes
+                    .get(&el.nodes[i])
+                    .copied()
+                    .unwrap_or(el.nodes[i]);
+                let n_b = canonical_nodes
+                    .get(&el.nodes[(i + 1) % n_len])
+                    .copied()
+                    .unwrap_or(el.nodes[(i + 1) % n_len]);
 
                 if let (Some(pa), Some(pb)) = (nodes.get(&n_a), nodes.get(&n_b)) {
                     if (pa.z - z_slab).abs() < tol_dist && (pb.z - z_slab).abs() < tol_dist {
@@ -56,9 +66,15 @@ pub fn extract_cutting_edge_nodes_for_slab(
 
     // 2. Ребра балок на отметке плиты
     if split_by_beams {
-        for el in elements.iter().filter(|e| e.nodes.len() == 2) {
-            let n_a = canonical_nodes.get(&el.nodes[0]).copied().unwrap_or(el.nodes[0]);
-            let n_b = canonical_nodes.get(&el.nodes[1]).copied().unwrap_or(el.nodes[1]);
+        for el in elements.iter().filter(|e| e.is_bar()) {
+            let n_a = canonical_nodes
+                .get(&el.nodes[0])
+                .copied()
+                .unwrap_or(el.nodes[0]);
+            let n_b = canonical_nodes
+                .get(&el.nodes[1])
+                .copied()
+                .unwrap_or(el.nodes[1]);
 
             if let (Some(pa), Some(pb)) = (nodes.get(&n_a), nodes.get(&n_b)) {
                 if (pa.z - z_slab).abs() < tol_dist && (pb.z - z_slab).abs() < tol_dist {

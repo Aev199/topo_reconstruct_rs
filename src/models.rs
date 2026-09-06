@@ -22,6 +22,17 @@ pub struct ElementData {
     pub nodes: Vec<u32>,
 }
 
+/// Explicit supported LIRA element families; unknown types are retained, not guessed.
+impl ElementData {
+    pub fn is_shell(&self) -> bool {
+        matches!((self.elem_type, self.nodes.len()), (41 | 44, 4) | (42, 3))
+    }
+
+    pub fn is_bar(&self) -> bool {
+        self.elem_type == 10 && self.nodes.len() == 2
+    }
+}
+
 /// Тип макроэлемента панели
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PanelType {
@@ -40,7 +51,10 @@ pub struct MacroPanel {
     pub plane_d: f64,
     /// Список 3D-контуров: [0] — внешний периметр, [1..] — внутренние проемы
     pub polygons: Vec<Vec<[f64; 3]>>,
+    pub filled_holes: usize,
+    pub filled_hole_area: f64,
     pub fe_count: usize,
+    pub source_element_ids: Vec<u32>,
     pub connected_panel_ids: Vec<u32>,
 }
 
@@ -71,6 +85,7 @@ pub struct ReconstructionReport {
     pub columns_count: usize,
     pub beams_count: usize,
     pub braces_count: usize,
+    pub diagnostics: Vec<String>,
     pub panels: Vec<MacroPanel>,
     pub bars: Vec<MacroBar>,
 }

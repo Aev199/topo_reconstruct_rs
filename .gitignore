@@ -1,1 +1,5 @@
 /dist_test
+/target/
+/building_topology.json
+/building_topology.dxf
+__pycache__/

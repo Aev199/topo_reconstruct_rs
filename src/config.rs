@@ -10,8 +10,10 @@ pub struct ReconstructionConfig {
     pub tol_angle: f64,
     /// Допуск упрощения контуров полигонов (м)
     pub simplify_tol: f64,
-    /// Округление координат для сшивки дубликатов узлов (количество знаков)
-    pub canonical_precision: u32,
+    /// Радиус объединения узлов в единицах исходной модели.
+    pub weld_tol: f64,
+    /// Минимальная длина ребра при очистке контура.
+    pub min_edge: f64,
     /// Флаг: делить плиты по стенам
     pub split_slabs_by_walls: bool,
     /// Флаг: делить плиты по балкам
@@ -24,7 +26,8 @@ impl Default for ReconstructionConfig {
             tol_dist: 0.15,
             tol_angle: 0.08,
             simplify_tol: 0.01,
-            canonical_precision: 3,
+            weld_tol: 0.001,
+            min_edge: 0.03,
             split_slabs_by_walls: true,
             split_slabs_by_beams: true,
         }

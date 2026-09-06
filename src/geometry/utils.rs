@@ -4,21 +4,52 @@ use glam::DVec3;
 use hashbrown::HashMap;
 
 /// Канонизация узлов: объединение близко расположенных узлов в единые индексы
-pub fn canonicalize_nodes(nodes: &HashMap<u32, DVec3>, precision: u32) -> HashMap<u32, u32> {
-    let factor = 10f64.powi(precision as i32);
-    let mut coord_map: HashMap<(i64, i64, i64), u32> = HashMap::with_capacity(nodes.len());
-    let mut canonical_map = HashMap::with_capacity(nodes.len());
-
-    for (&nid, &pt) in nodes {
+pub fn canonicalize_nodes(nodes: &HashMap<u32, DVec3>, tolerance: f64) -> HashMap<u32, u32> {
+    assert!(tolerance.is_finite() && tolerance > 0.0);
+    let mut cells: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+    let mut canonical = HashMap::new();
+    let mut ids: Vec<_> = nodes.keys().copied().collect();
+    ids.sort_unstable();
+    for id in ids {
+        let pt = nodes[&id];
+        if !pt.is_finite() {
+            continue;
+        }
         let key = (
-            (pt.x * factor).round() as i64,
-            (pt.y * factor).round() as i64,
-            (pt.z * factor).round() as i64,
+            (pt.x / tolerance).floor() as i64,
+            (pt.y / tolerance).floor() as i64,
+            (pt.z / tolerance).floor() as i64,
         );
-        let canon_id = *coord_map.entry(key).or_insert(nid);
-        canonical_map.insert(nid, canon_id);
+        let mut best: Option<(f64, u32)> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let neighbor = (
+                        key.0.saturating_add(dx),
+                        key.1.saturating_add(dy),
+                        key.2.saturating_add(dz),
+                    );
+                    if let Some(candidates) = cells.get(&neighbor) {
+                        for &candidate in candidates {
+                            let distance = pt.distance(nodes[&candidate]);
+                            if distance <= tolerance
+                                && best.map_or(true, |b| (distance, candidate) < b)
+                            {
+                                best = Some((distance, candidate));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Only representatives are indexed: chained welding cannot exceed tolerance.
+        let representative = best.map_or(id, |b| b.1);
+        if representative == id {
+            cells.entry(key).or_default().push(id);
+        }
+        canonical.insert(id, representative);
     }
-    canonical_map
+    canonical
 }
 
 /// Построение ортонормированного 2D-базиса (u, v), перпендикулярного вектору нормали
@@ -142,5 +173,30 @@ pub fn clean_polygon_coords_3d(pts: &[DVec3], tol_collinear: f64) -> Vec<DVec3> 
         current
     } else {
         Vec::new()
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn welding_crosses_cell_boundaries_but_not_long_chains() {
+        let nodes = HashMap::from_iter([
+            (1, DVec3::new(0.009, 0.0, 0.0)),
+            (2, DVec3::new(0.011, 0.0, 0.0)),
+            (3, DVec3::new(0.020, 0.0, 0.0)),
+        ]);
+        let map = canonicalize_nodes(&nodes, 0.01);
+        assert_eq!(map[&2], 1);
+        assert_eq!(map[&3], 3);
+        for (id, representative) in map {
+            assert!(nodes[&id].distance(nodes[&representative]) <= 0.01);
+        }
+    }
+    #[test]
+    fn welding_is_independent_of_insertion_order() {
+        let entries = [(9, DVec3::ZERO), (2, DVec3::new(0.0005, 0.0, 0.0))];
+        let a = HashMap::from_iter(entries);
+        let b = HashMap::from_iter(entries.into_iter().rev());
+        assert_eq!(canonicalize_nodes(&a, 0.001), canonicalize_nodes(&b, 0.001));
     }
 }
