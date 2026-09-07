@@ -500,6 +500,7 @@ mod tests {
             fe_count: 1,
             source_element_ids: vec![id],
             connected_panel_ids: vec![],
+            constraint_points: vec![],
         }
     }
     fn slab(id: u32, z: f64) -> MacroPanel {

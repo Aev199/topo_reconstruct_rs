@@ -49,6 +49,10 @@ def main():
             restored_groups=sorted(tuple(sorted(eorder[i-1] for i in p['source_element_ids'])) for p in report['panels'])
             assert restored_groups==original_groups,(name,'panel source membership changed')
             assert sum(p['filled_holes'] for p in report['panels'])==sum(p['filled_holes'] for p in baseline['panels'])
+            bar_groups=sorted(tuple(sorted(b.get('source_element_ids',[]))) for b in baseline['bars'])
+            restored_bars=sorted(tuple(sorted(eorder[i-1] for i in b.get('source_element_ids',[]))) for b in report['bars'])
+            assert restored_bars==bar_groups,(name,'bar source membership changed')
+            assert report.get('bar_contacts',{}).get('attached_groups')==baseline.get('bar_contacts',{}).get('attached_groups'),(name,'bar attachment count changed')
             assert connections(report,eorder)==baseline_connections,(name,'shared-edge connectivity changed')
             print(name+': counts, panel membership, filled holes and shared-edge connectivity preserved')
 

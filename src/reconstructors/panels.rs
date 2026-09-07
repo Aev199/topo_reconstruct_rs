@@ -420,6 +420,7 @@ impl PanelReconstructor {
                             .flat_map(|e| source_ids[&e.0].iter().copied())
                             .collect(),
                         connected_panel_ids: vec![],
+                        constraint_points: vec![],
                     });
                     sub_id += 1;
                 }

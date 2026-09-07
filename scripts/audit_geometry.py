@@ -96,7 +96,44 @@ def audit(model, report):
             t=np.divide(np.sum((point-starts)*direction,axis=1),lengths,out=np.zeros_like(lengths),where=lengths>0)
             distances=np.linalg.norm(point-(starts+np.clip(t,0,1)[:,None]*direction),axis=1)
             near_junctions+=int(np.sum((owners!=owner)&(t>1e-6)&(t<1-1e-6)&(distances>=1e-7)&(distances<0.01)))
-    return dict(connected_pairs=len(connections),unverified_connections=unverified,
+    bar_sources=[i for b in report['bars'] for i in b.get('source_element_ids',[])]
+    expected_bars={i for i,e in elements.items() if e[0]==10}
+    bad_attachments=[]
+    inconsistent_lengths=[]
+    endpoint_groups={}
+    for b in report['bars']:
+        if abs(np.linalg.norm(np.array(b['end_point'])-np.array(b['start_point']))-b['length'])>1e-8:
+            inconsistent_lengths.append(b.get('source_element_ids',[]))
+        for end in ['start','end']:
+            p=np.array(b[end+'_point'])
+            if end+'_node_id' in b: endpoint_groups.setdefault(b[end+'_node_id'],[]).append(p)
+            for owner in b.get(end+'_panel_ids',[]):
+                panel=by_id[owner];normal=np.array(panel['plane_normal'])
+                u=np.cross(normal,[0.,0.,1.] if abs(normal[2])<.9 else [1.,0.,0.]);u/=np.linalg.norm(u);v=np.cross(normal,u)
+                rings=[np.column_stack((np.array(r)@u,np.array(r)@v)) for r in panel['polygons']]
+                from shapely.geometry import Point
+                surface=Polygon(rings[0],rings[1:])
+                recorded=any(np.linalg.norm(p-np.array(q))<=1e-8 for q in panel.get('constraint_points',[]))
+                if abs(p@normal+panel['plane_d'])>1e-8 or surface.distance(Point(p@u,p@v))>1e-8 or not recorded:
+                    bad_attachments.append(dict(elements=b.get('source_element_ids',[]),end=end,panel=owner))
+    crowded_constraints=[]
+    for panel in panels:
+        points=[np.array(p) for p in panel.get('constraint_points',[])]
+        vertices=[np.array(p) for ring in panel['polygons'] for p in ring]
+        normal=np.array(panel['plane_normal']);u=np.cross(normal,[0.,0.,1.] if abs(normal[2])<.9 else [1.,0.,0.]);u/=np.linalg.norm(u);v=np.cross(normal,u)
+        rings=[np.column_stack((np.array(r)@u,np.array(r)@v)) for r in panel['polygons']]
+        surface=Polygon(rings[0],rings[1:])
+        for i,p in enumerate(points):
+            from shapely.geometry import Point
+            distance=surface.boundary.distance(Point(p@u,p@v))
+            close_boundary=1e-8<distance<0.03-1e-8
+            close_point=any(1e-8<np.linalg.norm(p-q)<0.03-1e-8 for q in points[:i]+vertices)
+            if close_boundary or close_point:crowded_constraints.append(dict(panel=panel['id'],point=i))
+    split_shared_nodes=[node for node,points in endpoint_groups.items() if any(np.linalg.norm(p-points[0])>1e-8 for p in points)]
+    return dict(crowded_constraint_points=crowded_constraints,source_bars=len(expected_bars),represented_bars=len(expected_bars.intersection(bar_sources)),
+        missing_bars=sorted(expected_bars-set(bar_sources)),duplicate_bar_sources=[i for i,c in Counter(bar_sources).items() if c>1],
+        invalid_bar_attachments=bad_attachments,inconsistent_bar_lengths=inconsistent_lengths,split_shared_bar_nodes=split_shared_nodes,
+        connected_pairs=len(connections),unverified_connections=unverified,
         narrow_feature_threshold=0.03,junction_distance_threshold=0.01,
         narrow_features=narrow,near_vertex_edge_candidates=near_junctions,
         max_plane_error=max_plane_error,

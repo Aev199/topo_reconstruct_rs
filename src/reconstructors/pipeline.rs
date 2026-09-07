@@ -29,10 +29,18 @@ impl<'a> TopologyPipeline<'a> {
             PanelReconstructor::extract_slab_elevations(&panels, self.config.tol_dist);
 
         // 4. Восстановление стержней
-        let bars = BarReconstructor::reconstruct(
+        let mut bars = BarReconstructor::reconstruct(
             self.mesh_data,
             &canonical_nodes,
             &slab_elevations,
+            self.config,
+        );
+
+        let bar_contacts = crate::geometry::bar_contacts::attach_bar_endpoints(
+            &mut bars,
+            &mut panels,
+            self.mesh_data,
+            &canonical_nodes,
             self.config,
         );
 
@@ -48,6 +56,24 @@ impl<'a> TopologyPipeline<'a> {
             .map(|e| e.id)
             .collect();
         let mut diagnostics = vec![format!("Согласование границ: объединено вершин {}, вставлено {}, связанных пар панелей {}; максимальное перемещение {}", topology.merged_vertices, topology.inserted_vertices, topology.connected_panel_pairs, topology.max_displacement)];
+        diagnostics.push(format!("Примыкания стержней: привязано групп {}, перемещено {}, не согласовано {}; максимум перемещения {}",bar_contacts.attached_groups,bar_contacts.moved_groups,bar_contacts.rejected_groups,bar_contacts.max_displacement));
+        let represented_bars: std::collections::HashSet<_> = bars
+            .iter()
+            .flat_map(|b| b.source_element_ids.iter().copied())
+            .collect();
+        let missing_bars: Vec<_> = self
+            .mesh_data
+            .elements
+            .iter()
+            .filter(|e| e.is_bar() && !represented_bars.contains(&e.id))
+            .map(|e| e.id)
+            .collect();
+        if !missing_bars.is_empty() {
+            diagnostics.push(format!(
+                "Стержневые КЭ без восстановленной оси: {:?}",
+                missing_bars
+            ));
+        }
         let mut excluded = std::collections::BTreeMap::<u32, Vec<u32>>::new();
         for el in &self.mesh_data.elements {
             if !el.is_shell() && !el.is_bar() {
@@ -92,6 +118,7 @@ impl<'a> TopologyPipeline<'a> {
         ReconstructionReport {
             diagnostics,
             topology,
+            bar_contacts,
             slabs_count: panels
                 .iter()
                 .filter(|p| p.panel_type == PanelType::Slab)
