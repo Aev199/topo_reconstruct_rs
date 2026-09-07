@@ -671,7 +671,7 @@ fn simplify_ring(pts: &[DVec3], min_edge: f64, deviation: f64) -> Vec<DVec3> {
     result
 }
 
-fn order_valid_rings(
+pub(crate) fn order_valid_rings(
     mut rings: Vec<Vec<[f64; 3]>>,
     u: DVec3,
     v: DVec3,

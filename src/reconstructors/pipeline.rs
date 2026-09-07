@@ -19,7 +19,10 @@ impl<'a> TopologyPipeline<'a> {
         let canonical_nodes = canonicalize_nodes(&self.mesh_data.nodes, self.config.weld_tol);
 
         // 2. Восстановление плит и стен (параллельно через Rayon)
-        let panels = PanelReconstructor::reconstruct(self.mesh_data, &canonical_nodes, self.config);
+        let mut panels =
+            PanelReconstructor::reconstruct(self.mesh_data, &canonical_nodes, self.config);
+
+        let topology = crate::geometry::topology::conform_panels(&mut panels, self.config);
 
         // 3. Определение высотных отметок
         let slab_elevations =
@@ -44,7 +47,7 @@ impl<'a> TopologyPipeline<'a> {
             .filter(|e| e.is_shell() && !represented.contains(&e.id))
             .map(|e| e.id)
             .collect();
-        let mut diagnostics = Vec::new();
+        let mut diagnostics = vec![format!("Согласование границ: объединено вершин {}, вставлено {}, связанных пар панелей {}; максимальное перемещение {}", topology.merged_vertices, topology.inserted_vertices, topology.connected_panel_pairs, topology.max_displacement)];
         let mut excluded = std::collections::BTreeMap::<u32, Vec<u32>>::new();
         for el in &self.mesh_data.elements {
             if !el.is_shell() && !el.is_bar() {
@@ -88,6 +91,7 @@ impl<'a> TopologyPipeline<'a> {
         ));
         ReconstructionReport {
             diagnostics,
+            topology,
             slabs_count: panels
                 .iter()
                 .filter(|p| p.panel_type == PanelType::Slab)

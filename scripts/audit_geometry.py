@@ -70,6 +70,23 @@ def audit(model, report):
             if pa.is_valid and pb.is_valid:
                 area=pa.intersection(pb).area
                 if area>1e-8: overlaps.append(dict(panels=[a['id'],b['id']],area=area))
+    connections=set()
+    unverified=[]
+    edge_sets={}
+    for panel in panels:
+        segments=set()
+        for ring in panel['polygons']:
+            for a,b in zip(ring,ring[1:]+ring[:1]):
+                a=tuple(round(x,8) for x in a);b=tuple(round(x,8) for x in b)
+                segments.add(tuple(sorted((a,b))))
+        edge_sets[panel['id']]=segments
+    by_id={p['id']:p for p in panels}
+    for panel in panels:
+        for neighbor in panel.get('connected_panel_ids',[]):
+            pair=tuple(sorted((panel['id'],neighbor)))
+            connections.add(pair)
+            if neighbor not in by_id or panel['id'] not in by_id[neighbor].get('connected_panel_ids',[]) or not edge_sets[panel['id']].intersection(edge_sets[neighbor]):
+                unverified.append(pair)
     near_junctions=0
     if edges:
         starts=np.array([e[1] for e in edges]); ends=np.array([e[2] for e in edges])
@@ -79,7 +96,8 @@ def audit(model, report):
             t=np.divide(np.sum((point-starts)*direction,axis=1),lengths,out=np.zeros_like(lengths),where=lengths>0)
             distances=np.linalg.norm(point-(starts+np.clip(t,0,1)[:,None]*direction),axis=1)
             near_junctions+=int(np.sum((owners!=owner)&(t>1e-6)&(t<1-1e-6)&(distances>=1e-7)&(distances<0.01)))
-    return dict(narrow_feature_threshold=0.03,junction_distance_threshold=0.01,
+    return dict(connected_pairs=len(connections),unverified_connections=unverified,
+        narrow_feature_threshold=0.03,junction_distance_threshold=0.01,
         narrow_features=narrow,near_vertex_edge_candidates=near_junctions,
         max_plane_error=max_plane_error,
         nodes=len(nodes),elements=len(elements),types=dict(Counter(e[0] for e in elements.values())),

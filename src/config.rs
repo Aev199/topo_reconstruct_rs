@@ -14,6 +14,8 @@ pub struct ReconstructionConfig {
     pub weld_tol: f64,
     /// Минимальная длина ребра при очистке контура.
     pub min_edge: f64,
+    /// Допуск согласования границ восстановленных панелей.
+    pub joint_tol: f64,
     /// Флаг: делить плиты по стенам
     pub split_slabs_by_walls: bool,
     /// Флаг: делить плиты по балкам
@@ -28,6 +30,7 @@ impl Default for ReconstructionConfig {
             simplify_tol: 0.01,
             weld_tol: 0.001,
             min_edge: 0.03,
+            joint_tol: 0.01,
             split_slabs_by_walls: true,
             split_slabs_by_beams: true,
         }

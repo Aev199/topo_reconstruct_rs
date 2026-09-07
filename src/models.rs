@@ -86,6 +86,7 @@ pub struct ReconstructionReport {
     pub beams_count: usize,
     pub braces_count: usize,
     pub diagnostics: Vec<String>,
+    pub topology: crate::geometry::topology::TopologySummary,
     pub panels: Vec<MacroPanel>,
     pub bars: Vec<MacroBar>,
 }

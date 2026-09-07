@@ -22,6 +22,11 @@ def main():
             subprocess.run([binary,str(path),'--json',str(root/'out.json'),'--dxf',str(root/'out.dxf')],check=True,capture_output=True)
             return json.loads((root/'out.json').read_text())
         baseline=run(Path(args.model).resolve())
+        def connections(report, order):
+            membership={p['id']:tuple(sorted(order[i-1] for i in p['source_element_ids'])) for p in report['panels']}
+            return {tuple(sorted((membership[p['id']],membership[neighbor])))
+                    for p in report['panels'] for neighbor in p.get('connected_panel_ids',[])}
+        baseline_connections=connections(baseline,list(elements))
         repeated=run(Path(args.model).resolve())
         assert baseline==repeated,'Output is not deterministic between runs'
         print('Repeated run: identical JSON')
@@ -44,6 +49,7 @@ def main():
             restored_groups=sorted(tuple(sorted(eorder[i-1] for i in p['source_element_ids'])) for p in report['panels'])
             assert restored_groups==original_groups,(name,'panel source membership changed')
             assert sum(p['filled_holes'] for p in report['panels'])==sum(p['filled_holes'] for p in baseline['panels'])
-            print(name+': counts, panel membership and filled holes preserved')
+            assert connections(report,eorder)==baseline_connections,(name,'shared-edge connectivity changed')
+            print(name+': counts, panel membership, filled holes and shared-edge connectivity preserved')
 
 if __name__=='__main__': main()
