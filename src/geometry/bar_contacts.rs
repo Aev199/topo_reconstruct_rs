@@ -13,6 +13,7 @@ const EPS: f64 = 1e-8;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BarContactSummary {
     pub fitted_axes: usize,
+    pub joint_solve_converged: bool,
     pub max_axis_fit_displacement: f64,
     pub anchor_groups: usize,
     pub surface_crossings: usize,
@@ -183,6 +184,104 @@ fn update_endpoint(bar: &mut MacroBar, anchor: Anchor, point: DVec3, panel_ids: 
     bar.bar_type = classify_bar(a, a + d);
 }
 
+// Alternating projections onto shared-node equations and endpoint displacement
+// balls. Unknowns are only the two ends of each whole straight axis.
+fn reconcile_axes(
+    bars: &mut [MacroBar],
+    original: &[[DVec3; 2]],
+    config: &ReconstructionConfig,
+) -> bool {
+    let mut joints: BTreeMap<u32, Vec<(usize, f64)>> = BTreeMap::new();
+    for (i, bar) in bars.iter().enumerate() {
+        joints.entry(bar.start_node_id).or_default().push((i, 0.0));
+        joints.entry(bar.end_node_id).or_default().push((i, 1.0));
+        for c in &bar.constraints {
+            if let Some(node) = c.source_node_id {
+                joints.entry(node).or_default().push((i, c.t));
+            }
+        }
+    }
+    let equations: Vec<Vec<(usize, f64)>> = joints
+        .values()
+        .flat_map(|anchors| {
+            anchors
+                .iter()
+                .skip(1)
+                .map(|&(j, u)| {
+                    let (i, t) = anchors[0];
+                    let mut coefficients = BTreeMap::<usize, f64>::new();
+                    for (index, value) in [
+                        (2 * i, 1.0 - t),
+                        (2 * i + 1, t),
+                        (2 * j, -(1.0 - u)),
+                        (2 * j + 1, -u),
+                    ] {
+                        *coefficients.entry(index).or_default() += value;
+                    }
+                    coefficients
+                        .into_iter()
+                        .filter(|(_, v)| v.abs() > 1e-14)
+                        .collect()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let mut points: Vec<_> = bars
+        .iter()
+        .flat_map(|b| {
+            [
+                DVec3::from_array(b.start_point),
+                DVec3::from_array(b.end_point),
+            ]
+        })
+        .collect();
+    for _ in 0..4000 {
+        for equation in &equations {
+            let norm: f64 = equation.iter().map(|(_, w)| w * w).sum();
+            if norm == 0.0 {
+                continue;
+            }
+            let residual: DVec3 = equation.iter().map(|&(i, w)| points[i] * w).sum();
+            for &(i, w) in equation {
+                points[i] -= residual * (w / norm);
+            }
+        }
+        for (i, point) in points.iter_mut().enumerate() {
+            let origin = original[i / 2][i % 2];
+            let delta = *point - origin;
+            if delta.length() > config.joint_tol {
+                *point = origin + delta.normalize() * config.joint_tol;
+            }
+        }
+        let error = equations
+            .iter()
+            .map(|e| {
+                e.iter()
+                    .map(|&(i, w)| points[i] * w)
+                    .sum::<DVec3>()
+                    .length()
+            })
+            .fold(0.0, f64::max);
+        if error < EPS * 0.1 {
+            if bars.iter().enumerate().any(|(i, _)| {
+                let d = points[2 * i + 1] - points[2 * i];
+                let old = original[i][1] - original[i][0];
+                d.length() + EPS < old.length().min(config.min_edge) || d.dot(old) <= 0.0
+            }) {
+                return false;
+            }
+            for (i, bar) in bars.iter_mut().enumerate() {
+                bar.start_point = points[2 * i].to_array();
+                bar.end_point = points[2 * i + 1].to_array();
+                bar.length = points[2 * i].distance(points[2 * i + 1]);
+                bar.bar_type = classify_bar(points[2 * i], points[2 * i + 1]);
+            }
+            return true;
+        }
+    }
+    false
+}
+
 pub fn attach_bar_endpoints(
     bars: &mut [MacroBar],
     panels: &mut [MacroPanel],
@@ -268,6 +367,16 @@ pub fn attach_bar_endpoints(
                 bars[i].length = new_a.distance(new_b);
                 bars[i].bar_type = classify_bar(new_a, new_b);
             }
+        }
+    }
+    stats.joint_solve_converged = reconcile_axes(bars, &original_ends, config);
+    if !stats.joint_solve_converged {
+        // A failed global proposal must not leave independently shifted axes.
+        for (bar, ends) in bars.iter_mut().zip(&original_ends) {
+            bar.start_point = ends[0].to_array();
+            bar.end_point = ends[1].to_array();
+            bar.length = ends[0].distance(ends[1]);
+            bar.bar_type = classify_bar(ends[0], ends[1]);
         }
     }
     let mut groups: BTreeMap<u32, Vec<(usize, Anchor)>> = BTreeMap::new();
@@ -622,6 +731,62 @@ mod tests {
         }
     }
     #[test]
+    fn joint_solver_moves_whole_crossing_axes_within_budget() {
+        let mut a = bar([0., 0., 0.], [2., 0., 0.], 1, 3);
+        let mut b = bar([1., -1., 0.], [1., 1., 0.], 4, 5);
+        for axis in [&mut a, &mut b] {
+            axis.constraints.push(crate::models::BarConstraint {
+                t: 0.5,
+                source_node_id: Some(2),
+                kinds: vec!["junction".into()],
+                panel_ids: vec![],
+            });
+        }
+        let original = vec![
+            [
+                DVec3::from_array(a.start_point),
+                DVec3::from_array(a.end_point),
+            ],
+            [
+                DVec3::from_array(b.start_point),
+                DVec3::from_array(b.end_point),
+            ],
+        ];
+        a.start_point[2] = 0.006;
+        a.end_point[2] = 0.006;
+        b.start_point[2] = -0.006;
+        b.end_point[2] = -0.006;
+        let mut bars = vec![a, b];
+        assert!(reconcile_axes(
+            &mut bars,
+            &original,
+            &ReconstructionConfig::default()
+        ));
+        assert!(
+            anchor_point(&bars[0], Anchor::Interior(0))
+                .distance(anchor_point(&bars[1], Anchor::Interior(0)))
+                < EPS
+        );
+        for (i, axis) in bars.iter().enumerate() {
+            assert!(DVec3::from_array(axis.start_point).distance(original[i][0]) <= 0.01 + EPS);
+            assert_eq!(axis.constraints[0].t, 0.5);
+            assert!(axis.length > 1.99);
+        }
+    }
+    #[test]
+    fn infeasible_joint_solver_does_not_commit_partial_changes() {
+        let a = bar([0., 0., 0.], [2., 0., 0.], 1, 1);
+        let original = vec![[DVec3::ZERO, DVec3::X * 2.]];
+        let mut bars = vec![a];
+        assert!(!reconcile_axes(
+            &mut bars,
+            &original,
+            &ReconstructionConfig::default()
+        ));
+        assert_eq!(bars[0].start_point, [0., 0., 0.]);
+        assert_eq!(bars[0].end_point, [2., 0., 0.]);
+    }
+    #[test]
     fn shared_endpoints_move_together_and_create_surface_constraint() {
         let mut bars = vec![
             bar([1., 1., 0.005], [1., 1., 1.], 1, 2),
@@ -736,8 +901,9 @@ mod tests {
             &ReconstructionConfig::default(),
         );
         assert_eq!(bars.len(), 2);
-        assert_eq!(bars[0].start_point, [0., 0., 0.]);
-        assert_eq!(bars[0].end_point, [2., 0., 0.]);
-        assert_eq!(bars[1].start_point, [1., 0., 0.]);
+        assert!(on_axis(&bars[0], DVec3::from_array(bars[1].start_point)));
+        assert!((bars[0].length - 2.0).abs() < EPS);
+        assert!(DVec3::from_array(bars[0].start_point).distance(DVec3::ZERO) <= 0.01);
+        assert!(DVec3::from_array(bars[0].end_point).distance(DVec3::X * 2.0) <= 0.01);
     }
 }
