@@ -71,7 +71,7 @@ pub enum BarType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MacroBar {
     pub bar_type: BarType,
-    pub stiffness_id: u32,
+    pub stiffness_id: Option<u32>,
     pub start_point: [f64; 3],
     pub end_point: [f64; 3],
     pub length: f64,
@@ -81,6 +81,8 @@ pub struct MacroBar {
     pub source_node_ids: Vec<u32>,
     pub start_panel_ids: Vec<u32>,
     pub end_panel_ids: Vec<u32>,
+    pub constraints: Vec<BarConstraint>,
+    pub property_spans: Vec<BarPropertySpan>,
 }
 
 /// Итоговый сводный отчет
@@ -97,4 +99,21 @@ pub struct ReconstructionReport {
     pub topology: crate::geometry::topology::TopologySummary,
     pub panels: Vec<MacroPanel>,
     pub bars: Vec<MacroBar>,
+}
+
+/// Meshing/attachment metadata on a two-endpoint geometric line; t is in [0,1].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BarConstraint {
+    pub t: f64,
+    pub source_node_id: Option<u32>,
+    pub kinds: Vec<String>,
+    pub panel_ids: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BarPropertySpan {
+    pub start_t: f64,
+    pub end_t: f64,
+    pub stiffness_id: u32,
+    pub source_element_ids: Vec<u32>,
 }

@@ -116,6 +116,31 @@ def audit(model, report):
                 recorded=any(np.linalg.norm(p-np.array(q))<=1e-8 for q in panel.get('constraint_points',[]))
                 if abs(p@normal+panel['plane_d'])>1e-8 or surface.distance(Point(p@u,p@v))>1e-8 or not recorded:
                     bad_attachments.append(dict(elements=b.get('source_element_ids',[]),end=end,panel=owner))
+    bad_bar_constraints=[]
+    bad_property_spans=[]
+    for b in report['bars']:
+        start=np.array(b['start_point']);direction=np.array(b['end_point'])-start
+        spans=b.get('property_spans',[])
+        if spans:
+            covered=[id for span in spans for id in span['source_element_ids']]
+            valid=(abs(spans[0]['start_t'])<1e-8 and abs(spans[-1]['end_t']-1)<1e-8
+                and all(0<=span['start_t']<span['end_t']<=1 for span in spans)
+                and all(abs(a['end_t']-c['start_t'])<1e-8 for a,c in zip(spans,spans[1:]))
+                and sorted(covered)==sorted(b['source_element_ids'])
+                and all(elements[id][1]==span['stiffness_id'] for span in spans for id in span['source_element_ids']))
+            if not valid:bad_property_spans.append(b['source_element_ids'])
+        for c in b.get('constraints',[]):
+            t=c['t'];point=start+t*direction
+            if not 0<t<1:bad_bar_constraints.append(dict(elements=b['source_element_ids'],t=t))
+            if c.get('source_node_id') is not None:endpoint_groups.setdefault(c['source_node_id'],[]).append(point)
+            for owner in c['panel_ids']:
+                panel=by_id[owner];normal=np.array(panel['plane_normal'])
+                u=np.cross(normal,[0.,0.,1.] if abs(normal[2])<.9 else [1.,0.,0.]);u/=np.linalg.norm(u);v=np.cross(normal,u)
+                rings=[np.column_stack((np.array(r)@u,np.array(r)@v)) for r in panel['polygons']]
+                surface=Polygon(rings[0],rings[1:])
+                recorded=any(np.linalg.norm(point-np.array(q))<=1e-8 for q in panel.get('constraint_points',[]))
+                if abs(point@normal+panel['plane_d'])>1e-8 or surface.distance(Point(point@u,point@v))>1e-8 or not recorded:
+                    bad_bar_constraints.append(dict(elements=b['source_element_ids'],t=t,panel=owner))
     crowded_constraints=[]
     for panel in panels:
         points=[np.array(p) for p in panel.get('constraint_points',[])]
@@ -130,7 +155,7 @@ def audit(model, report):
             close_point=any(1e-8<np.linalg.norm(p-q)<0.03-1e-8 for q in points[:i]+vertices)
             if close_boundary or close_point:crowded_constraints.append(dict(panel=panel['id'],point=i))
     split_shared_nodes=[node for node,points in endpoint_groups.items() if any(np.linalg.norm(p-points[0])>1e-8 for p in points)]
-    return dict(crowded_constraint_points=crowded_constraints,source_bars=len(expected_bars),represented_bars=len(expected_bars.intersection(bar_sources)),
+    return dict(invalid_bar_constraints=bad_bar_constraints,invalid_property_spans=bad_property_spans,crowded_constraint_points=crowded_constraints,source_bars=len(expected_bars),represented_bars=len(expected_bars.intersection(bar_sources)),
         missing_bars=sorted(expected_bars-set(bar_sources)),duplicate_bar_sources=[i for i,c in Counter(bar_sources).items() if c>1],
         invalid_bar_attachments=bad_attachments,inconsistent_bar_lengths=inconsistent_lengths,split_shared_bar_nodes=split_shared_nodes,
         connected_pairs=len(connections),unverified_connections=unverified,

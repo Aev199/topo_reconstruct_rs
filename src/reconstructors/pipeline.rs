@@ -57,6 +57,12 @@ impl<'a> TopologyPipeline<'a> {
             .collect();
         let mut diagnostics = vec![format!("Согласование границ: объединено вершин {}, вставлено {}, связанных пар панелей {}; максимальное перемещение {}", topology.merged_vertices, topology.inserted_vertices, topology.connected_panel_pairs, topology.max_displacement)];
         diagnostics.push(format!("Примыкания стержней: привязано групп {}, перемещено {}, не согласовано {}; максимум перемещения {}",bar_contacts.attached_groups,bar_contacts.moved_groups,bar_contacts.rejected_groups,bar_contacts.max_displacement));
+        if !bar_contacts.unresolved_bar_junctions.is_empty() {
+            diagnostics.push(format!(
+                "Прямые оси с несогласованными исходными примыканиями: {:?}",
+                bar_contacts.unresolved_bar_junctions
+            ));
+        }
         let represented_bars: std::collections::HashSet<_> = bars
             .iter()
             .flat_map(|b| b.source_element_ids.iter().copied())
