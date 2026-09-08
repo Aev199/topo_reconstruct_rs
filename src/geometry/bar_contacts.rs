@@ -20,6 +20,25 @@ pub struct RejectedSurfaceCrossing {
     pub reason: String,
 }
 
+/// Measurements of the final geometry, not a claim about mechanical contact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissingSurfaceContact {
+    pub node_id: u32,
+    pub panel_id: u32,
+    pub inferred: bool,
+    pub source_bar_element_ids: Vec<u32>,
+    pub anchors: Vec<SurfaceAnchorMeasurement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SurfaceAnchorMeasurement {
+    pub point: [f64; 3],
+    pub plane_distance: f64,
+    pub projection_inside: bool,
+    pub boundary_distance: f64,
+    pub nearest_constraint_distance: Option<f64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CoupledPlaneSearch {
     pub iterations: usize,
@@ -46,6 +65,11 @@ pub struct RotationTrial {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BarContactSummary {
     pub fitted_axes: usize,
+    /// Geometric hypotheses, separate from source FE incidence.
+    #[serde(default)]
+    pub inferred_panel_ids_by_node: BTreeMap<u32, Vec<u32>>,
+    #[serde(default)]
+    pub ambiguous_panel_ids_by_node: BTreeMap<u32, Vec<u32>>,
     pub rotation_trial: RotationTrial,
     pub joint_solve_converged: bool,
     pub coupled_planes_converged: bool,
@@ -59,6 +83,8 @@ pub struct BarContactSummary {
     pub attached_groups: usize,
     pub partial_groups: usize,
     pub unresolved_panel_ids_by_node: BTreeMap<u32, Vec<u32>>,
+    #[serde(default)]
+    pub missing_surface_contacts: Vec<MissingSurfaceContact>,
     pub moved_groups: usize,
     pub rejected_groups: usize,
     pub rejected_node_ids: Vec<u32>,
@@ -685,6 +711,11 @@ pub fn attach_bar_endpoints(
             canonical,
             config,
         );
+        if candidate.inferred_panel_ids_by_node != baseline.inferred_panel_ids_by_node
+            || candidate.ambiguous_panel_ids_by_node != baseline.ambiguous_panel_ids_by_node
+        {
+            continue;
+        }
         trial.candidate_missing_incidences = Some(missing(&candidate));
         let mut max_bar = 0.0_f64;
         let mut max_panel = 0.0_f64;
@@ -756,7 +787,148 @@ pub fn attach_bar_endpoints(
         }
     }
     baseline.rotation_trial.attempted_candidates = attempted;
+    baseline.missing_surface_contacts = measure_missing_contacts(bars, panels, &baseline);
     baseline
+}
+
+fn measure_missing_contacts(
+    bars: &[MacroBar],
+    panels: &[MacroPanel],
+    stats: &BarContactSummary,
+) -> Vec<MissingSurfaceContact> {
+    let mut result = vec![];
+    for (&node, ids) in &stats.unresolved_panel_ids_by_node {
+        let mut points = vec![];
+        let mut sources = BTreeSet::new();
+        for bar in bars {
+            let mut local = vec![];
+            if bar.start_node_id == node {
+                local.push(DVec3::from_array(bar.start_point));
+            }
+            if bar.end_node_id == node {
+                local.push(DVec3::from_array(bar.end_point));
+            }
+            for (i, c) in bar.constraints.iter().enumerate() {
+                if c.source_node_id == Some(node) {
+                    local.push(anchor_point(bar, Anchor::Interior(i)));
+                }
+            }
+            if !local.is_empty() {
+                sources.extend(bar.source_element_ids.iter().copied());
+            }
+            points.extend(local);
+        }
+        for id in ids {
+            let Some(panel) = panels.iter().find(|p| p.id == *id) else {
+                continue;
+            };
+            let n = DVec3::from_array(panel.plane_normal);
+            let anchors = points
+                .iter()
+                .map(|&point| {
+                    let signed = n.dot(point) + panel.plane_d;
+                    let projection = point - signed * n;
+                    SurfaceAnchorMeasurement {
+                        point: point.to_array(),
+                        plane_distance: signed.abs(),
+                        projection_inside: contains(panel, projection),
+                        boundary_distance: nearest_boundary(panel, projection).distance(projection),
+                        nearest_constraint_distance: panel
+                            .constraint_points
+                            .iter()
+                            .chain(panel.polygons.iter().flatten())
+                            .map(|p| DVec3::from_array(*p).distance(projection))
+                            .min_by(f64::total_cmp),
+                    }
+                })
+                .collect();
+            result.push(MissingSurfaceContact {
+                node_id: node,
+                panel_id: *id,
+                inferred: stats
+                    .inferred_panel_ids_by_node
+                    .get(&node)
+                    .is_some_and(|ids| ids.contains(id)),
+                source_bar_element_ids: sources.iter().copied().collect(),
+                anchors,
+            });
+        }
+    }
+    result
+}
+
+/// Infer missing incidence before the coupled solve. A point must project inside
+/// the actual surface (holes excluded). Separated parallel alternatives are not
+/// enough evidence to choose a construction connection across a possible joint.
+fn infer_incidence(
+    bars: &[MacroBar],
+    panels: &[MacroPanel],
+    incident: &mut BTreeMap<u32, BTreeSet<usize>>,
+    config: &ReconstructionConfig,
+    stats: &mut BarContactSummary,
+) {
+    let mut anchors: BTreeMap<u32, Vec<DVec3>> = BTreeMap::new();
+    for bar in bars {
+        anchors
+            .entry(bar.start_node_id)
+            .or_default()
+            .push(DVec3::from_array(bar.start_point));
+        anchors
+            .entry(bar.end_node_id)
+            .or_default()
+            .push(DVec3::from_array(bar.end_point));
+        for (i, c) in bar.constraints.iter().enumerate() {
+            if let Some(node) = c.source_node_id {
+                anchors
+                    .entry(node)
+                    .or_default()
+                    .push(anchor_point(bar, Anchor::Interior(i)));
+            }
+        }
+    }
+    for (node, points) in anchors {
+        if incident.contains_key(&node) {
+            continue;
+        }
+        let candidates: BTreeSet<_> = panels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, panel)| {
+                let n = DVec3::from_array(panel.plane_normal);
+                points
+                    .iter()
+                    .all(|p| {
+                        let distance = n.dot(*p) + panel.plane_d;
+                        distance.abs() <= config.joint_tol && contains(panel, *p - distance * n)
+                    })
+                    .then_some(i)
+            })
+            .collect();
+        let ambiguous = candidates.iter().any(|&i| {
+            candidates.iter().any(|&j| {
+                if i >= j {
+                    return false;
+                }
+                let a = DVec3::from_array(panels[i].plane_normal);
+                let b = DVec3::from_array(panels[j].plane_normal);
+                a.dot(b).abs() >= config.tol_angle.cos()
+                    && points.iter().any(|p| {
+                        let pa = *p - a * (a.dot(*p) + panels[i].plane_d);
+                        let pb = *p - b * (b.dot(*p) + panels[j].plane_d);
+                        pa.distance(pb) > EPS
+                    })
+            })
+        });
+        let ids = candidates.iter().map(|&i| panels[i].id).collect();
+        if ambiguous {
+            stats.ambiguous_panel_ids_by_node.insert(node, ids);
+            // An explicit empty entry prevents later nearest-surface fallback.
+            incident.insert(node, BTreeSet::new());
+        } else if !candidates.is_empty() {
+            stats.inferred_panel_ids_by_node.insert(node, ids);
+            incident.insert(node, candidates);
+        }
+    }
 }
 
 fn attach_bar_endpoints_impl(
@@ -784,6 +956,7 @@ fn attach_bar_endpoints_impl(
             }
         }
     }
+    infer_incidence(bars, panels, &mut incident, config, &mut stats);
     let original_ends: Vec<_> = bars
         .iter()
         .map(|b| {
@@ -1280,6 +1453,89 @@ mod tests {
         }
     }
     #[test]
+    fn disconnected_axis_is_inferred_from_surface_geometry() {
+        let mut bars = vec![bar([0.5, 1., 0.04], [1.5, 1., 0.04], 1, 2)];
+        let mut panels = vec![panel()];
+        let stats = attach_bar_endpoints(
+            &mut bars,
+            &mut panels,
+            &MeshData::default(),
+            &HashMap::new(),
+            &ReconstructionConfig::default(),
+        );
+        assert_eq!(stats.inferred_panel_ids_by_node.len(), 2);
+        assert_eq!(bars[0].start_panel_ids, vec![1]);
+        assert_eq!(bars[0].end_panel_ids, vec![1]);
+        assert!(contains(&panels[0], DVec3::from_array(bars[0].start_point)));
+        assert!(contains(&panels[0], DVec3::from_array(bars[0].end_point)));
+        assert_eq!(bars[0].source_element_ids, vec![1]);
+        assert!(bars[0].constraints.is_empty());
+    }
+
+    #[test]
+    fn separated_parallel_alternatives_are_not_arbitrarily_joined() {
+        let mut second = panel();
+        second.id = 2;
+        second.plane_d = -0.02;
+        for p in &mut second.polygons[0] {
+            p[2] = 0.02;
+        }
+        let mut panels = vec![panel(), second];
+        let mut bars = vec![bar([1., 1., 0.01], [1., 1., 1.], 1, 2)];
+        let stats = attach_bar_endpoints(
+            &mut bars,
+            &mut panels,
+            &MeshData::default(),
+            &HashMap::new(),
+            &ReconstructionConfig::default(),
+        );
+        assert_eq!(stats.ambiguous_panel_ids_by_node[&1], vec![1, 2]);
+        assert!(stats.inferred_panel_ids_by_node.is_empty());
+        assert!(bars[0].start_panel_ids.is_empty());
+        assert_eq!(bars[0].start_point, [1., 1., 0.01]);
+    }
+
+    #[test]
+    fn inference_respects_budget_holes_and_existing_source_incidence() {
+        let mut surface = panel();
+        surface.polygons.push(vec![
+            [0.5, 0.5, 0.],
+            [0.5, 1.5, 0.],
+            [1.5, 1.5, 0.],
+            [1.5, 0.5, 0.],
+        ]);
+        let bars = vec![
+            bar([1., 1., 0.01], [1., 1., 0.06], 1, 2),
+            bar([0.2, 0.2, 0.01], [0.2, 0.2, 0.06], 3, 4),
+        ];
+        let mut incident = BTreeMap::from([(3, BTreeSet::from([0]))]);
+        let mut stats = BarContactSummary::default();
+        infer_incidence(
+            &bars,
+            &[surface],
+            &mut incident,
+            &ReconstructionConfig::default(),
+            &mut stats,
+        );
+        assert!(stats.inferred_panel_ids_by_node.is_empty());
+        assert_eq!(incident, BTreeMap::from([(3, BTreeSet::from([0]))]));
+    }
+
+    #[test]
+    fn missing_contact_measurements_use_final_geometry_and_keep_provenance() {
+        let bars = vec![bar([1., 1., 0.06], [1., 1., 1.], 1, 2)];
+        let mut stats = BarContactSummary::default();
+        stats.unresolved_panel_ids_by_node.insert(1, vec![1]);
+        let details = measure_missing_contacts(&bars, &[panel()], &stats);
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].source_bar_element_ids, vec![1]);
+        assert!(!details[0].inferred);
+        assert_eq!(details[0].anchors[0].plane_distance, 0.06);
+        assert!(details[0].anchors[0].projection_inside);
+        assert_eq!(details[0].anchors[0].boundary_distance, 1.);
+    }
+
+    #[test]
     fn coupled_solver_moves_plane_and_whole_axis_together() {
         let mut bars = vec![bar([0.5, 1., 0.04], [1.5, 1., 0.04], 1, 2)];
         let original = vec![[
@@ -1495,11 +1751,11 @@ mod tests {
             &HashMap::new(),
             &ReconstructionConfig::default(),
         );
-        assert_eq!(bars[0].start_point, [1., 1., 0.]);
+        assert!(contains(&panels[0], DVec3::from_array(bars[0].start_point)));
         assert_eq!(bars[0].start_point, bars[1].start_point);
         assert_eq!(bars[0].start_panel_ids, vec![1]);
-        assert_eq!(panels[0].constraint_points, vec![[1., 1., 0.]]);
-        assert_eq!(stats.moved_groups, 1);
+        assert_eq!(panels[0].constraint_points, vec![bars[0].start_point]);
+        assert!(DVec3::from_array(bars[0].start_point).distance(DVec3::new(1., 1., 0.005)) <= 0.01);
         assert!(stats.max_displacement <= 0.01);
     }
     #[test]
@@ -1531,12 +1787,25 @@ mod tests {
         for point in &mut second.polygons[0] {
             point[2] = 0.006;
         }
+        second.source_element_ids = vec![101];
         let mut panels = vec![panel(), second];
+        let mesh = MeshData {
+            nodes: HashMap::new(),
+            elements: [100, 101]
+                .into_iter()
+                .map(|id| crate::models::ElementData {
+                    id,
+                    elem_type: 42,
+                    stiff_id: 1,
+                    nodes: vec![1, 10, 11],
+                })
+                .collect(),
+        };
         let mut bars = vec![bar([1., 1., 0.003], [1., 1., 1.], 1, 2)];
         let stats = attach_bar_endpoints(
             &mut bars,
             &mut panels,
-            &MeshData::default(),
+            &mesh,
             &HashMap::new(),
             &ReconstructionConfig::default(),
         );

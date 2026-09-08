@@ -61,6 +61,15 @@ impl<'a> TopologyPipeline<'a> {
         if let Some(reason) = &bar_contacts.coupled_search.failure_reason {
             diagnostics.push(format!("Совместная корректировка не принята: {reason}; использовано резервное согласование осей."));
         }
+        if !bar_contacts.inferred_panel_ids_by_node.is_empty()
+            || !bar_contacts.ambiguous_panel_ids_by_node.is_empty()
+        {
+            diagnostics.push(format!(
+                "Восстановление примыканий: геометрических гипотез по узлам {}; неоднозначных узлов {}",
+                bar_contacts.inferred_panel_ids_by_node.len(),
+                bar_contacts.ambiguous_panel_ids_by_node.len()
+            ));
+        }
         if bar_contacts.rotation_trial.attempted_candidates > 0 {
             diagnostics.push(format!(
                 "Поворот панелей: принят {}; проверено вариантов {}; причина {}",
