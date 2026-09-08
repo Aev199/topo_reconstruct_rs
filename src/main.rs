@@ -41,8 +41,8 @@ struct Args {
     #[arg(long, default_value_t = 0.03)]
     min_edge: f64,
 
-    /// Допуск согласования общих границ панелей
-    #[arg(long, default_value_t = 0.01)]
+    /// Допуск согласования геометрии: 0.05 при координатах в метрах
+    #[arg(long, default_value_t = 0.05)]
     joint_tol: f64,
 
     /// Путь для сохранения JSON отчета

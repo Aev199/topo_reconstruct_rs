@@ -9,6 +9,7 @@ use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 const EPS: f64 = 1e-8;
+const AXIS_RESIDUAL_TOL: f64 = 1e-7;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BarContactSummary {
@@ -25,6 +26,9 @@ pub struct BarContactSummary {
     pub rejection_reasons: BTreeMap<String, Vec<u32>>,
     pub max_displacement: f64,
     pub unresolved_bar_junctions: Vec<u32>,
+    pub numerical_residual_nodes: Vec<u32>,
+    pub max_joint_gap: f64,
+    pub joint_residual_tolerance: f64,
 }
 
 fn reject(stats: &mut BarContactSummary, node: u32, reason: &str) {
@@ -185,7 +189,8 @@ fn update_endpoint(bar: &mut MacroBar, anchor: Anchor, point: DVec3, panel_ids: 
 }
 
 // Alternating projections onto shared-node equations and endpoint displacement
-// balls. Unknowns are only the two ends of each whole straight axis.
+// balls. Axis endpoints and interior incidence fractions can move; no extra
+// geometric vertices are introduced.
 fn reconcile_axes(
     bars: &mut [MacroBar],
     original: &[[DVec3; 2]],
@@ -201,31 +206,6 @@ fn reconcile_axes(
             }
         }
     }
-    let equations: Vec<Vec<(usize, f64)>> = joints
-        .values()
-        .flat_map(|anchors| {
-            anchors
-                .iter()
-                .skip(1)
-                .map(|&(j, u)| {
-                    let (i, t) = anchors[0];
-                    let mut coefficients = BTreeMap::<usize, f64>::new();
-                    for (index, value) in [
-                        (2 * i, 1.0 - t),
-                        (2 * i + 1, t),
-                        (2 * j, -(1.0 - u)),
-                        (2 * j + 1, -u),
-                    ] {
-                        *coefficients.entry(index).or_default() += value;
-                    }
-                    coefficients
-                        .into_iter()
-                        .filter(|(_, v)| v.abs() > 1e-14)
-                        .collect()
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
     let mut points: Vec<_> = bars
         .iter()
         .flat_map(|b| {
@@ -235,7 +215,54 @@ fn reconcile_axes(
             ]
         })
         .collect();
-    for _ in 0..4000 {
+    for _ in 0..10000 {
+        // Slide interior incidences along their whole axes. Keeping FE-derived
+        // fractions fixed overconstrains a network after geometric straightening.
+        for anchors in joints.values_mut() {
+            if anchors.len() < 2 {
+                continue;
+            }
+            let target = anchors
+                .iter()
+                .map(|&(i, t)| points[2 * i] * (1.0 - t) + points[2 * i + 1] * t)
+                .sum::<DVec3>()
+                / anchors.len() as f64;
+            for (i, t) in anchors {
+                if *t > 0.0 && *t < 1.0 {
+                    let a = points[2 * *i];
+                    let d = points[2 * *i + 1] - a;
+                    if d.length_squared() > EPS * EPS {
+                        *t = ((target - a).dot(d) / d.length_squared()).clamp(1e-10, 1.0 - 1e-10);
+                    }
+                }
+            }
+        }
+        let equations: Vec<Vec<(usize, f64)>> = joints
+            .values()
+            .flat_map(|anchors| {
+                anchors
+                    .iter()
+                    .skip(1)
+                    .map(|&(j, u)| {
+                        let (i, t) = anchors[0];
+                        let mut coefficients = BTreeMap::<usize, f64>::new();
+                        for (index, value) in [
+                            (2 * i, 1.0 - t),
+                            (2 * i + 1, t),
+                            (2 * j, -(1.0 - u)),
+                            (2 * j + 1, -u),
+                        ] {
+                            *coefficients.entry(index).or_default() += value;
+                        }
+                        coefficients
+                            .into_iter()
+                            .filter(|(_, v)| v.abs() > 1e-14)
+                            .collect()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
         for equation in &equations {
             let norm: f64 = equation.iter().map(|(_, w)| w * w).sum();
             if norm == 0.0 {
@@ -262,7 +289,7 @@ fn reconcile_axes(
                     .length()
             })
             .fold(0.0, f64::max);
-        if error < EPS * 0.1 {
+        if error < AXIS_RESIDUAL_TOL {
             if bars.iter().enumerate().any(|(i, _)| {
                 let d = points[2 * i + 1] - points[2 * i];
                 let old = original[i][1] - original[i][0];
@@ -270,7 +297,59 @@ fn reconcile_axes(
             }) {
                 return false;
             }
+            let mut parameters = Vec::new();
+            for (i, bar) in bars.iter().enumerate() {
+                let values: Vec<_> = bar
+                    .constraints
+                    .iter()
+                    .map(|c| {
+                        c.source_node_id
+                            .and_then(|node| {
+                                joints[&node].iter().find(|(j, _)| *j == i).map(|(_, t)| *t)
+                            })
+                            .unwrap_or(c.t)
+                    })
+                    .collect();
+                for (c, &t) in bar.constraints.iter().zip(&values) {
+                    let old = original[i][0] + c.t * (original[i][1] - original[i][0]);
+                    let new = points[2 * i] + t * (points[2 * i + 1] - points[2 * i]);
+                    if t <= 0.0 || t >= 1.0 || new.distance(old) > config.joint_tol + EPS {
+                        return false;
+                    }
+                }
+                let mut order: Vec<_> = bar
+                    .constraints
+                    .iter()
+                    .zip(&values)
+                    .map(|(c, t)| (c.t, *t))
+                    .collect();
+                order.push((0.0, 0.0));
+                order.push((1.0, 1.0));
+                order.sort_by(|a, b| a.0.total_cmp(&b.0));
+                for pair in order.windows(2) {
+                    let old = (pair[1].0 - pair[0].0) * (original[i][1] - original[i][0]).length();
+                    let new =
+                        (pair[1].1 - pair[0].1) * (points[2 * i + 1] - points[2 * i]).length();
+                    if new + EPS < old.min(config.min_edge) {
+                        return false;
+                    }
+                }
+                parameters.push(values);
+            }
             for (i, bar) in bars.iter_mut().enumerate() {
+                for (c, &t) in bar.constraints.iter_mut().zip(&parameters[i]) {
+                    if c.kinds.iter().any(|k| k == "property_boundary") {
+                        for span in &mut bar.property_spans {
+                            if (span.start_t - c.t).abs() < EPS {
+                                span.start_t = t;
+                            }
+                            if (span.end_t - c.t).abs() < EPS {
+                                span.end_t = t;
+                            }
+                        }
+                    }
+                    c.t = t;
+                }
                 bar.start_point = points[2 * i].to_array();
                 bar.end_point = points[2 * i + 1].to_array();
                 bar.length = points[2 * i].distance(points[2 * i + 1]);
@@ -678,11 +757,19 @@ pub fn attach_bar_endpoints(
             }
         }
     }
-    stats.unresolved_bar_junctions = joint_positions
-        .into_iter()
-        .filter(|(_, points)| points.iter().any(|p| p.distance(points[0]) > EPS))
-        .map(|(id, _)| id)
-        .collect();
+    stats.joint_residual_tolerance = AXIS_RESIDUAL_TOL;
+    for (id, positions) in joint_positions {
+        let gap = positions
+            .iter()
+            .flat_map(|p| positions.iter().map(move |q| p.distance(*q)))
+            .fold(0.0, f64::max);
+        stats.max_joint_gap = stats.max_joint_gap.max(gap);
+        if gap > AXIS_RESIDUAL_TOL {
+            stats.unresolved_bar_junctions.push(id);
+        } else if gap > EPS {
+            stats.numerical_residual_nodes.push(id);
+        }
+    }
     for panel in panels {
         panel.constraint_points.sort_by(|a, b| {
             a[0].total_cmp(&b[0])
@@ -771,6 +858,57 @@ mod tests {
             assert!(DVec3::from_array(axis.start_point).distance(original[i][0]) <= 0.01 + EPS);
             assert_eq!(axis.constraints[0].t, 0.5);
             assert!(axis.length > 1.99);
+        }
+    }
+    #[test]
+    fn snap_uses_fifty_mm_budget_and_slides_property_boundary() {
+        let mut main = bar([0., 0., 0.], [2., 0., 0.], 1, 3);
+        main.constraints.push(crate::models::BarConstraint {
+            t: 0.5,
+            source_node_id: Some(2),
+            kinds: vec!["junction".into(), "property_boundary".into()],
+            panel_ids: vec![],
+        });
+        main.property_spans = vec![
+            crate::models::BarPropertySpan {
+                start_t: 0.,
+                end_t: 0.5,
+                stiffness_id: 1,
+                source_element_ids: vec![1],
+            },
+            crate::models::BarPropertySpan {
+                start_t: 0.5,
+                end_t: 1.,
+                stiffness_id: 2,
+                source_element_ids: vec![2],
+            },
+        ];
+        let branch = bar([1.04, 0.04, 0.], [1.04, 1., 0.], 2, 4);
+        let mut bars = vec![main, branch];
+        let original: Vec<_> = bars
+            .iter()
+            .map(|b| {
+                [
+                    DVec3::from_array(b.start_point),
+                    DVec3::from_array(b.end_point),
+                ]
+            })
+            .collect();
+        assert!(reconcile_axes(
+            &mut bars,
+            &original,
+            &ReconstructionConfig::default()
+        ));
+        assert!((bars[0].constraints[0].t - 0.5).abs() > 1e-4);
+        assert!(
+            anchor_point(&bars[0], Anchor::Interior(0))
+                .distance(DVec3::from_array(bars[1].start_point))
+                < EPS
+        );
+        assert_eq!(bars[0].property_spans[0].end_t, bars[0].constraints[0].t);
+        assert_eq!(bars[0].property_spans[1].start_t, bars[0].constraints[0].t);
+        for (i, b) in bars.iter().enumerate() {
+            assert!(DVec3::from_array(b.start_point).distance(original[i][0]) <= 0.05 + EPS);
         }
     }
     #[test]

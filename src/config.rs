@@ -30,7 +30,7 @@ impl Default for ReconstructionConfig {
             simplify_tol: 0.01,
             weld_tol: 0.001,
             min_edge: 0.03,
-            joint_tol: 0.01,
+            joint_tol: 0.05,
             split_slabs_by_walls: true,
             split_slabs_by_beams: true,
         }
