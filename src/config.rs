@@ -16,6 +16,9 @@ pub struct ReconstructionConfig {
     pub min_edge: f64,
     /// Допуск согласования границ восстановленных панелей.
     pub joint_tol: f64,
+    /// Верхняя граница адаптивного ремонта контуров, в единицах модели.
+    #[serde(default = "default_repair_max_tol")]
+    pub repair_max_tol: f64,
     /// Флаг: делить плиты по стенам
     pub split_slabs_by_walls: bool,
     /// Флаг: делить плиты по балкам
@@ -31,8 +34,13 @@ impl Default for ReconstructionConfig {
             weld_tol: 0.001,
             min_edge: 0.03,
             joint_tol: 0.05,
+            repair_max_tol: default_repair_max_tol(),
             split_slabs_by_walls: true,
             split_slabs_by_beams: true,
         }
     }
+}
+
+fn default_repair_max_tol() -> f64 {
+    0.15
 }

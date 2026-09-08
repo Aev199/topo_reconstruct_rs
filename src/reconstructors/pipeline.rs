@@ -70,6 +70,13 @@ impl<'a> TopologyPipeline<'a> {
                 bar_contacts.ambiguous_panel_ids_by_node.len()
             ));
         }
+        if !bar_contacts.adaptive_boundary_repairs.is_empty() {
+            diagnostics.push(format!(
+                "Адаптивный ремонт контуров: восстановлено примыканий {}; предел смещения {}",
+                bar_contacts.adaptive_boundary_repairs.len(),
+                self.config.repair_max_tol
+            ));
+        }
         if bar_contacts.rotation_trial.attempted_candidates > 0 {
             diagnostics.push(format!(
                 "Поворот панелей: принят {}; проверено вариантов {}; причина {}",

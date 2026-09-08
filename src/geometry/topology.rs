@@ -454,6 +454,88 @@ pub(crate) fn transformed_planes_checked(
     Ok(targets)
 }
 
+/// Move an existing boundary vertex or a whole edge to an on-plane anchor.
+/// Local radius is 5% of the shortest adjacent edge, capped by repair_max_tol.
+/// Shared vertices move together; no contour subdivision is introduced.
+pub(crate) fn snap_boundary_to_anchor(
+    panels: &[MacroPanel],
+    origins: &[MacroPanel],
+    target: usize,
+    point: DVec3,
+    config: &ReconstructionConfig,
+) -> Option<(Vec<MacroPanel>, f64)> {
+    let panel = &panels[target];
+    if (DVec3::from_array(panel.plane_normal).dot(point) + panel.plane_d).abs() > EPS {
+        return None;
+    }
+    let mut proposals = vec![];
+    for ring in &panel.polygons {
+        for i in 0..ring.len() {
+            let a = DVec3::from_array(ring[i]);
+            let b = DVec3::from_array(ring[(i + 1) % ring.len()]);
+            let previous = DVec3::from_array(ring[(i + ring.len() - 1) % ring.len()]);
+            let next = DVec3::from_array(ring[(i + 2) % ring.len()]);
+            let local = a.distance(b).min(a.distance(previous));
+            let radius = config.repair_max_tol.min(0.05 * local);
+            if a.distance(point) > EPS && a.distance(point) <= radius {
+                proposals.push((a.distance(point), radius, vec![(a, point)]));
+            }
+            let d = b - a;
+            if d.length_squared() <= EPS * EPS {
+                continue;
+            }
+            let t = (point - a).dot(d) / d.length_squared();
+            if t <= 0.0 || t >= 1.0 {
+                continue;
+            }
+            let shift = point - (a + t * d);
+            let radius = config
+                .repair_max_tol
+                .min(0.05 * local.min(b.distance(next)));
+            if shift.length() > EPS && shift.length() <= radius {
+                proposals.push((shift.length(), radius, vec![(a, a + shift), (b, b + shift)]));
+            }
+        }
+    }
+    proposals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (_, radius, moves) in proposals {
+        let mut graph = Graph::new(panels, config.min_edge);
+        let mut affected = BTreeSet::new();
+        let mut bounded = true;
+        for i in 0..graph.points.len() {
+            if let Some((_, destination)) = moves
+                .iter()
+                .find(|(a, _)| a.distance(graph.points[i]) <= EPS)
+            {
+                graph.points[i] = *destination;
+                affected.extend(&graph.owners[i]);
+            }
+        }
+        // Compare every vertex with its origin before plane and boundary repair;
+        // several accepted local moves cannot accumulate beyond the global cap.
+        for &i in &affected {
+            for (ring, original) in graph.coords(i).iter().zip(&origins[i].polygons) {
+                for (p, q) in ring.iter().zip(original) {
+                    if DVec3::from_array(*p).distance(DVec3::from_array(*q))
+                        > config.repair_max_tol + EPS
+                    {
+                        bounded = false;
+                    }
+                }
+            }
+        }
+        if !bounded || !graph.valid(&affected) {
+            continue;
+        }
+        let mut candidate = panels.to_vec();
+        for &i in &affected {
+            candidate[i].polygons = graph.coords(i);
+        }
+        return Some((candidate, radius));
+    }
+    None
+}
+
 pub fn conform_panels(panels: &mut [MacroPanel], config: &ReconstructionConfig) -> TopologySummary {
     let mut graph = Graph::new(panels, config.min_edge);
     let mut stats = TopologySummary::default();

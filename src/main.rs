@@ -45,6 +45,10 @@ struct Args {
     #[arg(long, default_value_t = 0.05)]
     joint_tol: f64,
 
+    /// Верхний предел адаптивного ремонта контуров: 0.15 при координатах в метрах
+    #[arg(long, default_value_t = 0.15)]
+    repair_max_tol: f64,
+
     /// Путь для сохранения JSON отчета
     #[arg(short, long, default_value = "building_topology.json")]
     json: String,
@@ -63,6 +67,7 @@ fn main() {
         args.simplify_tol,
         args.min_edge,
         args.joint_tol,
+        args.repair_max_tol,
     ] {
         if !value.is_finite() || value <= 0.0 {
             eprintln!("Допуски должны быть конечными положительными числами.");
@@ -74,6 +79,7 @@ fn main() {
     config.simplify_tol = args.simplify_tol;
     config.min_edge = args.min_edge;
     config.joint_tol = args.joint_tol;
+    config.repair_max_tol = args.repair_max_tol;
 
     println!("=== RECONSTRUCT TOPOLOGY CORE (RUST) ===");
     println!("Входной файл: {}", args.input);

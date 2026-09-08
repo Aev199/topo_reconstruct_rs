@@ -20,6 +20,14 @@ pub struct RejectedSurfaceCrossing {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveBoundaryRepair {
+    pub node_id: u32,
+    pub panel_id: u32,
+    pub local_tolerance: f64,
+    pub max_cumulative_displacement: f64,
+}
+
 /// Measurements of the final geometry, not a claim about mechanical contact.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MissingSurfaceContact {
@@ -65,6 +73,8 @@ pub struct RotationTrial {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BarContactSummary {
     pub fitted_axes: usize,
+    #[serde(default)]
+    pub adaptive_boundary_repairs: Vec<AdaptiveBoundaryRepair>,
     /// Geometric hypotheses, separate from source FE incidence.
     #[serde(default)]
     pub inferred_panel_ids_by_node: BTreeMap<u32, Vec<u32>>,
@@ -787,8 +797,150 @@ pub fn attach_bar_endpoints(
         }
     }
     baseline.rotation_trial.attempted_candidates = attempted;
+    repair_boundaries(bars, panels, &original_panels, config, &mut baseline);
     baseline.missing_surface_contacts = measure_missing_contacts(bars, panels, &baseline);
     baseline
+}
+
+fn surface_spacing_ok(panel: &MacroPanel, point: DVec3, min_edge: f64) -> bool {
+    let distance = nearest_boundary(panel, point).distance(point);
+    contains(panel, point)
+        && (distance <= EPS || distance + EPS >= min_edge)
+        && panel
+            .constraint_points
+            .iter()
+            .chain(panel.polygons.iter().flatten())
+            .all(|p| {
+                let distance = DVec3::from_array(*p).distance(point);
+                distance <= EPS || distance + EPS >= min_edge
+            })
+}
+
+fn repair_boundaries(
+    bars: &mut [MacroBar],
+    panels: &mut [MacroPanel],
+    origins: &[MacroPanel],
+    config: &ReconstructionConfig,
+    stats: &mut BarContactSummary,
+) {
+    let mut pending: Vec<_> = stats
+        .unresolved_panel_ids_by_node
+        .iter()
+        .flat_map(|(&node, ids)| ids.iter().map(move |&id| (node, id)))
+        .collect();
+    // Rank by geometric distance, independent of source numbering.
+    let anchor = |node, bars: &[MacroBar]| -> Vec<(usize, Anchor)> {
+        let mut result = vec![];
+        for (i, b) in bars.iter().enumerate() {
+            if b.start_node_id == node {
+                result.push((i, Anchor::Start));
+            }
+            if b.end_node_id == node {
+                result.push((i, Anchor::End));
+            }
+            for (ci, c) in b.constraints.iter().enumerate() {
+                if c.source_node_id == Some(node) {
+                    result.push((i, Anchor::Interior(ci)));
+                }
+            }
+        }
+        result
+    };
+    let distance = |node, id| {
+        let points = anchor(node, bars);
+        let Some(&(i, a)) = points.first() else {
+            return f64::INFINITY;
+        };
+        let Some(panel) = panels.iter().find(|p| p.id == id) else {
+            return f64::INFINITY;
+        };
+        nearest_boundary(panel, anchor_point(&bars[i], a)).distance(anchor_point(&bars[i], a))
+    };
+    pending.sort_by(|&(n, p), &(m, q)| distance(n, p).total_cmp(&distance(m, q)));
+    for (node, id) in pending {
+        let anchors = anchor(node, bars);
+        let Some(&(i, a)) = anchors.first() else {
+            continue;
+        };
+        let point = anchor_point(&bars[i], a);
+        if anchors
+            .iter()
+            .any(|&(i, a)| anchor_point(&bars[i], a).distance(point) > EPS)
+        {
+            continue;
+        }
+        let Some(target) = panels.iter().position(|p| p.id == id) else {
+            continue;
+        };
+        let Some((candidate, tolerance)) =
+            super::topology::snap_boundary_to_anchor(panels, origins, target, point, config)
+        else {
+            continue;
+        };
+        if !surface_spacing_ok(&candidate[target], point, config.min_edge)
+            || candidate.iter().any(|p| {
+                p.constraint_points
+                    .iter()
+                    .any(|q| !surface_spacing_ok(p, DVec3::from_array(*q), config.min_edge))
+            })
+        {
+            continue;
+        }
+        let previously_attached = anchors.iter().any(|&(i, a)| match a {
+            Anchor::Start => !bars[i].start_panel_ids.is_empty(),
+            Anchor::End => !bars[i].end_panel_ids.is_empty(),
+            Anchor::Interior(ci) => !bars[i].constraints[ci].panel_ids.is_empty(),
+        });
+        let displacement = candidate
+            .iter()
+            .zip(origins)
+            .flat_map(|(p, o)| p.polygons.iter().flatten().zip(o.polygons.iter().flatten()))
+            .map(|(p, q)| DVec3::from_array(*p).distance(DVec3::from_array(*q)))
+            .fold(0.0_f64, f64::max);
+        panels.clone_from_slice(&candidate);
+        if panels[target]
+            .constraint_points
+            .iter()
+            .all(|q| DVec3::from_array(*q).distance(point) > EPS)
+        {
+            panels[target].constraint_points.push(point.to_array());
+        }
+        for (i, a) in anchors {
+            let ids = match a {
+                Anchor::Start => &mut bars[i].start_panel_ids,
+                Anchor::End => &mut bars[i].end_panel_ids,
+                Anchor::Interior(ci) => &mut bars[i].constraints[ci].panel_ids,
+            };
+            ids.push(id);
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        if !previously_attached {
+            stats.attached_groups += 1;
+            stats.partial_groups += 1;
+        }
+        let remaining = stats.unresolved_panel_ids_by_node.get_mut(&node).unwrap();
+        remaining.retain(|p| *p != id);
+        if remaining.is_empty() {
+            stats.unresolved_panel_ids_by_node.remove(&node);
+            stats.partial_groups = stats.partial_groups.saturating_sub(1);
+            stats.rejected_groups = stats.rejected_groups.saturating_sub(1);
+            stats.rejected_node_ids.retain(|n| *n != node);
+            for nodes in stats.rejection_reasons.values_mut() {
+                nodes.retain(|n| *n != node);
+            }
+            stats.rejection_reasons.retain(|_, nodes| !nodes.is_empty());
+        }
+        stats.max_panel_displacement = stats.max_panel_displacement.max(displacement);
+        stats
+            .adaptive_boundary_repairs
+            .push(AdaptiveBoundaryRepair {
+                node_id: node,
+                panel_id: id,
+                local_tolerance: tolerance,
+                max_cumulative_displacement: displacement,
+            });
+    }
 }
 
 fn measure_missing_contacts(
@@ -1452,6 +1604,172 @@ mod tests {
             property_spans: vec![],
         }
     }
+    #[test]
+    fn adaptive_boundary_repair_preserves_axis_and_attaches_outside_anchor() {
+        let mut panels = vec![panel()];
+        let origins = panels.clone();
+        let mut bars = vec![bar([1., -0.01, 0.], [1., -0.01, 1.], 1, 2)];
+        let mut stats = BarContactSummary::default();
+        stats.unresolved_panel_ids_by_node.insert(1, vec![1]);
+        stats.rejected_groups = 1;
+        repair_boundaries(
+            &mut bars,
+            &mut panels,
+            &origins,
+            &ReconstructionConfig::default(),
+            &mut stats,
+        );
+        assert_eq!(stats.adaptive_boundary_repairs.len(), 1);
+        assert_eq!(stats.adaptive_boundary_repairs[0].local_tolerance, 0.1);
+        assert!(stats.unresolved_panel_ids_by_node.is_empty());
+        assert_eq!(stats.attached_groups, 1);
+        assert_eq!(stats.partial_groups, 0);
+        assert_eq!(bars[0].start_panel_ids, vec![1]);
+        assert_eq!(bars[0].start_point, [1., -0.01, 0.]);
+        assert_eq!(bars[0].end_point, [1., -0.01, 1.]);
+        assert!(surface_spacing_ok(
+            &panels[0],
+            DVec3::from_array(bars[0].start_point),
+            0.03
+        ));
+    }
+
+    #[test]
+    fn adaptive_radius_shrinks_for_small_features_and_respects_cumulative_cap() {
+        let mut small = panel();
+        for p in &mut small.polygons[0] {
+            p[1] *= 0.05;
+        }
+        let mut config = ReconstructionConfig::default();
+        config.repair_max_tol = 0.05;
+        assert!(super::super::topology::snap_boundary_to_anchor(
+            &[small.clone()],
+            &[small],
+            0,
+            DVec3::new(1., -0.01, 0.),
+            &config
+        )
+        .is_none());
+        let panels = vec![panel()];
+        let (shifted, _) = super::super::topology::snap_boundary_to_anchor(
+            &panels,
+            &panels,
+            0,
+            DVec3::new(1., -0.04, 0.),
+            &config,
+        )
+        .unwrap();
+        assert!(super::super::topology::snap_boundary_to_anchor(
+            &shifted,
+            &panels,
+            0,
+            DVec3::new(1., -0.07, 0.),
+            &config
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn adaptive_repair_can_exceed_fifty_mm_on_large_geometry() {
+        let mut surface = panel();
+        for p in &mut surface.polygons[0] {
+            p[0] *= 2.;
+            p[1] *= 2.;
+        }
+        let panels = vec![surface];
+        let (repaired, tolerance) = super::super::topology::snap_boundary_to_anchor(
+            &panels,
+            &panels,
+            0,
+            DVec3::new(2., -0.08, 0.),
+            &ReconstructionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(tolerance, 0.15);
+        assert!(contains(&repaired[0], DVec3::new(2., -0.08, 0.)));
+        assert!(super::super::topology::snap_boundary_to_anchor(
+            &panels,
+            &panels,
+            0,
+            DVec3::new(2., -0.16, 0.),
+            &ReconstructionConfig::default()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn adaptive_repair_keeps_shared_vertices_and_incident_planes() {
+        let mut neighbour = panel();
+        neighbour.id = 2;
+        for p in &mut neighbour.polygons[0] {
+            p[1] -= 2.;
+        }
+        let panels = vec![panel(), neighbour];
+        let (repaired, _) = super::super::topology::snap_boundary_to_anchor(
+            &panels,
+            &panels,
+            0,
+            DVec3::new(1., -0.02, 0.),
+            &ReconstructionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(repaired[0].polygons[0][0], repaired[1].polygons[0][3]);
+        assert_eq!(repaired[0].polygons[0][1], repaired[1].polygons[0][2]);
+        let mut wall = panels[1].clone();
+        wall.plane_normal = [0., 1., 0.];
+        wall.plane_d = 0.;
+        for p in &mut wall.polygons[0] {
+            p[2] = p[1];
+            p[1] = 0.;
+        }
+        let panels = vec![panel(), wall];
+        assert!(super::super::topology::snap_boundary_to_anchor(
+            &panels,
+            &panels,
+            0,
+            DVec3::new(1., -0.02, 0.),
+            &ReconstructionConfig::default()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn adaptive_repair_preserves_clearance_at_existing_contacts() {
+        let mut panels = vec![panel()];
+        panels[0].constraint_points.push([1., 0.035, 0.]);
+        let origins = panels.clone();
+        let mut bars = vec![bar([1., 0.02, 0.], [1., 0.02, 1.], 1, 2)];
+        let mut stats = BarContactSummary::default();
+        stats.unresolved_panel_ids_by_node.insert(1, vec![1]);
+        repair_boundaries(
+            &mut bars,
+            &mut panels,
+            &origins,
+            &ReconstructionConfig::default(),
+            &mut stats,
+        );
+        assert!(stats.adaptive_boundary_repairs.is_empty());
+        assert_eq!(panels[0].polygons, origins[0].polygons);
+    }
+
+    #[test]
+    fn adaptive_repair_does_not_create_coplanar_overlap() {
+        let mut neighbour = panel();
+        neighbour.id = 2;
+        for p in &mut neighbour.polygons[0] {
+            p[1] -= 2.01;
+        }
+        let panels = vec![panel(), neighbour];
+        assert!(super::super::topology::snap_boundary_to_anchor(
+            &panels,
+            &panels,
+            0,
+            DVec3::new(1., -0.02, 0.),
+            &ReconstructionConfig::default()
+        )
+        .is_none());
+    }
+
     #[test]
     fn disconnected_axis_is_inferred_from_surface_geometry() {
         let mut bars = vec![bar([0.5, 1., 0.04], [1.5, 1., 0.04], 1, 2)];
