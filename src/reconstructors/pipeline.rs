@@ -57,6 +57,10 @@ impl<'a> TopologyPipeline<'a> {
             .collect();
         let mut diagnostics = vec![format!("Согласование границ: объединено вершин {}, вставлено {}, связанных пар панелей {}; максимальное перемещение {}", topology.merged_vertices, topology.inserted_vertices, topology.connected_panel_pairs, topology.max_displacement)];
         diagnostics.push(format!("Примыкания стержней: привязано групп {}, перемещено {}, не согласовано {}; максимум перемещения {}",bar_contacts.attached_groups,bar_contacts.moved_groups,bar_contacts.rejected_groups,bar_contacts.max_displacement));
+        diagnostics.push(format!("Совместное согласование панелей и осей: принято {}; осталось требований {} из {}; максимальное смещение вершины панели {}",bar_contacts.coupled_planes_converged,bar_contacts.coupled_search.retained_incidence_count,bar_contacts.coupled_search.requested_incidence_count,bar_contacts.max_panel_displacement));
+        if let Some(reason) = &bar_contacts.coupled_search.failure_reason {
+            diagnostics.push(format!("Совместная корректировка не принята: {reason}; использовано резервное согласование осей."));
+        }
         if !bar_contacts.joint_solve_converged {
             diagnostics.push("Совместное согласование осей не сошлось в заданном допуске; предварительные независимые смещения отменены. Требуется проверка оставшихся примыканий.".into());
         }

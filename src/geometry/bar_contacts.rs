@@ -21,9 +21,24 @@ pub struct RejectedSurfaceCrossing {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CoupledPlaneSearch {
+    pub iterations: usize,
+    pub requested_incidence_count: usize,
+    pub retained_incidence_count: usize,
+    pub relaxed_incidence_pairs: Vec<[u32; 2]>,
+    pub frozen_panel_ids: Vec<u32>,
+    pub final_axis_residual: f64,
+    pub final_plane_residual: f64,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BarContactSummary {
     pub fitted_axes: usize,
     pub joint_solve_converged: bool,
+    pub coupled_planes_converged: bool,
+    pub coupled_search: CoupledPlaneSearch,
+    pub max_panel_displacement: f64,
     pub max_axis_fit_displacement: f64,
     pub anchor_groups: usize,
     pub surface_crossings: usize,
@@ -208,6 +223,27 @@ fn reconcile_axes(
     original: &[[DVec3; 2]],
     config: &ReconstructionConfig,
 ) -> bool {
+    reconcile_axes_and_planes(
+        bars,
+        original,
+        config,
+        &mut [],
+        &BTreeMap::new(),
+        &mut CoupledPlaneSearch::default(),
+    )
+}
+fn reconcile_axes_and_planes(
+    bars: &mut [MacroBar],
+    original: &[[DVec3; 2]],
+    config: &ReconstructionConfig,
+    panels: &mut [MacroPanel],
+    incident: &BTreeMap<u32, BTreeSet<usize>>,
+    search: &mut CoupledPlaneSearch,
+) -> bool {
+    *search = CoupledPlaneSearch {
+        failure_reason: Some("iteration_limit".into()),
+        ..Default::default()
+    };
     let mut joints: BTreeMap<u32, Vec<(usize, f64)>> = BTreeMap::new();
     for (i, bar) in bars.iter().enumerate() {
         joints.entry(bar.start_node_id).or_default().push((i, 0.0));
@@ -218,6 +254,72 @@ fn reconcile_axes(
             }
         }
     }
+    // Coupled constraint selection must not depend on LIRA node/element IDs.
+    let center = original
+        .iter()
+        .flat_map(|ends| ends.iter())
+        .copied()
+        .sum::<DVec3>()
+        / (original.len() * 2).max(1) as f64;
+    let quantize = |x: f64| (x * 1e6).round() as i64;
+    let mut ordered_nodes: Vec<_> = joints.keys().copied().collect();
+    if !panels.is_empty() {
+        for anchors in joints.values_mut() {
+            anchors.sort_by_key(|&(i, _)| {
+                let d = original[i][1] - original[i][0];
+                let m = (original[i][0] + original[i][1]) * 0.5 - center;
+                (
+                    -quantize(d.length_squared()),
+                    quantize(m.length_squared()),
+                    quantize(d.dot(m).abs()),
+                )
+            });
+        }
+        ordered_nodes.sort_by_key(|node| {
+            let anchors = &joints[node];
+            let p = anchors
+                .iter()
+                .map(|&(i, t)| original[i][0] * (1.0 - t) + original[i][1] * t)
+                .sum::<DVec3>()
+                / anchors.len() as f64;
+            quantize(p.distance_squared(center))
+        });
+    }
+    let original_fractions: BTreeMap<_, _> = joints
+        .iter()
+        .flat_map(|(&node, anchors)| anchors.iter().map(move |&(i, t)| ((node, i), t)))
+        .collect();
+    let plane_origins: Vec<_> = panels.iter().map(|p| p.plane_d).collect();
+    let mut offsets = plane_origins.clone();
+    let mut frozen_planes = BTreeSet::new();
+    let leaders: Vec<_> = (0..panels.len())
+        .map(|i| {
+            (0..i)
+                .find(|&j| {
+                    DVec3::from_array(panels[i].plane_normal)
+                        .distance(DVec3::from_array(panels[j].plane_normal))
+                        < EPS
+                        && (panels[i].plane_d - panels[j].plane_d).abs() < EPS
+                })
+                .unwrap_or(i)
+        })
+        .collect();
+    let mut surface_equations = Vec::new();
+    for &node in &ordered_nodes {
+        let anchors = &joints[&node];
+        let (i, t) = anchors[0];
+        let p = original[i][0] * (1.0 - t) + original[i][1] * t;
+        if let Some(ids) = incident.get(&node) {
+            for &j in ids {
+                let n = DVec3::from_array(panels[j].plane_normal);
+                if (n.dot(p) + panels[j].plane_d).abs() <= config.joint_tol {
+                    surface_equations.push((node, j));
+                }
+            }
+        }
+    }
+    search.requested_incidence_count = surface_equations.len();
+    search.retained_incidence_count = surface_equations.len();
     let mut points: Vec<_> = bars
         .iter()
         .flat_map(|b| {
@@ -227,10 +329,12 @@ fn reconcile_axes(
             ]
         })
         .collect();
-    for _ in 0..10000 {
+    for iteration in 0..if panels.is_empty() { 10000 } else { 30000 } {
+        search.iterations = iteration + 1;
         // Slide interior incidences along their whole axes. Keeping FE-derived
         // fractions fixed overconstrains a network after geometric straightening.
-        for anchors in joints.values_mut() {
+        for &node in &ordered_nodes {
+            let anchors = joints.get_mut(&node).unwrap();
             if anchors.len() < 2 {
                 continue;
             }
@@ -244,13 +348,25 @@ fn reconcile_axes(
                     let a = points[2 * *i];
                     let d = points[2 * *i + 1] - a;
                     if d.length_squared() > EPS * EPS {
-                        *t = ((target - a).dot(d) / d.length_squared()).clamp(1e-10, 1.0 - 1e-10);
+                        let old_t = original_fractions[&(node, *i)];
+                        let origin = original[*i][0] + old_t * (original[*i][1] - original[*i][0]);
+                        let center = (origin - a).dot(d) / d.length_squared();
+                        let perpendicular = origin.distance_squared(a + center * d);
+                        let radius = ((config.joint_tol.powi(2) - perpendicular).max(0.0)
+                            / d.length_squared())
+                        .sqrt();
+                        let low = (center - radius).max(1e-10);
+                        let high = (center + radius).min(1.0 - 1e-10);
+                        if low <= high {
+                            *t = ((target - a).dot(d) / d.length_squared()).clamp(low, high);
+                        }
                     }
                 }
             }
         }
-        let equations: Vec<Vec<(usize, f64)>> = joints
-            .values()
+        let equations: Vec<Vec<(usize, f64)>> = ordered_nodes
+            .iter()
+            .map(|node| &joints[node])
             .flat_map(|anchors| {
                 anchors
                     .iter()
@@ -285,6 +401,36 @@ fn reconcile_axes(
                 points[i] -= residual * (w / norm);
             }
         }
+        for &(node, j) in &surface_equations {
+            let (i, t) = joints[&node][0];
+            let n = DVec3::from_array(panels[j].plane_normal);
+            let leader = leaders[j];
+            let residual =
+                n.dot(points[2 * i] * (1.0 - t) + points[2 * i + 1] * t) + offsets[leader];
+            let step = residual
+                / ((1.0 - t).powi(2)
+                    + t * t
+                    + if frozen_planes.contains(&leader) {
+                        0.0
+                    } else {
+                        1.0
+                    });
+            points[2 * i] -= n * (step * (1.0 - t));
+            points[2 * i + 1] -= n * (step * t);
+            if !frozen_planes.contains(&leader) {
+                offsets[leader] -= step;
+            }
+        }
+        for i in 0..offsets.len() {
+            let leader = leaders[i];
+            offsets[leader] = offsets[leader].clamp(
+                plane_origins[leader] - config.joint_tol,
+                plane_origins[leader] + config.joint_tol,
+            );
+        }
+        for i in 0..offsets.len() {
+            offsets[i] = offsets[leaders[i]];
+        }
         for (i, point) in points.iter_mut().enumerate() {
             let origin = original[i / 2][i % 2];
             let delta = *point - origin;
@@ -301,12 +447,95 @@ fn reconcile_axes(
                     .length()
             })
             .fold(0.0, f64::max);
-        if error < AXIS_RESIDUAL_TOL {
+        let plane_error = surface_equations
+            .iter()
+            .map(|&(node, j)| {
+                let (i, t) = joints[&node][0];
+                (DVec3::from_array(panels[j].plane_normal)
+                    .dot(points[2 * i] * (1.0 - t) + points[2 * i + 1] * t)
+                    + offsets[j])
+                    .abs()
+            })
+            .fold(0.0, f64::max);
+        search.final_axis_residual = error;
+        search.final_plane_residual = plane_error;
+        // Incompatible source incidences must not poison every feasible plane.
+        // Relax the largest residuals in bounded rounds; all omitted incidences
+        // are checked again by the final contact pass and remain in diagnostics.
+        if iteration % 500 == 499
+            && iteration < 16000
+            && (plane_error > EPS || error > AXIS_RESIDUAL_TOL)
+            && surface_equations.len() > 1
+        {
+            let mut bar_errors = vec![0.0_f64; bars.len()];
+            for anchors in joints.values() {
+                let (i, t) = anchors[0];
+                let a = points[2 * i] * (1.0 - t) + points[2 * i + 1] * t;
+                let gap = anchors
+                    .iter()
+                    .map(|&(b, u)| a.distance(points[2 * b] * (1.0 - u) + points[2 * b + 1] * u))
+                    .fold(0.0, f64::max);
+                for &(b, _) in anchors {
+                    bar_errors[b] = bar_errors[b].max(gap);
+                }
+            }
+            let mut ranked: Vec<_> = surface_equations
+                .iter()
+                .enumerate()
+                .map(|(k, &(node, j))| {
+                    let (i, t) = joints[&node][0];
+                    let gap = (DVec3::from_array(panels[j].plane_normal)
+                        .dot(points[2 * i] * (1.0 - t) + points[2 * i + 1] * t)
+                        + offsets[j])
+                        .abs();
+                    let anchor = points[2 * i] * (1.0 - t) + points[2 * i + 1] * t;
+                    let joint_gap = joints[&node]
+                        .iter()
+                        .map(|&(b, u)| {
+                            anchor.distance(points[2 * b] * (1.0 - u) + points[2 * b + 1] * u)
+                        })
+                        .fold(0.0, f64::max);
+                    (k, gap.max(joint_gap).max(bar_errors[i]))
+                })
+                .collect();
+            ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let remove: BTreeSet<_> = ranked
+                .iter()
+                .take((ranked.len() / 10).max(1))
+                .filter(|(_, gap)| *gap > EPS)
+                .map(|(k, _)| *k)
+                .collect();
+            for &k in &remove {
+                let (node, j) = surface_equations[k];
+                search.relaxed_incidence_pairs.push([node, panels[j].id]);
+            }
+            surface_equations = surface_equations
+                .into_iter()
+                .enumerate()
+                .filter(|(k, _)| !remove.contains(k))
+                .map(|(_, e)| e)
+                .collect();
+            search.retained_incidence_count = surface_equations.len();
+            if !remove.is_empty() {
+                for (i, point) in points.iter_mut().enumerate() {
+                    *point = original[i / 2][i % 2];
+                }
+                offsets.clone_from(&plane_origins);
+                for (&node, anchors) in &mut joints {
+                    for (i, t) in anchors {
+                        *t = original_fractions[&(node, *i)];
+                    }
+                }
+                continue;
+            }
+        }
+        if error < AXIS_RESIDUAL_TOL && plane_error < EPS * 0.1 {
             if bars.iter().enumerate().any(|(i, _)| {
                 let d = points[2 * i + 1] - points[2 * i];
                 let old = original[i][1] - original[i][0];
                 d.length() + EPS < old.length().min(config.min_edge) || d.dot(old) <= 0.0
             }) {
+                search.failure_reason = Some("axis_quality".into());
                 return false;
             }
             let mut parameters = Vec::new();
@@ -326,6 +555,7 @@ fn reconcile_axes(
                     let old = original[i][0] + c.t * (original[i][1] - original[i][0]);
                     let new = points[2 * i] + t * (points[2 * i + 1] - points[2 * i]);
                     if t <= 0.0 || t >= 1.0 || new.distance(old) > config.joint_tol + EPS {
+                        search.failure_reason = Some("anchor_displacement".into());
                         return false;
                     }
                 }
@@ -343,11 +573,41 @@ fn reconcile_axes(
                     let new =
                         (pair[1].1 - pair[0].1) * (points[2 * i + 1] - points[2 * i]).length();
                     if new + EPS < old.min(config.min_edge) {
+                        search.failure_reason = Some("constraint_spacing".into());
                         return false;
                     }
                 }
                 parameters.push(values);
             }
+            let corrected = if panels.is_empty() {
+                Vec::new()
+            } else {
+                match crate::geometry::topology::shifted_planes_checked(panels, &offsets, config) {
+                    Ok(result) => result,
+                    Err(affected) => {
+                        let previous = frozen_planes.len();
+                        frozen_planes.extend(affected.iter().map(|&i| leaders[i]));
+                        search.frozen_panel_ids = (0..panels.len())
+                            .filter(|&i| frozen_planes.contains(&leaders[i]))
+                            .map(|i| panels[i].id)
+                            .collect();
+                        if frozen_planes.len() == previous {
+                            search.failure_reason = Some("panel_geometry".into());
+                            return false;
+                        }
+                        for (i, point) in points.iter_mut().enumerate() {
+                            *point = original[i / 2][i % 2];
+                        }
+                        offsets.clone_from(&plane_origins);
+                        for (&node, anchors) in &mut joints {
+                            for (i, t) in anchors {
+                                *t = original_fractions[&(node, *i)];
+                            }
+                        }
+                        continue;
+                    }
+                }
+            };
             for (i, bar) in bars.iter_mut().enumerate() {
                 for (c, &t) in bar.constraints.iter_mut().zip(&parameters[i]) {
                     if c.kinds.iter().any(|k| k == "property_boundary") {
@@ -367,6 +627,8 @@ fn reconcile_axes(
                 bar.length = points[2 * i].distance(points[2 * i + 1]);
                 bar.bar_type = classify_bar(points[2 * i], points[2 * i + 1]);
             }
+            panels.clone_from_slice(&corrected);
+            search.failure_reason = None;
             return true;
         }
     }
@@ -460,7 +722,29 @@ pub fn attach_bar_endpoints(
             }
         }
     }
-    stats.joint_solve_converged = reconcile_axes(bars, &original_ends, config);
+    let panel_origins = panels.to_vec();
+    stats.coupled_planes_converged = reconcile_axes_and_planes(
+        bars,
+        &original_ends,
+        config,
+        panels,
+        &incident,
+        &mut stats.coupled_search,
+    );
+    stats.joint_solve_converged =
+        stats.coupled_planes_converged || reconcile_axes(bars, &original_ends, config);
+    for (before, after) in panel_origins.iter().zip(panels.iter()) {
+        for (a, b) in before
+            .polygons
+            .iter()
+            .flatten()
+            .zip(after.polygons.iter().flatten())
+        {
+            stats.max_panel_displacement = stats
+                .max_panel_displacement
+                .max(DVec3::from_array(*a).distance(DVec3::from_array(*b)));
+        }
+    }
     if !stats.joint_solve_converged {
         // A failed global proposal must not leave independently shifted axes.
         for (bar, ends) in bars.iter_mut().zip(&original_ends) {
@@ -870,6 +1154,79 @@ mod tests {
             constraints: vec![],
             property_spans: vec![],
         }
+    }
+    #[test]
+    fn coupled_solver_moves_plane_and_whole_axis_together() {
+        let mut bars = vec![bar([0.5, 1., 0.04], [1.5, 1., 0.04], 1, 2)];
+        let original = vec![[
+            DVec3::from_array(bars[0].start_point),
+            DVec3::from_array(bars[0].end_point),
+        ]];
+        let mut panels = vec![panel()];
+        let incidence = BTreeMap::from([(1, BTreeSet::from([0])), (2, BTreeSet::from([0]))]);
+        assert!(reconcile_axes_and_planes(
+            &mut bars,
+            &original,
+            &ReconstructionConfig::default(),
+            &mut panels,
+            &incidence,
+            &mut CoupledPlaneSearch::default()
+        ));
+        assert!(panels[0].plane_d.abs() > 1e-4);
+        assert!(contains(&panels[0], DVec3::from_array(bars[0].start_point)));
+        assert!(contains(&panels[0], DVec3::from_array(bars[0].end_point)));
+        assert!((bars[0].length - 1.0).abs() < EPS);
+        assert!(panels[0].polygons[0].iter().all(|p| p[2].abs() <= 0.05));
+    }
+    #[test]
+    fn incompatible_planes_are_frozen_and_omitted_incidence_is_reported() {
+        let mut second = panel();
+        second.id = 2;
+        second.plane_d = -0.02;
+        for p in second.polygons.iter_mut().flatten() {
+            p[2] = 0.02;
+        }
+        let mut panels = vec![panel(), second];
+        let mut bars = vec![bar([1., 1., 0.01], [1., 1., 1.], 1, 2)];
+        let original = vec![[
+            DVec3::from_array(bars[0].start_point),
+            DVec3::from_array(bars[0].end_point),
+        ]];
+        let incident = BTreeMap::from([(1, BTreeSet::from([0, 1]))]);
+        let mut search = CoupledPlaneSearch::default();
+        assert!(reconcile_axes_and_planes(
+            &mut bars,
+            &original,
+            &ReconstructionConfig::default(),
+            &mut panels,
+            &incident,
+            &mut search
+        ));
+        assert_eq!(search.frozen_panel_ids, vec![1, 2]);
+        assert_eq!(search.requested_incidence_count, 2);
+        assert_eq!(search.retained_incidence_count, 1);
+        assert_eq!(search.relaxed_incidence_pairs.len(), 1);
+        assert_eq!(panels[0].plane_d, 0.0);
+        assert_eq!(panels[1].plane_d, -0.02);
+        assert!(search.failure_reason.is_none());
+    }
+    #[test]
+    fn shifted_planes_keep_shared_vertices_and_reject_excessive_motion() {
+        let floor = panel();
+        let mut wall = panel();
+        wall.id = 2;
+        wall.plane_normal = [1., 0., 0.];
+        wall.plane_d = 0.;
+        wall.polygons = vec![vec![[0., 0., 0.], [0., 2., 0.], [0., 2., 2.], [0., 0., 2.]]];
+        let panels = vec![floor, wall];
+        let config = ReconstructionConfig::default();
+        let moved =
+            crate::geometry::topology::shifted_planes(&panels, &[-0.01, -0.02], &config).unwrap();
+        assert_eq!(moved[0].polygons[0][0], moved[1].polygons[0][0]);
+        assert_eq!(moved[0].polygons[0][3], moved[1].polygons[0][1]);
+        assert_eq!(moved[0].polygons[0][0], [0.02, 0., 0.01]);
+        assert!(crate::geometry::topology::shifted_planes(&panels, &[-0.1, 0.], &config).is_none());
+        assert_eq!(panels[0].polygons[0][0], [0., 0., 0.]);
     }
     #[test]
     fn joint_solver_moves_whole_crossing_axes_within_budget() {

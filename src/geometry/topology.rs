@@ -351,6 +351,89 @@ impl<'a> Graph<'a> {
     }
 }
 
+/// Rebuild all shared contour vertices on translated planes, transactionally.
+/// Normals and ring membership stay fixed; no new short edges or overlaps.
+pub(crate) fn shifted_planes(
+    panels: &[MacroPanel],
+    offsets: &[f64],
+    config: &ReconstructionConfig,
+) -> Option<Vec<MacroPanel>> {
+    shifted_planes_checked(panels, offsets, config).ok()
+}
+
+pub(crate) fn shifted_planes_checked(
+    panels: &[MacroPanel],
+    offsets: &[f64],
+    config: &ReconstructionConfig,
+) -> Result<Vec<MacroPanel>, BTreeSet<usize>> {
+    if panels.len() != offsets.len() {
+        return Err((0..panels.len()).collect());
+    }
+    let mut targets = panels.to_vec();
+    for (panel, &d) in targets.iter_mut().zip(offsets) {
+        panel.plane_d = d;
+    }
+    let original = Graph::new(panels, config.min_edge);
+    let mut graph = Graph::new(&targets, config.min_edge);
+    graph.baseline_overlap.clear();
+    for i in 0..panels.len() {
+        for j in i + 1..panels.len() {
+            if graph.coplanar(i, j) {
+                graph.baseline_overlap.insert(
+                    (i, j),
+                    if original.coplanar(i, j) {
+                        original.overlap(i, j)
+                    } else {
+                        0.0
+                    },
+                );
+            }
+        }
+    }
+    for i in 0..graph.points.len() {
+        let origin = original.points[i];
+        let mut owners = graph.owners[i].clone();
+        for j in 0..original.points.len() {
+            if origin.distance(original.points[j]) <= EPS {
+                owners.extend(&original.owners[j]);
+            }
+        }
+        let point = graph
+            .project(origin, &owners)
+            .ok_or_else(|| owners.clone())?;
+        if !graph.bounded(i, point, config.joint_tol) {
+            return Err(owners);
+        }
+        graph.points[i] = point;
+    }
+    for i in 0..panels.len() {
+        if !graph.valid(&BTreeSet::from([i])) {
+            let mut affected = BTreeSet::from([i]);
+            for (&(a, b), &old) in &graph.baseline_overlap {
+                if (a == i || b == i) && graph.overlap(a, b) > old + 1e-9 {
+                    affected.extend([a, b]);
+                }
+            }
+            for (j, owners) in original.owners.iter().enumerate() {
+                if original.rings[i]
+                    .iter()
+                    .flatten()
+                    .any(|&v| original.points[v].distance(original.points[j]) <= EPS)
+                {
+                    affected.extend(owners);
+                }
+            }
+            return Err(affected);
+        }
+    }
+    let coords: Vec<_> = (0..panels.len()).map(|i| graph.coords(i)).collect();
+    drop(graph);
+    for (panel, rings) in targets.iter_mut().zip(coords) {
+        panel.polygons = rings;
+    }
+    Ok(targets)
+}
+
 pub fn conform_panels(panels: &mut [MacroPanel], config: &ReconstructionConfig) -> TopologySummary {
     let mut graph = Graph::new(panels, config.min_edge);
     let mut stats = TopologySummary::default();
