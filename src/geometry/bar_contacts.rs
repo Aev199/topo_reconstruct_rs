@@ -33,8 +33,20 @@ pub struct CoupledPlaneSearch {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RotationTrial {
+    pub proposed_panels: usize,
+    pub attempted_candidates: usize,
+    pub accepted: bool,
+    pub reason: String,
+    pub baseline_missing_incidences: usize,
+    pub candidate_missing_incidences: Option<usize>,
+    pub max_rotation_radians: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BarContactSummary {
     pub fitted_axes: usize,
+    pub rotation_trial: RotationTrial,
     pub joint_solve_converged: bool,
     pub coupled_planes_converged: bool,
     pub coupled_search: CoupledPlaneSearch,
@@ -642,6 +654,118 @@ pub fn attach_bar_endpoints(
     canonical: &HashMap<u32, u32>,
     config: &ReconstructionConfig,
 ) -> BarContactSummary {
+    let original_bars = bars.to_vec();
+    let original_panels = panels.to_vec();
+    let mut baseline = attach_bar_endpoints_impl(bars, panels, mesh, canonical, config);
+    let missing = |r: &BarContactSummary| {
+        r.unresolved_panel_ids_by_node
+            .values()
+            .map(|ids| ids.len())
+            .sum::<usize>()
+    };
+    let original_missing = missing(&baseline);
+    let proposals = super::plane_fit::proposals(bars, &original_panels, mesh, canonical, config);
+    let attempted = proposals.len();
+    baseline.rotation_trial = RotationTrial {
+        baseline_missing_incidences: original_missing,
+        reason: "no_safe_rotation".into(),
+        ..Default::default()
+    };
+    'trials: for (mut candidate_panels, count) in proposals {
+        let mut trial = RotationTrial {
+            baseline_missing_incidences: original_missing,
+            ..Default::default()
+        };
+        trial.proposed_panels = count;
+        let mut candidate_bars = original_bars.clone();
+        let mut candidate = attach_bar_endpoints_impl(
+            &mut candidate_bars,
+            &mut candidate_panels,
+            mesh,
+            canonical,
+            config,
+        );
+        trial.candidate_missing_incidences = Some(missing(&candidate));
+        let mut max_bar = 0.0_f64;
+        let mut max_panel = 0.0_f64;
+        for (old, new) in original_bars.iter().zip(&candidate_bars) {
+            let a = DVec3::from_array(old.start_point);
+            let d = DVec3::from_array(old.end_point) - a;
+            let b = DVec3::from_array(new.start_point);
+            let e = DVec3::from_array(new.end_point) - b;
+            max_bar = max_bar.max(a.distance(b)).max((a + d).distance(b + e));
+            for c in &old.constraints {
+                if let Some(node) = c.source_node_id {
+                    let Some(other) = new
+                        .constraints
+                        .iter()
+                        .find(|c| c.source_node_id == Some(node))
+                    else {
+                        continue 'trials;
+                    };
+                    max_bar = max_bar.max((a + c.t * d).distance(b + other.t * e));
+                }
+            }
+        }
+        for (old, new) in original_panels.iter().zip(&candidate_panels) {
+            for (a, b) in old
+                .polygons
+                .iter()
+                .flatten()
+                .zip(new.polygons.iter().flatten())
+            {
+                max_panel = max_panel.max(DVec3::from_array(*a).distance(DVec3::from_array(*b)));
+            }
+            trial.max_rotation_radians = trial.max_rotation_radians.max(
+                DVec3::from_array(old.plane_normal)
+                    .dot(DVec3::from_array(new.plane_normal))
+                    .clamp(-1.0, 1.0)
+                    .acos(),
+            );
+        }
+        let quality = |r: &BarContactSummary| {
+            (
+                r.unresolved_bar_junctions.len(),
+                missing(r),
+                r.rejected_groups,
+                r.rejected_surface_crossings,
+            )
+        };
+        if max_bar > config.joint_tol + EPS || max_panel > config.joint_tol + EPS {
+            trial.reason = "cumulative_displacement".into();
+        } else if quality(&candidate) < quality(&baseline) {
+            trial.accepted = true;
+            trial.reason = "improved_contacts".into();
+            candidate.max_displacement = max_bar;
+            candidate.max_panel_displacement = max_panel;
+            candidate.rotation_trial = trial;
+            bars.clone_from_slice(&candidate_bars);
+            panels.clone_from_slice(&candidate_panels);
+            baseline = candidate;
+            continue;
+        } else {
+            trial.reason = "no_contact_improvement".into();
+        }
+        if !baseline.rotation_trial.accepted
+            && baseline
+                .rotation_trial
+                .candidate_missing_incidences
+                .is_none_or(|v| v > trial.candidate_missing_incidences.unwrap_or(usize::MAX))
+        {
+            baseline.rotation_trial = trial;
+        }
+    }
+    baseline.rotation_trial.attempted_candidates = attempted;
+    baseline
+}
+
+fn attach_bar_endpoints_impl(
+    bars: &mut [MacroBar],
+    panels: &mut [MacroPanel],
+    mesh: &MeshData,
+    canonical: &HashMap<u32, u32>,
+    config: &ReconstructionConfig,
+) -> BarContactSummary {
     let mut stats = BarContactSummary::default();
     let mut source_panel = HashMap::new();
     for (i, p) in panels.iter().enumerate() {
@@ -1209,6 +1333,28 @@ mod tests {
         assert_eq!(panels[0].plane_d, 0.0);
         assert_eq!(panels[1].plane_d, -0.02);
         assert!(search.failure_reason.is_none());
+    }
+    #[test]
+    fn plane_rotation_is_bounded_by_vertex_motion_not_only_angle() {
+        let panels = vec![panel()];
+        let n = DVec3::new(-0.01, 0., 1.).normalize().to_array();
+        let config = ReconstructionConfig::default();
+        let tilted =
+            crate::geometry::topology::transformed_planes_checked(&panels, &[n], &[0.], &config)
+                .unwrap();
+        for (a, b) in panels[0].polygons[0].iter().zip(&tilted[0].polygons[0]) {
+            assert!(DVec3::from_array(*a).distance(DVec3::from_array(*b)) <= 0.05);
+            assert!(DVec3::from_array(n).dot(DVec3::from_array(*b)).abs() < EPS);
+        }
+        let mut long = panels.clone();
+        for p in &mut long[0].polygons[0] {
+            p[0] *= 100.;
+        }
+        assert!(
+            crate::geometry::topology::transformed_planes_checked(&long, &[n], &[0.], &config)
+                .is_err()
+        );
+        assert_eq!(panels[0].plane_normal, [0., 0., 1.]);
     }
     #[test]
     fn shifted_planes_keep_shared_vertices_and_reject_excessive_motion() {

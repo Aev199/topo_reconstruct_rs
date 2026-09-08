@@ -366,12 +366,32 @@ pub(crate) fn shifted_planes_checked(
     offsets: &[f64],
     config: &ReconstructionConfig,
 ) -> Result<Vec<MacroPanel>, BTreeSet<usize>> {
-    if panels.len() != offsets.len() {
+    let normals: Vec<_> = panels.iter().map(|p| p.plane_normal).collect();
+    transformed_planes_checked(panels, &normals, offsets, config)
+}
+
+pub(crate) fn transformed_planes_checked(
+    panels: &[MacroPanel],
+    normals: &[[f64; 3]],
+    offsets: &[f64],
+    config: &ReconstructionConfig,
+) -> Result<Vec<MacroPanel>, BTreeSet<usize>> {
+    if panels.len() != offsets.len() || panels.len() != normals.len() {
         return Err((0..panels.len()).collect());
     }
     let mut targets = panels.to_vec();
-    for (panel, &d) in targets.iter_mut().zip(offsets) {
+    for ((panel, &d), &normal) in targets.iter_mut().zip(offsets).zip(normals) {
+        let n = DVec3::from_array(normal);
+        let old = DVec3::from_array(panel.plane_normal);
+        if !n.is_finite()
+            || !d.is_finite()
+            || (n.length() - 1.0).abs() > EPS
+            || n.dot(old) < config.tol_angle.cos()
+        {
+            return Err((0..panels.len()).collect());
+        }
         panel.plane_d = d;
+        panel.plane_normal = normal;
     }
     let original = Graph::new(panels, config.min_edge);
     let mut graph = Graph::new(&targets, config.min_edge);

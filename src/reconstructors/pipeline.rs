@@ -61,6 +61,14 @@ impl<'a> TopologyPipeline<'a> {
         if let Some(reason) = &bar_contacts.coupled_search.failure_reason {
             diagnostics.push(format!("Совместная корректировка не принята: {reason}; использовано резервное согласование осей."));
         }
+        if bar_contacts.rotation_trial.attempted_candidates > 0 {
+            diagnostics.push(format!(
+                "Поворот панелей: принят {}; проверено вариантов {}; причина {}",
+                bar_contacts.rotation_trial.accepted,
+                bar_contacts.rotation_trial.attempted_candidates,
+                bar_contacts.rotation_trial.reason
+            ));
+        }
         if !bar_contacts.joint_solve_converged {
             diagnostics.push("Совместное согласование осей не сошлось в заданном допуске; предварительные независимые смещения отменены. Требуется проверка оставшихся примыканий.".into());
         }
