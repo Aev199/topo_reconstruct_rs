@@ -11,6 +11,15 @@ use std::collections::{BTreeMap, BTreeSet};
 const EPS: f64 = 1e-8;
 const AXIS_RESIDUAL_TOL: f64 = 1e-7;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RejectedSurfaceCrossing {
+    pub panel_id: u32,
+    pub source_element_ids: Vec<u32>,
+    pub point: [f64; 3],
+    pub t: f64,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BarContactSummary {
     pub fitted_axes: usize,
@@ -19,7 +28,10 @@ pub struct BarContactSummary {
     pub anchor_groups: usize,
     pub surface_crossings: usize,
     pub rejected_surface_crossings: usize,
+    pub rejected_crossing_details: Vec<RejectedSurfaceCrossing>,
     pub attached_groups: usize,
+    pub partial_groups: usize,
+    pub unresolved_panel_ids_by_node: BTreeMap<u32, Vec<u32>>,
     pub moved_groups: usize,
     pub rejected_groups: usize,
     pub rejected_node_ids: Vec<u32>,
@@ -550,6 +562,20 @@ pub fn attach_bar_endpoints(
                     })
             })
         };
+        let accepts_surface = |i: usize, point: DVec3| {
+            let panel = &panels[i];
+            let distance = nearest_boundary(panel, point).distance(point);
+            contains(panel, point)
+                && (distance <= EPS || distance + EPS >= config.min_edge)
+                && panel
+                    .constraint_points
+                    .iter()
+                    .chain(panel.polygons.iter().flatten())
+                    .all(|p| {
+                        let distance = DVec3::from_array(*p).distance(point);
+                        distance <= EPS || distance + EPS >= config.min_edge
+                    })
+        };
         let choose = |indices: &BTreeSet<usize>| -> Result<DVec3, &'static str> {
             if indices.iter().any(|&i| !nearby(i)) {
                 return Err("surface_outside_tolerance");
@@ -574,36 +600,55 @@ pub fn attach_bar_endpoints(
             candidates.sort_by(|a, b| a.distance(origin).total_cmp(&b.distance(origin)));
             candidates
                 .into_iter()
-                .find(|&point| {
-                    safe(point)
-                        && indices.iter().all(|&i| {
-                            let panel = &panels[i];
-                            let distance = nearest_boundary(panel, point).distance(point);
-                            contains(panel, point)
-                                && (distance <= EPS || distance + EPS >= config.min_edge)
-                                && panel
-                                    .constraint_points
-                                    .iter()
-                                    .chain(panel.polygons.iter().flatten())
-                                    .all(|p| {
-                                        let distance = DVec3::from_array(*p).distance(point);
-                                        distance <= EPS || distance + EPS >= config.min_edge
-                                    })
-                        })
-                })
+                .find(|&point| safe(point) && indices.iter().all(|&i| accepts_surface(i, point)))
                 .ok_or("would_bend_axis_exceed_budget_or_create_short_constraint")
         };
         let (indices, point) = match choose(&indices) {
             Ok(point) => (indices, point),
             Err(reason) => {
                 reject(&mut stats, node, reason);
-                // Failure to match a surface must not prevent a safe bar-to-bar join.
-                if ends.len() < 2 {
-                    continue;
-                }
-                match choose(&BTreeSet::new()) {
-                    Ok(point) => (BTreeSet::new(), point),
-                    Err(_) => continue,
+                // Preserve feasible source incidences even when another source
+                // surface cannot be reached. Missing incidences remain explicit.
+                let mut partial: Vec<_> = indices
+                    .iter()
+                    .filter_map(|&i| {
+                        choose(&BTreeSet::from([i])).ok().map(|point| {
+                            let compatible: BTreeSet<_> = indices
+                                .iter()
+                                .copied()
+                                .filter(|&j| nearby(j) && accepts_surface(j, point))
+                                .collect();
+                            (compatible, point)
+                        })
+                    })
+                    .collect();
+                partial.sort_by(|(a, p), (b, q)| {
+                    b.len()
+                        .cmp(&a.len())
+                        .then_with(|| p.distance(origin).total_cmp(&q.distance(origin)))
+                });
+                if let Some((compatible, point)) = partial.into_iter().next() {
+                    stats.partial_groups += 1;
+                    stats.unresolved_panel_ids_by_node.insert(
+                        node,
+                        indices
+                            .difference(&compatible)
+                            .map(|&i| panels[i].id)
+                            .collect(),
+                    );
+                    (compatible, point)
+                } else {
+                    stats
+                        .unresolved_panel_ids_by_node
+                        .insert(node, indices.iter().map(|&i| panels[i].id).collect());
+                    // Failure to match a surface must not prevent a safe bar-to-bar join.
+                    if ends.len() < 2 {
+                        continue;
+                    }
+                    match choose(&BTreeSet::new()) {
+                        Ok(point) => (BTreeSet::new(), point),
+                        Err(_) => continue,
+                    }
                 }
             }
         };
@@ -700,6 +745,15 @@ pub fn attach_bar_endpoints(
                 && (1.0 - t) * d.length() + EPS >= config.min_edge;
             if !spacing_ok {
                 stats.rejected_surface_crossings += 1;
+                stats
+                    .rejected_crossing_details
+                    .push(RejectedSurfaceCrossing {
+                        panel_id: panel.id,
+                        source_element_ids: bar.source_element_ids.clone(),
+                        point: point.to_array(),
+                        t,
+                        reason: "would_create_short_constraint".into(),
+                    });
                 continue;
             }
             let existing = bar
@@ -967,7 +1021,7 @@ mod tests {
         assert_eq!(bars[0].start_point, [1., 1., 0.005]);
     }
     #[test]
-    fn conflicting_surfaces_are_reported_without_moving_endpoint() {
+    fn conflicting_surfaces_preserve_feasible_incidence_and_report_missing_one() {
         let mut second = panel();
         second.id = 2;
         second.plane_d = -0.006;
@@ -984,7 +1038,18 @@ mod tests {
             &ReconstructionConfig::default(),
         );
         assert_eq!(stats.rejected_groups, 1);
-        assert_eq!(bars[0].start_point, [1., 1., 0.003]);
+        assert_eq!(stats.partial_groups, 1);
+        assert_eq!(stats.attached_groups, 1);
+        assert_eq!(bars[0].start_panel_ids.len(), 1);
+        assert_eq!(stats.unresolved_panel_ids_by_node[&1].len(), 1);
+        assert_ne!(
+            bars[0].start_panel_ids[0],
+            stats.unresolved_panel_ids_by_node[&1][0]
+        );
+        assert!(contains(
+            &panels[(bars[0].start_panel_ids[0] - 1) as usize],
+            DVec3::from_array(bars[0].start_point)
+        ));
     }
     #[test]
     fn near_boundary_point_is_snapped_instead_of_creating_a_sliver() {
@@ -1000,6 +1065,25 @@ mod tests {
         assert_eq!(stats.attached_groups, 1);
         assert_eq!(bars[0].start_point, [1., 0., 0.]);
         assert_eq!(panels[0].constraint_points, vec![[1., 0., 0.]]);
+    }
+    #[test]
+    fn rejected_interior_crossing_has_location_and_source_provenance() {
+        let mut panels = vec![panel()];
+        let mut bars = vec![bar([1., 0.005, -1.], [1., 0.005, 1.], 1, 2)];
+        let stats = attach_bar_endpoints(
+            &mut bars,
+            &mut panels,
+            &MeshData::default(),
+            &HashMap::new(),
+            &ReconstructionConfig::default(),
+        );
+        assert_eq!(stats.rejected_surface_crossings, 1);
+        let detail = &stats.rejected_crossing_details[0];
+        assert_eq!(detail.panel_id, 1);
+        assert_eq!(detail.source_element_ids, vec![1]);
+        assert_eq!(detail.point, [1., 0.005, 0.]);
+        assert_eq!(detail.t, 0.5);
+        assert!(panels[0].constraint_points.is_empty());
     }
     #[test]
     fn through_column_has_two_ends_and_an_interior_surface_constraint() {
