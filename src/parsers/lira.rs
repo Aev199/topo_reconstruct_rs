@@ -1,4 +1,4 @@
-use crate::models::{ElementData, MeshData};
+use crate::input::{ElementData, MeshData};
 use fast_float::parse as fast_parse_f64;
 use glam::DVec3;
 use hashbrown::HashMap;

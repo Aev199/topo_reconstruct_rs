@@ -1,5 +1,6 @@
 //! Planar surfaces on a shared topological graph. No implicit mechanical ties.
 pub mod axes;
+pub mod recognize;
 
 use geo::{Contains, Intersects, Line, LineString, Polygon};
 use glam::DVec3;

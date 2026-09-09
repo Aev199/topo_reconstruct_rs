@@ -3,6 +3,7 @@
 mod config;
 mod exporters;
 mod geometry;
+mod input;
 mod models;
 mod parsers;
 mod reconstructors;
