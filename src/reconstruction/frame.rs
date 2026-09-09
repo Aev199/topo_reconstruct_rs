@@ -42,6 +42,10 @@ pub enum ConstraintOrigin {
         node_id: u32,
         component: usize,
     },
+    ShortAxisVector {
+        axis: usize,
+        component: usize,
+    },
     AxisDirection {
         axis: usize,
     },
@@ -97,10 +101,14 @@ pub struct Report {
 struct Equation {
     origin: ConstraintOrigin,
     terms: Vec<(usize, f64)>,
+    target: f64,
 }
 impl Equation {
-    fn residual(&self, x: &[f64]) -> f64 {
+    fn value(&self, x: &[f64]) -> f64 {
         self.terms.iter().map(|&(i, a)| a * x[i]).sum()
+    }
+    fn residual(&self, x: &[f64]) -> f64 {
+        self.value(x) - self.target
     }
 }
 fn equation(terms: Vec<(usize, f64)>, origin: ConstraintOrigin) -> Equation {
@@ -109,6 +117,7 @@ fn equation(terms: Vec<(usize, f64)>, origin: ConstraintOrigin) -> Equation {
         *combined.entry(i).or_default() += a;
     }
     Equation {
+        target: 0.0,
         origin,
         terms: combined
             .into_iter()
@@ -290,7 +299,24 @@ pub fn solve(
             anchors.push(Anchor { node, t: c.t });
         }
         let cosine = d.normalize().dot(up).abs();
-        let directions = if cosine >= policy.angle.cos() {
+        // An unresolved short feature may translate, but must not be flattened,
+        // contracted or assigned a new direction from noisy source coordinates.
+        if length < policy.minimum_length {
+            for k in 0..3 {
+                let mut e = equation(
+                    vec![(ends[1] * 3 + k, 1.), (ends[0] * 3 + k, -1.)],
+                    ConstraintOrigin::ShortAxisVector {
+                        axis: axis_index,
+                        component: k,
+                    },
+                );
+                e.target = d[k];
+                equations.push(e);
+            }
+        }
+        let directions = if length < policy.minimum_length {
+            vec![]
+        } else if cosine >= policy.angle.cos() {
             vec![u, v]
         } else if cosine <= policy.angle.sin() {
             vec![up]
@@ -386,7 +412,7 @@ pub fn solve(
         equations
             .iter()
             .zip(&scales)
-            .map(|(e, s)| e.residual(v) / s)
+            .map(|(e, s)| e.value(v) / s)
             .collect()
     };
     let transpose = |v: &[f64]| -> Vec<f64> {
@@ -398,7 +424,11 @@ pub fn solve(
         }
         result
     };
-    let mut u: Vec<_> = multiply(&x).into_iter().map(|v| -v).collect();
+    let mut u: Vec<_> = equations
+        .iter()
+        .zip(&scales)
+        .map(|(e, s)| -e.residual(&x) / s)
+        .collect();
     let mut beta = norm(&u);
     if beta > 0. {
         for v in &mut u {
@@ -482,7 +512,7 @@ pub fn solve(
         && new_axes.iter().all(|a| {
             let [i, j] = a.endpoints;
             let d = candidate[j] - candidate[i];
-            d.length()
+            d.length() + policy.residual_tolerance
                 >= policy
                     .minimum_length
                     .min(reference[j].distance(reference[i]))
@@ -688,6 +718,103 @@ mod tests {
         .unwrap();
         solve(m, &a, &s, p).unwrap()
     }
+    fn short_feature(both_ends_on_plane: bool) -> MeshData {
+        let mut m = MeshData::default();
+        for (id, point) in [
+            (1, [0., 0., 0.]),
+            (2, [1., 0., 0.0002]),
+            (3, [0., 1., 0.]),
+            (4, [0.006, 0., 0.00001]),
+        ] {
+            m.nodes.insert(id, DVec3::from_array(point));
+        }
+        m.elements.push(ElementData {
+            id: 10,
+            elem_type: 10,
+            stiff_id: 77,
+            nodes: vec![1, 4],
+        });
+        m.elements.push(ElementData {
+            id: 20,
+            elem_type: 42,
+            stiff_id: 88,
+            nodes: vec![1, 2, 3],
+        });
+        if both_ends_on_plane {
+            m.elements.push(ElementData {
+                id: 21,
+                elem_type: 42,
+                stiff_id: 88,
+                nodes: vec![1, 3, 4],
+            });
+        }
+        m
+    }
+
+    #[test]
+    fn short_axis_translates_with_support_without_losing_vector_or_properties() {
+        for transformed in [false, true] {
+            let mut m = short_feature(false);
+            let mut p = policy();
+            if transformed {
+                let rotation =
+                    glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.6);
+                m.nodes = m
+                    .nodes
+                    .into_iter()
+                    .map(|(id, point)| (id + 100, rotation * point + DVec3::new(20., 30., 40.)))
+                    .collect();
+                for e in &mut m.elements {
+                    e.id += 200;
+                    for n in &mut e.nodes {
+                        *n += 100;
+                    }
+                }
+                p.up = (rotation * DVec3::Z).to_array();
+            }
+            let r = run(&m, &p);
+            assert!(r.accepted, "{}: {}", r.reason, r.candidate_max_residual);
+            assert_eq!(r.short_axis_indices, vec![0]);
+            assert_eq!(r.axes.len(), 1);
+            let [i, j] = r.axes[0].endpoints;
+            let old =
+                DVec3::from_array(r.reference_points[j]) - DVec3::from_array(r.reference_points[i]);
+            let new = DVec3::from_array(r.points[j]) - DVec3::from_array(r.points[i]);
+            assert!(old.distance(new) < 2. * p.residual_tolerance);
+            assert!(r.maximum_movement > 1e-6);
+            assert!(r.axis_failures.is_empty());
+            assert_eq!(r.axes[0].spans.len(), 1);
+            assert_eq!(r.axes[0].spans[0].stiffness, 77);
+            assert_eq!(
+                r.axes[0].spans[0].element,
+                if transformed { 210 } else { 10 }
+            );
+            assert_eq!(
+                r.surfaces[0]
+                    .stiffness_regions
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![88]
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_short_axis_is_reported_without_collapsing_or_dropping_it() {
+        let m = short_feature(true);
+        let r = run(&m, &policy());
+        assert!(!r.accepted);
+        assert!(!r.candidate_constraints_satisfied);
+        assert_eq!(r.points, r.reference_points);
+        assert_eq!(r.axes.len(), 1);
+        assert_eq!(r.axes[0].spans[0].element, 10);
+        assert!(r
+            .largest_constraint_failures
+            .iter()
+            .any(|f| matches!(f.origin, ConstraintOrigin::ShortAxisVector { .. })));
+    }
+
     #[test]
     fn coplanar_patches_meeting_at_one_vertex_share_support() {
         let mut m = MeshData::default();
