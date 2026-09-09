@@ -91,6 +91,9 @@ pub struct Report {
     pub maximum_movement: f64,
     pub node_ids: Vec<u32>,
     pub reference_points: Vec<[f64; 3]>,
+    /// Unaccepted proposal for topology assembly; never an export-ready model.
+    pub candidate_points: Vec<[f64; 3]>,
+    pub candidate_planes: Vec<PlaneFrame>,
     pub points: Vec<[f64; 3]>,
     pub axes: Vec<Axis>,
     pub surfaces: Vec<Surface>,
@@ -525,8 +528,9 @@ pub fn solve(
         .all(|((p, o), cap)| p.distance(*o) <= *cap + 1e-10);
     let accepted = residual <= policy.residual_tolerance && valid && within_budget;
     let mut maximum_movement = 0.0_f64;
-    if accepted {
-        for (i, p) in surfaces.iter_mut().enumerate() {
+    let mut candidate_surfaces = surfaces.clone();
+    {
+        for (i, p) in candidate_surfaces.iter_mut().enumerate() {
             let origin = DVec3::from_array(p.plane.origin);
             let family = plane_to_family[i];
             let n = normals[family];
@@ -534,6 +538,9 @@ pub fn solve(
             p.plane = PlaneFrame::new(projected.to_array(), n.to_array())
                 .map_err(|_| "invalid solved plane")?;
         }
+    }
+    if accepted {
+        surfaces = candidate_surfaces.clone();
         maximum_movement = candidate
             .iter()
             .zip(&reference)
@@ -619,6 +626,8 @@ pub fn solve(
         maximum_movement,
         node_ids: node_ids.clone(),
         reference_points: reference.iter().map(|p| p.to_array()).collect(),
+        candidate_points: candidate.iter().map(|p| p.to_array()).collect(),
+        candidate_planes: candidate_surfaces.iter().map(|s| s.plane.clone()).collect(),
         points: if accepted {
             candidate.iter().map(|p| p.to_array()).collect()
         } else {
