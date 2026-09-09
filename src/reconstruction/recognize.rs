@@ -48,7 +48,8 @@ pub struct Report {
 }
 
 /// Connected near-collinear FE paths are accepted only when the whole path fits
-/// one chord. A failed fit retains the original elements and records the failure.
+/// one chord. A failed whole-path fit is partitioned into validated subpaths.
+/// Ambiguous optimal partitions retain all possible cut locations.
 /// No proximity welding and no interpretation of mechanical connectivity.
 pub fn recognize(mesh: &MeshData, policy: &Policy) -> Result<Report, &'static str> {
     if !policy.angle.is_finite()
@@ -254,6 +255,53 @@ pub fn recognize(mesh: &MeshData, policy: &Policy) -> Result<Report, &'static st
         report
             .unmerged_components
             .push(component.iter().copied().collect());
+        if path.len() == component.len() && nodes.len() == path.len() + 1 {
+            // Minimum-count valid interval cover. Keep every cut belonging to an
+            // optimal cover rather than choosing by source IDs or traversal order.
+            let n = path.len();
+            let mut valid = vec![vec![false; n + 1]; n];
+            for i in 0..n {
+                for j in i + 1..=n {
+                    valid[i][j] = build(&path[i..j], &nodes[i..=j]).is_some();
+                }
+            }
+            let mut prefix = vec![n + 1; n + 1];
+            let mut suffix = vec![n + 1; n + 1];
+            prefix[0] = 0;
+            suffix[n] = 0;
+            for j in 1..=n {
+                for i in 0..j {
+                    if valid[i][j] {
+                        prefix[j] = prefix[j].min(prefix[i] + 1);
+                    }
+                }
+            }
+            for i in (0..n).rev() {
+                for j in i + 1..=n {
+                    if valid[i][j] {
+                        suffix[i] = suffix[i].min(suffix[j] + 1);
+                    }
+                }
+            }
+            let cuts: Vec<_> = (0..=n)
+                .filter(|&i| prefix[i] + suffix[i] == prefix[n])
+                .collect();
+            for pair in cuts.windows(2) {
+                let (i, j) = (pair[0], pair[1]);
+                if let Some(axis) = build(&path[i..j], &nodes[i..=j]) {
+                    report.axes.push(axis);
+                } else {
+                    // A subchord need not satisfy its parent's angular bound.
+                    for k in i..j {
+                        report.axes.push(
+                            build(&path[k..k + 1], &nodes[k..=k + 1])
+                                .ok_or("failed to retain valid source bar")?,
+                        );
+                    }
+                }
+            }
+            continue;
+        }
         for id in component {
             report.axes.push(
                 build(&[id], &elements[&id].nodes).ok_or("failed to retain valid source bar")?,
@@ -327,9 +375,77 @@ mod tests {
             .collect();
         let ends: Vec<_> = (1..30).map(|i| [i, i + 1]).collect();
         let r = recognize(&mesh(&points, &ends), &policy()).unwrap();
-        assert_eq!(r.axes.len(), 29);
+        assert!(r.axes.len() > 1);
+        let spans: BTreeSet<_> = r
+            .axes
+            .iter()
+            .flat_map(|a| a.spans.iter().map(|s| s.element))
+            .collect();
+        assert_eq!(spans.len(), 29);
+        assert_eq!(r.axes.iter().map(|a| a.spans.len()).sum::<usize>(), 29);
+        assert!(r.axes.iter().all(|a| a
+            .anchors
+            .iter()
+            .all(|n| n.distance_to_axis <= policy().line_tolerance)));
         assert_eq!(r.unmerged_components.len(), 1);
     }
+    #[test]
+    fn failed_whole_path_retains_straight_subpaths_and_short_property_span() {
+        let points = [
+            [0., 0., 0.],
+            [1., 0., 0.],
+            [1.006, 0., 0.],
+            [2., 0., 0.],
+            [3., 0.015, 0.],
+            [4., 0.045, 0.],
+        ];
+        let ends = [[1, 2], [2, 3], [3, 4], [4, 5], [5, 6]];
+        let original = mesh(&points, &ends);
+        let baseline = recognize(&original, &policy()).unwrap();
+        assert_eq!(baseline.unmerged_components.len(), 1);
+        let merged = baseline
+            .axes
+            .iter()
+            .find(|a| a.spans.iter().any(|s| s.element == 2))
+            .unwrap();
+        assert!(merged.spans.len() >= 3);
+        assert_eq!(
+            merged
+                .spans
+                .iter()
+                .find(|s| s.element == 2)
+                .unwrap()
+                .stiffness,
+            2
+        );
+        let groups = |r: &Report, offset: u32| -> BTreeSet<BTreeSet<u32>> {
+            r.axes
+                .iter()
+                .map(|a| a.spans.iter().map(|s| s.element - offset).collect())
+                .collect()
+        };
+        for angle in [0.6, 3.0] {
+            let rotation = glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), angle);
+            let mut m = original.clone();
+            m.nodes = m
+                .nodes
+                .into_iter()
+                .map(|(id, p)| (id + 100, rotation * p + DVec3::new(20., 30., 40.)))
+                .collect();
+            m.elements.reverse();
+            for e in &mut m.elements {
+                e.id += 200;
+                for n in &mut e.nodes {
+                    *n += 100;
+                }
+                e.nodes.reverse();
+            }
+            let r = recognize(&m, &policy()).unwrap();
+            assert_eq!(groups(&baseline, 0), groups(&r, 200));
+            assert_eq!(r.axes.iter().map(|a| a.spans.len()).sum::<usize>(), 5);
+        }
+    }
+
     #[test]
     fn invalid_source_is_accounted_for() {
         let m = mesh(&[[0., 0., 0.], [1., 0., 0.]], &[[1, 2], [1, 1], [2, 9]]);
