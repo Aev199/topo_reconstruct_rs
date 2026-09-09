@@ -1,6 +1,6 @@
 //! Surface topology preview. Engineering closure tolerance is distinct from
 //! numerical planarity. Mechanical ties and mesh readiness are not inferred.
-use super::{frame, Model, PlaneFrame};
+use super::{frame, planes, Model, PlaneFrame};
 use crate::input::MeshData;
 use glam::DVec3;
 use serde::Serialize;
@@ -33,16 +33,20 @@ pub struct Report {
     pub support_representatives: Vec<usize>,
 }
 
-fn boundary(mesh: &MeshData, ids: &[u32]) -> Result<Vec<Vec<u32>>, &'static str> {
+fn boundary(
+    mesh: &MeshData,
+    ids: &[u32],
+    plane: &PlaneFrame,
+    precision: f64,
+) -> Result<Vec<Vec<u32>>, &'static str> {
     let elements: BTreeMap<_, _> = mesh.elements.iter().map(|e| (e.id, e)).collect();
     let mut counts = BTreeMap::<[u32; 2], usize>::new();
     for id in ids {
         let e = elements.get(id).ok_or("missing_source_element")?;
-        if e.nodes.len() < 3 || e.nodes.iter().collect::<BTreeSet<_>>().len() != e.nodes.len() {
-            return Err("invalid_source_face");
-        }
-        for i in 0..e.nodes.len() {
-            let (a, b) = (e.nodes[i], e.nodes[(i + 1) % e.nodes.len()]);
+        let nodes =
+            planes::ordered_facet_nodes(mesh, e, plane, precision).ok_or("invalid_source_face")?;
+        for i in 0..nodes.len() {
+            let (a, b) = (nodes[i], nodes[(i + 1) % nodes.len()]);
             *counts.entry([a.min(b), a.max(b)]).or_default() += 1;
         }
     }
@@ -134,7 +138,12 @@ pub fn assemble(
     let mut issues = vec![];
     let mut rings = BTreeMap::new();
     for (i, s) in source.surfaces.iter().enumerate() {
-        match boundary(mesh, &s.source_elements) {
+        match boundary(
+            mesh,
+            &s.source_elements,
+            &source.candidate_planes[i],
+            policy.precision,
+        ) {
             Ok(r) => {
                 rings.insert(i, r);
             }
@@ -300,6 +309,67 @@ pub fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tensor_numbering_preserves_outer_boundary_and_hole() {
+        use crate::input::ElementData;
+        let mut mesh = MeshData::default();
+        for y in 0..4 {
+            for x in 0..4 {
+                mesh.nodes.insert(
+                    y * 4 + x + 1,
+                    DVec3::new(x as f64 + 10., y as f64 - 20., 7.),
+                );
+            }
+        }
+        for y in 0..3 {
+            for x in 0..3 {
+                if x == 1 && y == 1 {
+                    continue;
+                }
+                let a = y * 4 + x + 1;
+                mesh.elements.push(ElementData {
+                    id: mesh.elements.len() as u32 + 1,
+                    elem_type: 44,
+                    stiff_id: 9,
+                    nodes: vec![a, a + 1, a + 5, a + 4],
+                });
+            }
+        }
+        let plane = PlaneFrame::new([0., 0., 7.], [0., 0., 1.]).unwrap();
+        let ids: Vec<_> = mesh.elements.iter().map(|e| e.id).collect();
+        let original = boundary(&mesh, &ids, &plane, 1e-8).unwrap();
+        assert_eq!(original.len(), 2);
+        assert_eq!(
+            original.iter().map(Vec::len).collect::<BTreeSet<_>>(),
+            BTreeSet::from([4, 12])
+        );
+        for e in &mut mesh.elements {
+            e.nodes.swap(2, 3);
+        }
+        assert_eq!(boundary(&mesh, &ids, &plane, 1e-8).unwrap(), original);
+        let mut model = Model::new(1e-8, 0.01).unwrap();
+        let p = model.add_plane(plane);
+        let vertices: BTreeMap<_, _> = mesh
+            .nodes
+            .iter()
+            .map(|(&id, p)| (id, model.add_vertex(p.to_array()).unwrap()))
+            .collect();
+        let mut rings = original;
+        rings.sort_by_key(|r| std::cmp::Reverse(r.len()));
+        model
+            .add_surface(
+                p,
+                rings
+                    .iter()
+                    .map(|r| r.iter().map(|n| vertices[n]).collect())
+                    .collect(),
+                ids,
+            )
+            .unwrap();
+        assert_eq!(model.surfaces[0].contours.len(), 2);
+        assert_eq!(model.surfaces[0].source_elements.len(), 8);
+    }
+
     #[test]
     fn assembles_common_edge_despite_small_unaccepted_frame_residual() {
         use super::super::{planes, recognize};

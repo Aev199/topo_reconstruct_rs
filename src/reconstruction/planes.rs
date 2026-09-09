@@ -98,6 +98,43 @@ pub(super) fn fit(points: &[DVec3], reference: DVec3) -> Option<(DVec3, f64)> {
     Some((n, -n.dot(center)))
 }
 
+/// Recover the perimeter of a supported convex FE facet independently of
+/// tensor-product or cyclic input numbering. Shared by recognition and assembly.
+pub(super) fn ordered_facet_nodes(
+    mesh: &MeshData,
+    e: &ElementData,
+    frame: &PlaneFrame,
+    precision: f64,
+) -> Option<Vec<u32>> {
+    if !e.is_shell() || e.nodes.iter().collect::<BTreeSet<_>>().len() != e.nodes.len() {
+        return None;
+    }
+    let points: Option<Vec<_>> = e
+        .nodes
+        .iter()
+        .map(|n| mesh.nodes.get(n).copied().filter(|p| p.is_finite()))
+        .collect();
+    let points = points?;
+    let center = points.iter().copied().sum::<DVec3>() / points.len() as f64;
+    let normal = DVec3::from_array(frame.normal);
+    let local = PlaneFrame::new(center.to_array(), frame.normal).ok()?;
+    let mut nodes = e.nodes.clone();
+    nodes.sort_by(|a, b| {
+        let p = local.project(mesh.nodes[a].to_array());
+        let q = local.project(mesh.nodes[b].to_array());
+        p[1].atan2(p[0]).total_cmp(&q[1].atan2(q[0]))
+    });
+    for i in 0..nodes.len() {
+        let a = mesh.nodes[&nodes[i]];
+        let b = mesh.nodes[&nodes[(i + 1) % nodes.len()]];
+        let c = mesh.nodes[&nodes[(i + 2) % nodes.len()]];
+        if a.distance(b) <= precision || (b - a).cross(c - b).dot(normal) <= precision * precision {
+            return None;
+        }
+    }
+    Some(nodes)
+}
+
 pub fn recognize(mesh: &MeshData, policy: &Policy) -> Result<Report, &'static str> {
     if !policy.angle.is_finite()
         || policy.angle <= 0.0
@@ -144,23 +181,7 @@ pub fn recognize(mesh: &MeshData, policy: &Policy) -> Result<Report, &'static st
                 return None;
             }
             let frame = PlaneFrame::new(center.to_array(), n.to_array()).ok()?;
-            let mut nodes = e.nodes.clone();
-            // LIRA tensor-product node numbering is not a perimeter ordering.
-            nodes.sort_by(|a, b| {
-                let p = frame.project(mesh.nodes[a].to_array());
-                let q = frame.project(mesh.nodes[b].to_array());
-                p[1].atan2(p[0]).total_cmp(&q[1].atan2(q[0]))
-            });
-            for i in 0..nodes.len() {
-                let a = mesh.nodes[&nodes[i]];
-                let b = mesh.nodes[&nodes[(i + 1) % nodes.len()]];
-                let c = mesh.nodes[&nodes[(i + 2) % nodes.len()]];
-                if a.distance(b) <= policy.precision
-                    || (b - a).cross(c - b).dot(n) <= policy.precision * policy.precision
-                {
-                    return None;
-                }
-            }
+            let nodes = ordered_facet_nodes(mesh, e, &frame, policy.precision)?;
             Some(Facet {
                 nodes,
                 normal: n,
