@@ -1,5 +1,6 @@
 //! Planar surfaces on a shared topological graph. No implicit mechanical ties.
 pub mod axes;
+pub mod frame;
 pub mod planes;
 pub mod recognize;
 
