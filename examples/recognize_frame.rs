@@ -6,7 +6,12 @@ use topo_reconstruct_rs::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
-        .ok_or("Usage: recognize_frame model.txt")?;
+        .ok_or("Usage: recognize_frame model.txt [iterations]")?;
+    let iterations = std::env::args()
+        .nth(2)
+        .map(|v| v.parse::<usize>())
+        .transpose()?
+        .unwrap_or(1000);
     let mesh = LiraParser::parse(path)?;
     let axes = recognize::recognize(
         &mesh,
@@ -35,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             relative_movement: 0.05,
             minimum_length: 0.03,
             residual_tolerance: 1e-7,
-            iterations: 1000,
+            iterations,
         },
     )?;
     serde_json::to_writer_pretty(

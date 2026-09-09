@@ -38,7 +38,7 @@ struct Facet {
     center: DVec3,
 }
 
-fn fit(points: &[DVec3], reference: DVec3) -> Option<(DVec3, f64)> {
+pub(super) fn fit(points: &[DVec3], reference: DVec3) -> Option<(DVec3, f64)> {
     if points.len() < 3 {
         return None;
     }
