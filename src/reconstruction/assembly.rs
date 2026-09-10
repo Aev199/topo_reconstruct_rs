@@ -18,18 +18,20 @@ pub struct Policy {
 #[derive(Debug, Serialize)]
 pub struct Issue {
     pub patch: usize,
+    pub source_elements: Vec<u32>,
     pub reason: String,
 }
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub policy: Policy,
-    /// This stage assembles surfaces only; axes/property-region geometry still
-    /// require reconciliation. Never treat this preview as an export gate.
+    /// This stage assembles surface property regions; axes and inter-surface
+    /// intersections still require reconciliation. This is not an export gate.
     pub export_ready: bool,
     pub all_surface_patches_built: bool,
     pub preview: Model,
     pub vertex_source_nodes: Vec<u32>,
     pub surface_source_patches: Vec<usize>,
+    pub surface_stiffness: Vec<u32>,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -91,6 +93,76 @@ fn boundary(
         rings.push(ring);
     }
     Ok(rings)
+}
+
+/// Split property regions by edge connectivity; a point contact does not
+/// turn two separate material areas into one polygon with an invalid hole.
+fn property_regions(
+    mesh: &MeshData,
+    source: &frame::Report,
+    precision: f64,
+) -> Result<Vec<(usize, u32, Vec<u32>)>, &'static str> {
+    let elements: BTreeMap<_, _> = mesh.elements.iter().map(|e| (e.id, e)).collect();
+    let mut result = vec![];
+    for (patch, surface) in source.surfaces.iter().enumerate() {
+        let represented: Vec<_> = surface
+            .stiffness_regions
+            .values()
+            .flatten()
+            .copied()
+            .collect();
+        if represented.len() != represented.iter().collect::<BTreeSet<_>>().len()
+            || represented.iter().copied().collect::<BTreeSet<_>>()
+                != surface.source_elements.iter().copied().collect()
+        {
+            return Err("invalid property coverage");
+        }
+        for (&stiffness, ids) in &surface.stiffness_regions {
+            let mut edges = BTreeMap::<[u32; 2], Vec<u32>>::new();
+            let mut neighbors = BTreeMap::<u32, BTreeSet<u32>>::new();
+            for &id in ids {
+                let e = elements.get(&id).ok_or("missing property element")?;
+                if e.stiff_id != stiffness {
+                    return Err("property mismatch");
+                }
+                neighbors.entry(id).or_default();
+                let ns = planes::ordered_facet_nodes(
+                    mesh,
+                    e,
+                    &source.candidate_planes[patch],
+                    precision,
+                )
+                .ok_or("invalid property facet")?;
+                for i in 0..ns.len() {
+                    let (a, b) = (ns[i], ns[(i + 1) % ns.len()]);
+                    edges.entry([a.min(b), a.max(b)]).or_default().push(id);
+                }
+            }
+            for owners in edges.values() {
+                for &a in owners {
+                    for &b in owners {
+                        if a != b {
+                            neighbors.entry(a).or_default().insert(b);
+                        }
+                    }
+                }
+            }
+            let mut remaining: BTreeSet<_> = ids.iter().copied().collect();
+            while let Some(&seed) = remaining.first() {
+                let mut stack = vec![seed];
+                let mut group = vec![];
+                while let Some(id) = stack.pop() {
+                    if remaining.remove(&id) {
+                        group.push(id);
+                        stack.extend(&neighbors[&id]);
+                    }
+                }
+                group.sort_unstable();
+                result.push((patch, stiffness, group));
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Minimum movement onto the intersection of fixed support planes, using an
@@ -216,18 +288,20 @@ pub fn assemble(
         .collect();
     let mut issues = vec![];
     let mut rings = BTreeMap::new();
-    for (i, s) in source.surfaces.iter().enumerate() {
+    let regions = property_regions(mesh, source, policy.precision)?;
+    for (i, (patch, _, ids)) in regions.iter().enumerate() {
         match boundary(
             mesh,
-            &s.source_elements,
-            &source.candidate_planes[i],
+            ids,
+            &source.candidate_planes[*patch],
             policy.precision,
         ) {
             Ok(r) => {
                 rings.insert(i, r);
             }
             Err(reason) => issues.push(Issue {
-                patch: i,
+                patch: *patch,
+                source_elements: ids.clone(),
                 reason: reason.into(),
             }),
         }
@@ -355,10 +429,14 @@ pub fn assemble(
         vertex_source_nodes.push(id);
     }
     let mut surface_source_patches = vec![];
-    for (patch, mut loops) in rings {
+    let mut surface_stiffness = vec![];
+    for (region, mut loops) in rings {
+        let (patch, stiffness, ids) = &regions[region];
+        let patch = *patch;
         if loops.iter().flatten().any(|n| !vertices.contains_key(n)) {
             issues.push(Issue {
                 patch,
+                source_elements: ids.clone(),
                 reason: "support_intersection_or_movement_budget".into(),
             });
             continue;
@@ -384,14 +462,14 @@ pub fn assemble(
             .iter()
             .map(|r| r.iter().map(|n| vertices[n]).collect())
             .collect();
-        match model.add_surface(
-            plane_id,
-            mapped,
-            source.surfaces[patch].source_elements.clone(),
-        ) {
-            Ok(_) => surface_source_patches.push(patch),
+        match model.add_surface(plane_id, mapped, ids.clone()) {
+            Ok(_) => {
+                surface_source_patches.push(patch);
+                surface_stiffness.push(*stiffness);
+            }
             Err(error) => issues.push(Issue {
                 patch,
+                source_elements: ids.clone(),
                 reason: format!("contour_{error:?}"),
             }),
         }
@@ -403,6 +481,7 @@ pub fn assemble(
         preview: model,
         vertex_source_nodes,
         surface_source_patches,
+        surface_stiffness,
         issues,
         maximum_closure_movement,
         rejected_vertices,
@@ -601,6 +680,28 @@ mod tests {
                 }
             }
         }
+        let mut planar = mesh.clone();
+        planar.nodes.insert(5, DVec3::new(-1., 1., 0.));
+        planar.nodes.insert(6, DVec3::new(-1., 0., 0.));
+        let planar_planes = planes::recognize(
+            &planar,
+            &planes::Policy {
+                angle: 0.02,
+                distance: 0.01,
+                precision: 1e-8,
+            },
+        )
+        .unwrap();
+        assert_eq!(planar_planes.patches.len(), 1);
+        let planar_frame = frame::solve(&planar, &axes, &planar_planes, &f.policy).unwrap();
+        let materialized = assemble(&planar, &planar_frame, &p).unwrap();
+        assert!(materialized.all_surface_patches_built);
+        assert_eq!(materialized.surface_source_patches, vec![0, 0]);
+        assert_eq!(materialized.surface_stiffness, vec![10, 20]);
+        assert_eq!(materialized.preview.surfaces.len(), 2);
+        assert_eq!(materialized.preview.edges.len(), 7);
+        assert_eq!(materialized.preview.surfaces[0].source_elements, vec![1]);
+        assert_eq!(materialized.preview.surfaces[1].source_elements, vec![2]);
         f.candidate_points[0] = [0.002, 0., 0.002];
         let blocked = assemble(&mesh, &f, &p).unwrap();
         assert!(!blocked.all_surface_patches_built);
