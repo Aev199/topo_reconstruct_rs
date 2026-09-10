@@ -48,6 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &result,
         &assembly::Policy {
             closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
             precision: 1e-7,
             minimum_edge: 0.001,
         },

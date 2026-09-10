@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Policy {
+    /// Maximum normal deviation when reconciling support planes.
     pub closure_tolerance: f64,
+    /// Additional displacement allowed when closing shared junctions.
+    pub junction_movement_limit: f64,
     pub precision: f64,
     pub minimum_edge: f64,
 }
@@ -191,7 +194,11 @@ pub fn assemble(
     source: &frame::Report,
     policy: &Policy,
 ) -> Result<Report, &'static str> {
-    if !policy.closure_tolerance.is_finite() || policy.closure_tolerance < policy.precision {
+    if !policy.closure_tolerance.is_finite()
+        || policy.closure_tolerance < policy.precision
+        || !policy.junction_movement_limit.is_finite()
+        || policy.junction_movement_limit < policy.precision
+    {
         return Err("invalid closure tolerance");
     }
     let mut model =
@@ -326,7 +333,8 @@ pub fn assemble(
                 budget = budget.min(source.policy.relative_movement * a.distance(b));
             }
         }
-        if movement > policy.closure_tolerance || q.distance(reference) > budget + policy.precision
+        if movement > policy.junction_movement_limit
+            || q.distance(reference) > budget + policy.precision
         {
             rejected_vertices.insert(
                 id,
@@ -568,6 +576,7 @@ mod tests {
         f.candidate_points[0] = [0.0003, 0., 0.0002];
         let p = Policy {
             closure_tolerance: 0.001,
+            junction_movement_limit: 0.001,
             precision: 1e-7,
             minimum_edge: 0.001,
         };
@@ -597,6 +606,22 @@ mod tests {
         assert!(!blocked.all_surface_patches_built);
         assert!(blocked.preview.surfaces.is_empty());
         assert_eq!(blocked.issues.len(), 2);
+        let mut larger = p.clone();
+        larger.junction_movement_limit = 0.01;
+        let permitted = assemble(&mesh, &f, &larger).unwrap();
+        assert!(permitted.all_surface_patches_built);
+        assert!(permitted.maximum_closure_movement > larger.closure_tolerance);
+        assert_eq!(permitted.preview.edges.len(), 7);
+        let mut limited = f.clone();
+        limited.policy.maximum_movement = 1e-6;
+        // Move the shared point tangentially so projection does not remove its
+        // accumulated displacement from the immutable source model.
+        limited.candidate_points[0] = [0.002, 0.0002, 0.002];
+        assert!(
+            !assemble(&mesh, &limited, &larger)
+                .unwrap()
+                .all_surface_patches_built
+        );
     }
     #[test]
     fn closes_shared_point_on_two_planes_and_rejects_parallel_gap() {
