@@ -31,6 +31,7 @@ pub struct Report {
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
     pub support_representatives: Vec<usize>,
+    pub support_offset_projection_applied: bool,
 }
 
 fn boundary(
@@ -112,6 +113,77 @@ fn intersection(point: DVec3, planes: &[&PlaneFrame], precision: f64) -> Option<
             .iter()
             .all(|p| p.distance(result.to_array()).abs() <= precision))
     .then_some(result)
+}
+
+/// Enforce concurrence by projecting support offsets onto the linear
+/// compatibility constraints. Normals remain fixed; no per-surface node copies.
+fn concurrent_supports(planes: &[PlaneFrame], junctions: &[Vec<usize>]) -> Vec<PlaneFrame> {
+    if planes.is_empty() {
+        return vec![];
+    }
+    let center = DVec3::from_array(planes[0].origin);
+    let offsets: Vec<_> = planes
+        .iter()
+        .map(|p| DVec3::from_array(p.normal).dot(DVec3::from_array(p.origin) - center))
+        .collect();
+    let mut constraints: Vec<Vec<f64>> = vec![];
+    for junction in junctions {
+        let mut basis: Vec<(DVec3, Vec<f64>)> = vec![];
+        for &i in junction {
+            let mut n = DVec3::from_array(planes[i].normal);
+            let mut row = vec![0.; planes.len()];
+            row[i] = 1.;
+            for (q, r) in &basis {
+                let a = n.dot(*q);
+                n -= a * *q;
+                for (v, b) in row.iter_mut().zip(r) {
+                    *v -= a * b;
+                }
+            }
+            let length = n.length();
+            if length > 1e-10 && basis.len() < 3 {
+                for v in &mut row {
+                    *v /= length;
+                }
+                basis.push((n / length, row));
+            } else {
+                // Reorthogonalize to avoid amplifying repeated junction rows.
+                for _ in 0..2 {
+                    for q in &constraints {
+                        let a: f64 = row.iter().zip(q).map(|(a, b)| a * b).sum();
+                        for (v, b) in row.iter_mut().zip(q) {
+                            *v -= a * b;
+                        }
+                    }
+                }
+                let length = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if length > 1e-10 {
+                    for v in &mut row {
+                        *v /= length;
+                    }
+                    constraints.push(row);
+                }
+            }
+        }
+    }
+    let mut corrected = offsets.clone();
+    for row in constraints {
+        let error: f64 = row.iter().zip(&offsets).map(|(a, b)| a * b).sum();
+        for (d, a) in corrected.iter_mut().zip(row) {
+            *d -= error * a;
+        }
+    }
+    planes
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let n = DVec3::from_array(p.normal);
+            let mut result = p.clone();
+            result.origin =
+                (DVec3::from_array(p.origin) + n * (corrected[i] - offsets[i])).to_array();
+            result
+        })
+        .collect()
 }
 
 pub fn assemble(
@@ -204,6 +276,30 @@ pub fn assemble(
             }
         }
     }
+    let junctions: Vec<Vec<usize>> = owners
+        .values()
+        .map(|ids| {
+            ids.iter()
+                .map(|&i| support_representatives[i])
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        })
+        .collect();
+    let proposal = concurrent_supports(&source.candidate_planes, &junctions);
+    let support_offsets_adjusted = source.surfaces.iter().enumerate().all(|(i, s)| {
+        s.nodes.iter().all(|&n| {
+            proposal[support_representatives[i]]
+                .distance(source.candidate_points[n])
+                .abs()
+                <= policy.closure_tolerance
+        })
+    });
+    let closed_supports = if support_offsets_adjusted {
+        proposal
+    } else {
+        source.candidate_planes.clone()
+    };
     let mut rejected_vertices = BTreeMap::new();
     let mut vertices = BTreeMap::new();
     let mut vertex_source_nodes = vec![];
@@ -213,7 +309,7 @@ pub fn assemble(
         let p = DVec3::from_array(source.candidate_points[i]);
         let planes: Vec<_> = supports
             .iter()
-            .map(|&s| &source.candidate_planes[support_representatives[s]])
+            .map(|&s| &closed_supports[support_representatives[s]])
             .collect();
         let Some(q) = intersection(p, &planes, policy.precision) else {
             rejected_vertices.insert(id, "inconsistent_supports".into());
@@ -259,7 +355,7 @@ pub fn assemble(
             });
             continue;
         }
-        let plane = &source.candidate_planes[support_representatives[patch]];
+        let plane = &closed_supports[support_representatives[patch]];
         let area = |ring: &Vec<u32>| {
             let uv: Vec<_> = ring
                 .iter()
@@ -303,12 +399,45 @@ pub fn assemble(
         maximum_closure_movement,
         rejected_vertices,
         support_representatives,
+        support_offset_projection_applied: support_offsets_adjusted,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn offset_projection_closes_three_walls_without_changing_normals() {
+        let planes = vec![
+            PlaneFrame::new([0.; 3], [1., 0., 0.]).unwrap(),
+            PlaneFrame::new([0.; 3], [0., 1., 0.]).unwrap(),
+            PlaneFrame::new([0.0003, 0., 0.], [1., 1., 0.]).unwrap(),
+        ];
+        assert!(intersection(DVec3::ZERO, &planes.iter().collect::<Vec<_>>(), 1e-9).is_none());
+        let closed = concurrent_supports(&planes, &[vec![0, 1, 2], vec![2, 1, 0]]);
+        let point = intersection(DVec3::ZERO, &closed.iter().collect::<Vec<_>>(), 1e-9).unwrap();
+        assert!(point.length() < 0.001);
+        for (a, b) in planes.iter().zip(&closed) {
+            assert_eq!(a.normal, b.normal);
+            assert!(a.distance(b.origin).abs() < 0.001);
+        }
+        let rotation = glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.6);
+        let shift = DVec3::new(10., 20., 30.);
+        let moved: Vec<_> = planes
+            .iter()
+            .map(|p| {
+                PlaneFrame::new(
+                    (rotation * DVec3::from_array(p.origin) + shift).to_array(),
+                    (rotation * DVec3::from_array(p.normal)).to_array(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let result = concurrent_supports(&moved, &[vec![2, 0, 1]]);
+        let transformed = intersection(shift, &result.iter().collect::<Vec<_>>(), 1e-9).unwrap();
+        assert!(transformed.distance(rotation * point + shift) < 1e-9);
+    }
+
     #[test]
     fn tensor_numbering_preserves_outer_boundary_and_hole() {
         use crate::input::ElementData;
