@@ -20,6 +20,14 @@ pub struct Issue {
     pub patch: usize,
     pub source_elements: Vec<u32>,
     pub reason: String,
+    pub boundary_source_nodes: Vec<Vec<u32>>,
+}
+#[derive(Debug, Serialize)]
+pub struct RegionSplit {
+    pub patch: usize,
+    pub stiffness: u32,
+    pub source_elements: Vec<u32>,
+    pub parts: Vec<Vec<u32>>,
 }
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -32,6 +40,7 @@ pub struct Report {
     pub vertex_source_nodes: Vec<u32>,
     pub surface_source_patches: Vec<usize>,
     pub surface_stiffness: Vec<u32>,
+    pub pinched_region_splits: Vec<RegionSplit>,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -95,12 +104,81 @@ fn boundary(
     Ok(rings)
 }
 
+/// Open a pinched boundary by isolating its incident face fans along existing
+/// source edges. This partitions material, never fills a hole or moves a node.
+/// Every successful recursion strictly reduces the source group; unresolved
+/// nonmanifold cases still reach the normal rejecting boundary validator.
+fn split_pinched_regions(ids: &[u32], facets: &BTreeMap<u32, Vec<u32>>) -> Vec<Vec<u32>> {
+    let mut edges = BTreeMap::<[u32; 2], Vec<u32>>::new();
+    for &id in ids {
+        let ns = &facets[&id];
+        for i in 0..ns.len() {
+            let (a, b) = (ns[i], ns[(i + 1) % ns.len()]);
+            edges.entry([a.min(b), a.max(b)]).or_default().push(id);
+        }
+    }
+    if edges.values().any(|owners| owners.len() > 2) {
+        return vec![ids.to_vec()];
+    }
+    let mut degree = BTreeMap::<u32, usize>::new();
+    for (edge, owners) in &edges {
+        if owners.len() == 1 {
+            for &n in edge {
+                *degree.entry(n).or_default() += 1;
+            }
+        }
+    }
+    let pinch: BTreeSet<_> = degree
+        .into_iter()
+        .filter_map(|(n, d)| (d > 2).then_some(n))
+        .collect();
+    if pinch.is_empty() {
+        return vec![ids.to_vec()];
+    }
+    let incident: BTreeSet<_> = ids
+        .iter()
+        .copied()
+        .filter(|id| facets[id].iter().any(|n| pinch.contains(n)))
+        .collect();
+    let mut neighbors = BTreeMap::<u32, Vec<u32>>::new();
+    for owners in edges.values() {
+        if let [a, b] = owners.as_slice() {
+            if incident.contains(a) == incident.contains(b) {
+                neighbors.entry(*a).or_default().push(*b);
+                neighbors.entry(*b).or_default().push(*a);
+            }
+        }
+    }
+    let mut remaining: BTreeSet<_> = ids.iter().copied().collect();
+    let mut groups = vec![];
+    while let Some(&seed) = remaining.first() {
+        let mut stack = vec![seed];
+        let mut group = vec![];
+        while let Some(id) = stack.pop() {
+            if remaining.remove(&id) {
+                group.push(id);
+                stack.extend(neighbors.get(&id).into_iter().flatten().copied());
+            }
+        }
+        group.sort_unstable();
+        groups.push(group);
+    }
+    if groups.len() == 1 {
+        return groups;
+    }
+    groups
+        .iter()
+        .flat_map(|g| split_pinched_regions(g, facets))
+        .collect()
+}
+
 /// Split property regions by edge connectivity; a point contact does not
 /// turn two separate material areas into one polygon with an invalid hole.
 fn property_regions(
     mesh: &MeshData,
     source: &frame::Report,
     precision: f64,
+    splits: &mut Vec<RegionSplit>,
 ) -> Result<Vec<(usize, u32, Vec<u32>)>, &'static str> {
     let elements: BTreeMap<_, _> = mesh.elements.iter().map(|e| (e.id, e)).collect();
     let mut result = vec![];
@@ -118,6 +196,7 @@ fn property_regions(
             return Err("invalid property coverage");
         }
         for (&stiffness, ids) in &surface.stiffness_regions {
+            let mut facets = BTreeMap::new();
             let mut edges = BTreeMap::<[u32; 2], Vec<u32>>::new();
             let mut neighbors = BTreeMap::<u32, BTreeSet<u32>>::new();
             for &id in ids {
@@ -133,6 +212,7 @@ fn property_regions(
                     precision,
                 )
                 .ok_or("invalid property facet")?;
+                facets.insert(id, ns.clone());
                 for i in 0..ns.len() {
                     let (a, b) = (ns[i], ns[(i + 1) % ns.len()]);
                     edges.entry([a.min(b), a.max(b)]).or_default().push(id);
@@ -158,7 +238,16 @@ fn property_regions(
                     }
                 }
                 group.sort_unstable();
-                result.push((patch, stiffness, group));
+                let parts = split_pinched_regions(&group, &facets);
+                if parts.len() > 1 {
+                    splits.push(RegionSplit {
+                        patch,
+                        stiffness,
+                        source_elements: group,
+                        parts: parts.clone(),
+                    });
+                }
+                result.extend(parts.into_iter().map(|part| (patch, stiffness, part)));
             }
         }
     }
@@ -288,7 +377,8 @@ pub fn assemble(
         .collect();
     let mut issues = vec![];
     let mut rings = BTreeMap::new();
-    let regions = property_regions(mesh, source, policy.precision)?;
+    let mut pinched_region_splits = vec![];
+    let regions = property_regions(mesh, source, policy.precision, &mut pinched_region_splits)?;
     for (i, (patch, _, ids)) in regions.iter().enumerate() {
         match boundary(
             mesh,
@@ -303,6 +393,7 @@ pub fn assemble(
                 patch: *patch,
                 source_elements: ids.clone(),
                 reason: reason.into(),
+                boundary_source_nodes: vec![],
             }),
         }
     }
@@ -438,6 +529,7 @@ pub fn assemble(
                 patch,
                 source_elements: ids.clone(),
                 reason: "support_intersection_or_movement_budget".into(),
+                boundary_source_nodes: loops.clone(),
             });
             continue;
         }
@@ -451,12 +543,16 @@ pub fn assemble(
                 .map(|i| {
                     let a = uv[i];
                     let b = uv[(i + 1) % uv.len()];
-                    a[0] * b[1] - a[1] * b[0]
+                    (a[0] - uv[0][0]) * (b[1] - uv[0][1]) - (a[1] - uv[0][1]) * (b[0] - uv[0][0])
                 })
                 .sum::<f64>()
                 .abs()
         };
         loops.sort_by(|a, b| area(b).total_cmp(&area(a)));
+        let degenerate_hole = loops
+            .iter()
+            .skip(1)
+            .any(|ring| area(ring) <= policy.precision * policy.precision);
         let plane_id = model.add_plane(plane.clone());
         let mapped = loops
             .iter()
@@ -470,7 +566,12 @@ pub fn assemble(
             Err(error) => issues.push(Issue {
                 patch,
                 source_elements: ids.clone(),
-                reason: format!("contour_{error:?}"),
+                reason: if degenerate_hole {
+                    "degenerate_hole_after_closure".into()
+                } else {
+                    format!("contour_{error:?}")
+                },
+                boundary_source_nodes: loops,
             }),
         }
     }
@@ -482,6 +583,7 @@ pub fn assemble(
         vertex_source_nodes,
         surface_source_patches,
         surface_stiffness,
+        pinched_region_splits,
         issues,
         maximum_closure_movement,
         rejected_vertices,
@@ -493,6 +595,252 @@ pub fn assemble(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn planar_frame(mesh: &MeshData, up: DVec3) -> frame::Report {
+        use super::super::recognize;
+        let axes = recognize::recognize(
+            mesh,
+            &recognize::Policy {
+                angle: 0.02,
+                line_tolerance: 0.01,
+                numerical_precision: 1e-8,
+            },
+        )
+        .unwrap();
+        let surfaces = planes::recognize(
+            mesh,
+            &planes::Policy {
+                angle: 0.02,
+                distance: 0.01,
+                precision: 1e-8,
+            },
+        )
+        .unwrap();
+        frame::solve(
+            mesh,
+            &axes,
+            &surfaces,
+            &frame::Policy {
+                up: up.to_array(),
+                angle: 0.02,
+                maximum_movement: 0.15,
+                relative_movement: 0.05,
+                minimum_length: 0.03,
+                residual_tolerance: 1e-7,
+                iterations: 100,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pinched_opening_is_partitioned_without_filling_or_duplicate_sources() {
+        use crate::input::ElementData;
+        let policy = Policy {
+            closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
+            precision: 1e-7,
+            minimum_edge: 0.001,
+        };
+        let mut mesh = MeshData::default();
+        for y in 0..4 {
+            for x in 0..4 {
+                mesh.nodes
+                    .insert(1 + x + 4 * y, DVec3::new(x as f64, y as f64, 0.));
+            }
+        }
+        for y in 0..3 {
+            for x in 0..3 {
+                // An interior void touches the exterior at just one vertex.
+                if (x == 0 && y == 0) || (x == 1 && y == 1) {
+                    continue;
+                }
+                let a = 1 + x + 4 * y;
+                mesh.elements.push(ElementData {
+                    id: mesh.elements.len() as u32 + 1,
+                    elem_type: 44,
+                    stiff_id: 9,
+                    nodes: vec![a, a + 1, a + 4, a + 5],
+                });
+            }
+        }
+        let f = planar_frame(&mesh, DVec3::Z);
+        let ids: Vec<_> = mesh.elements.iter().map(|e| e.id).collect();
+        assert_eq!(
+            boundary(&mesh, &ids, &f.candidate_planes[0], 1e-7),
+            Err("ambiguous_boundary")
+        );
+        let base = assemble(&mesh, &f, &policy).unwrap();
+        assert!(base.all_surface_patches_built, "{:?}", base.issues);
+        assert_eq!(base.pinched_region_splits.len(), 1);
+        assert!(base.preview.surfaces.len() > 1);
+        let mut sources: Vec<_> = base
+            .preview
+            .surfaces
+            .iter()
+            .flat_map(|s| s.source_elements.iter().copied())
+            .collect();
+        sources.sort_unstable();
+        assert_eq!(sources, ids);
+        let area: f64 = base
+            .preview
+            .surfaces
+            .iter()
+            .map(|s| {
+                s.contours
+                    .iter()
+                    .enumerate()
+                    .map(|(j, r)| {
+                        let a = (0..r.len())
+                            .map(|i| {
+                                let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                                a[0] * b[1] - a[1] * b[0]
+                            })
+                            .sum::<f64>()
+                            .abs()
+                            / 2.;
+                        if j == 0 {
+                            a
+                        } else {
+                            -a
+                        }
+                    })
+                    .sum::<f64>()
+            })
+            .sum();
+        assert!((area - 7.).abs() < 1e-9);
+        assert_eq!(
+            base.vertex_source_nodes.iter().filter(|&&n| n == 6).count(),
+            1
+        );
+        let mut uses = BTreeMap::<usize, usize>::new();
+        for e in base
+            .preview
+            .surfaces
+            .iter()
+            .flat_map(|s| s.boundaries.iter().flatten())
+        {
+            *uses.entry(e.edge).or_default() += 1;
+        }
+        assert!(uses.values().any(|&n| n == 2));
+        assert!(base.surface_stiffness.iter().all(|&s| s == 9));
+        // Run the whole recognition and assembly after a rigid transform and
+        // reversed node/element numbering, not merely the graph helper.
+        let q = glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.6);
+        let shift = DVec3::new(30., -40., 70.);
+        let mut moved = mesh.clone();
+        moved.nodes = mesh
+            .nodes
+            .iter()
+            .map(|(&n, &p)| (100 - n, q * p + shift))
+            .collect();
+        moved.elements.reverse();
+        for e in &mut moved.elements {
+            e.id = 100 - e.id;
+            for n in &mut e.nodes {
+                *n = 100 - *n;
+            }
+            e.nodes.reverse();
+        }
+        let transformed = assemble(&moved, &planar_frame(&moved, q * DVec3::Z), &policy).unwrap();
+        assert!(transformed.all_surface_patches_built);
+        let groups = |r: &Report, reverse: bool| -> BTreeSet<Vec<u32>> {
+            r.preview
+                .surfaces
+                .iter()
+                .map(|s| {
+                    let mut ids: Vec<_> = s
+                        .source_elements
+                        .iter()
+                        .map(|&n| if reverse { 100 - n } else { n })
+                        .collect();
+                    ids.sort_unstable();
+                    ids
+                })
+                .collect()
+        };
+        assert_eq!(groups(&base, false), groups(&transformed, true));
+        for (&n, &p) in base.vertex_source_nodes.iter().zip(&base.preview.vertices) {
+            let k = transformed
+                .vertex_source_nodes
+                .iter()
+                .position(|&v| v == 100 - n)
+                .unwrap();
+            assert!(
+                DVec3::from_array(transformed.preview.vertices[k])
+                    .distance(q * DVec3::from_array(p) + shift)
+                    < 1e-7
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_hole_is_reported_with_source_nodes_and_never_filled() {
+        use crate::input::ElementData;
+        let mut mesh = MeshData::default();
+        for (i, p) in [
+            [-2., -2., 0.],
+            [2., -2., 0.],
+            [0., 2., 0.],
+            [-0.005, 0., 0.],
+            [0.005, 0., 0.],
+            [0., 0.5, 0.],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mesh.nodes.insert(i as u32 + 1, DVec3::from_array(p));
+        }
+        for i in 0..3_u32 {
+            mesh.elements.push(ElementData {
+                id: i + 1,
+                elem_type: 44,
+                stiff_id: 9,
+                nodes: vec![i + 1, (i + 1) % 3 + 1, (i + 1) % 3 + 4, i + 4],
+            });
+        }
+        let policy = Policy {
+            closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
+            precision: 1e-7,
+            minimum_edge: 0.001,
+        };
+        let mut f = planar_frame(&mesh, DVec3::Z);
+        let base = assemble(&mesh, &f, &policy).unwrap();
+        assert!(base.all_surface_patches_built, "{:?}", base.issues);
+        assert_eq!(base.preview.surfaces[0].contours.len(), 2);
+        // A regularized candidate flattens the narrow hole into a line with
+        // distinct points, so this is not merely a duplicate-node test.
+        for (i, &n) in f.node_ids.iter().enumerate() {
+            if n == 4 {
+                f.candidate_points[i] = [0., 0., 0.];
+            }
+            if n == 5 {
+                f.candidate_points[i] = [0., 0.1, 0.];
+            }
+        }
+        let result = assemble(&mesh, &f, &policy).unwrap();
+        assert!(!result.all_surface_patches_built);
+        assert!(result.preview.surfaces.is_empty());
+        assert!(result.preview.edges.is_empty());
+        assert_eq!(result.issues.len(), 1);
+        assert_eq!(result.issues[0].reason, "degenerate_hole_after_closure");
+        assert_eq!(result.issues[0].source_elements, vec![1, 2, 3]);
+        assert!(result.issues[0].boundary_source_nodes.iter().any(|r| r
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            == BTreeSet::from([4, 5, 6])));
+    }
+
+    #[test]
+    fn nonmanifold_source_is_not_hidden_by_pinch_partition() {
+        let facets = BTreeMap::from([(1, vec![1, 2, 3]), (2, vec![2, 1, 4]), (3, vec![1, 2, 5])]);
+        assert_eq!(
+            split_pinched_regions(&[1, 2, 3], &facets),
+            vec![vec![1, 2, 3]]
+        );
+    }
+
     #[test]
     fn offset_projection_closes_three_walls_without_changing_normals() {
         let planes = vec![
