@@ -9,6 +9,8 @@ use geo::{
 use glam::{DVec2, DVec3};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+mod repair;
+pub use repair::{Change as BoundaryChange, Repair as BoundaryRepair};
 
 #[derive(Debug, Serialize)]
 pub struct Anchor {
@@ -56,6 +58,7 @@ pub struct Issue {
 }
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
+    pub boundary_repairs: Vec<BoundaryRepair>,
     pub all_axes_built: bool,
     pub axes: Vec<Axis>,
     pub contacts: Vec<Contact>,
@@ -456,6 +459,21 @@ pub(super) fn assemble(
             locked.insert(n, candidate);
         }
     }
+    report.boundary_repairs = repair::repair(
+        model,
+        &mut locked,
+        &repair::Context {
+            mesh,
+            source,
+            vertices: &vertices,
+            incidence: &incidence,
+            unavailable: &unavailable,
+            owner_planes: &owner_planes,
+            owner_surfaces: &owner_surfaces,
+            supports,
+            policy,
+        },
+    );
     // Shared junctions are fixed before any axis is considered. Accepted axes
     // cannot move a neighbor or depend on processing order.
     for (source_axis, axis) in source.axes.iter().enumerate() {
@@ -676,6 +694,108 @@ mod tests {
             },
         ]);
         mesh
+    }
+    #[test]
+    fn shared_material_boundary_moves_with_axis_under_transforms() {
+        for scale in [0.1, 1., 10.] {
+            for transformed in [false, true] {
+                let mut mesh = slab_beam_column();
+                mesh.elements.retain(|e| e.id != 7);
+                for e in &mut mesh.elements {
+                    if e.id == 3 || e.id == 4 {
+                        e.stiff_id = 2;
+                    }
+                }
+                let q = if transformed {
+                    glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.6)
+                } else {
+                    glam::DQuat::IDENTITY
+                };
+                let shift = DVec3::new(20., -30., 50.);
+                let number = |n| if transformed { 100 - n } else { n };
+                mesh.nodes = mesh
+                    .nodes
+                    .iter()
+                    .map(|(&n, &p)| (number(n), q * (p * scale) + shift))
+                    .collect();
+                for e in &mut mesh.elements {
+                    e.id = number(e.id);
+                    for n in &mut e.nodes {
+                        *n = number(*n);
+                    }
+                    e.nodes.reverse();
+                }
+                if transformed {
+                    mesh.elements.reverse();
+                }
+                let mut f = frame(&mesh, q * DVec3::Z);
+                let i = f.node_ids.iter().position(|&n| n == number(5)).unwrap();
+                f.candidate_points[i] =
+                    (q * (DVec3::new(1., 1.002, 0.) * scale) + shift).to_array();
+                let r = assembly::assemble(&mesh, &f, &policy(scale)).unwrap();
+                assert!(r.all_surface_patches_built);
+                assert!(
+                    r.axis_assembly.all_axes_built,
+                    "{:?}",
+                    r.axis_assembly.issues
+                );
+                assert_eq!(r.axis_assembly.boundary_repairs.len(), 1);
+                let repair = &r.axis_assembly.boundary_repairs[0];
+                assert!(repair.accepted, "{}", repair.reason);
+                assert_eq!(repair.surfaces.len(), 2);
+                assert_eq!(repair.changes.len(), 1);
+                assert_eq!(repair.changes[0].source_node, number(5));
+                let p = DVec3::from_array(repair.changes[0].after);
+                assert!(p.distance(mesh.nodes[&number(5)]) < policy(scale).precision);
+                assert_eq!(
+                    r.vertex_source_nodes
+                        .iter()
+                        .filter(|&&n| n == number(5))
+                        .count(),
+                    1
+                );
+                for s in &r.preview.surfaces {
+                    assert!(
+                        (geo::Area::unsigned_area(&polygon(&s.contours)) - 2. * scale * scale)
+                            .abs()
+                            < 1e-6 * scale * scale
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn boundary_repair_rolls_back_when_neighbor_would_self_touch() {
+        let mut mesh = slab_beam_column();
+        mesh.elements.retain(|e| e.id != 7);
+        for e in &mut mesh.elements {
+            if e.id == 3 || e.id == 4 {
+                e.stiff_id = 2;
+            }
+        }
+        for n in [7, 8, 9] {
+            mesh.nodes.get_mut(&n).unwrap().y = 1.004;
+        }
+        let mut f = frame(&mesh, DVec3::Z);
+        for (i, &n) in f.node_ids.iter().enumerate() {
+            if n == 5 {
+                f.candidate_points[i][1] = 0.998;
+            }
+            if n == 8 {
+                f.candidate_points[i][1] = 1.;
+            }
+        }
+        let r = assembly::assemble(&mesh, &f, &policy(1.)).unwrap();
+        assert!(r.all_surface_patches_built, "{:?}", r.issues);
+        assert_eq!(r.axis_assembly.boundary_repairs.len(), 1);
+        let repair = &r.axis_assembly.boundary_repairs[0];
+        assert!(!repair.accepted);
+        assert_eq!(repair.reason, "invalid_neighbor_contour");
+        assert!(repair.changes.is_empty());
+        let v = r.vertex_source_nodes.iter().position(|&n| n == 5).unwrap();
+        assert!((r.preview.vertices[v][1] - 0.998).abs() < 1e-7);
+        assert!(!r.axis_assembly.all_axes_built);
     }
     #[test]
     fn interior_joint_shares_one_vertex_without_splitting_axis_or_properties() {

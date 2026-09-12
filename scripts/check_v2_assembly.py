@@ -40,8 +40,13 @@ def check(data, baseline=None):
 
     for surface, patch, stiffness in zip(model["surfaces"], topology["surface_source_patches"], topology["surface_stiffness"]):
         assert set(surface["source_elements"]) <= set(frame["surfaces"][patch]["stiffness_regions"][str(stiffness)])
-        for ring in surface["boundaries"]:
-            for edge in ring:
+        for ring, contour in zip(surface["boundaries"], surface["contours"]):
+            assert len(ring) == len(contour)
+            plane = model["planes"][surface["plane"]]
+            for edge, uv in zip(ring, contour):
+                start = model["edges"][edge["edge"]][1 if edge["reversed"] else 0]
+                lifted = [plane["origin"][k] + uv[0] * plane["u"][k] + uv[1] * plane["v"][k] for k in range(3)]
+                assert math.dist(lifted, vertices[start]) <= epsilon
                 for v in model["edges"][edge["edge"]]:
                     assert abs(distance(surface, vertices[v])) <= epsilon
 
@@ -83,9 +88,31 @@ def check(data, baseline=None):
             assert all(abs(distance(surface, vertices[v])) <= epsilon for v in axis["endpoints"])
     if baseline:
         before = baseline["topology"]["preview"]
-        for field in ("surfaces", "edges", "planes"):
+        old_axes = baseline["topology"].get("axis_assembly", {}).get("axes", [])
+        assert {a["source_axis"] for a in old_axes} <= {a["source_axis"] for a in bars["axes"]}
+        for field in ("edges", "planes"):
             assert model[field] == before[field], field
-        assert vertices[:len(before["vertices"])] == before["vertices"]
+        assert len(model["surfaces"]) == len(before["surfaces"])
+        for old, new in zip(before["surfaces"], model["surfaces"]):
+            for field in ("plane", "boundaries", "source_elements"):
+                assert old[field] == new[field]
+        logged = {}
+        for repair in bars.get("boundary_repairs", []):
+            if not repair["accepted"]:
+                assert not repair["changes"]
+            for change in repair["changes"]:
+                assert change["source_node"] not in logged
+                logged[change["source_node"]] = change
+        current_by_node = dict(zip(source_nodes, vertices))
+        boundary_vertices = {v for edge in before["edges"] for v in edge}
+        for v in boundary_vertices:
+            n = baseline["topology"]["vertex_source_nodes"][v]
+            old = before["vertices"][v]
+            if n in logged:
+                assert logged[n]["before"] == old
+                assert logged[n]["after"] == current_by_node[n]
+            else:
+                assert current_by_node[n] == old
     assert not topology["export_ready"]
     assert not bars["mesh_constraints_complete"]
     return {"surfaces": len(model["surfaces"]), "axes": len(bars["axes"]),
@@ -96,7 +123,7 @@ def check(data, baseline=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("report")
-    parser.add_argument("--baseline", help="Optional surface-only report; check it remains unchanged")
+    parser.add_argument("--baseline", help="Check retained topology, logged boundary moves, and previously accepted axes")
     args = parser.parse_args()
     with open(args.report, encoding="utf-8") as stream:
         data = json.load(stream)
