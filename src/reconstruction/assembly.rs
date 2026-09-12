@@ -1,8 +1,10 @@
 //! Surface topology preview. Engineering closure tolerance is distinct from
 //! numerical planarity. Mechanical ties and mesh readiness are not inferred.
+mod holes;
 use super::{frame, planes, Model, PlaneFrame};
 use crate::input::MeshData;
 use glam::DVec3;
+pub use holes::{HoleConstraint, HoleNodeChange, HoleOutcome, HoleRecovery};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,6 +43,7 @@ pub struct Report {
     pub surface_source_patches: Vec<usize>,
     pub surface_stiffness: Vec<u32>,
     pub pinched_region_splits: Vec<RegionSplit>,
+    pub hole_recovery: Vec<HoleRecovery>,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -350,6 +353,30 @@ fn concurrent_supports(planes: &[PlaneFrame], junctions: &[Vec<usize>]) -> Vec<P
         .collect()
 }
 
+fn movement_budget(mesh: &MeshData, source: &frame::Report, index: usize) -> f64 {
+    let mut budget = source.policy.maximum_movement;
+    for axis in &source.axes {
+        if axis.anchors.iter().any(|a| a.node == index) {
+            let a = mesh.nodes[&source.node_ids[axis.endpoints[0]]];
+            let b = mesh.nodes[&source.node_ids[axis.endpoints[1]]];
+            budget = budget.min(source.policy.relative_movement * a.distance(b));
+        }
+    }
+    budget
+}
+
+fn ring_area(ring: &[u32], plane: &PlaneFrame, point: impl Fn(u32) -> [f64; 3]) -> f64 {
+    let uv: Vec<_> = ring.iter().map(|&n| plane.project(point(n))).collect();
+    (0..uv.len())
+        .map(|i| {
+            let (a, b, o) = (uv[i], uv[(i + 1) % uv.len()], uv[0]);
+            (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+        })
+        .sum::<f64>()
+        .abs()
+        / 2.
+}
+
 pub fn assemble(
     mesh: &MeshData,
     source: &frame::Report,
@@ -386,7 +413,14 @@ pub fn assemble(
             &source.candidate_planes[*patch],
             policy.precision,
         ) {
-            Ok(r) => {
+            Ok(mut r) => {
+                // Fix exterior/hole roles from the immutable source geometry.
+                let area = |ring: &Vec<u32>| {
+                    ring_area(ring, &source.candidate_planes[*patch], |n| {
+                        mesh.nodes[&n].to_array()
+                    })
+                };
+                r.sort_by(|a, b| area(b).total_cmp(&area(a)));
                 rings.insert(i, r);
             }
             Err(reason) => issues.push(Issue {
@@ -473,9 +507,7 @@ pub fn assemble(
         source.candidate_planes.clone()
     };
     let mut rejected_vertices = BTreeMap::new();
-    let mut vertices = BTreeMap::new();
-    let mut vertex_source_nodes = vec![];
-    let mut maximum_closure_movement = 0.0_f64;
+    let mut closed_points = BTreeMap::new();
     for (&id, supports) in &owners {
         let i = lookup[&id];
         let p = DVec3::from_array(source.candidate_points[i]);
@@ -490,14 +522,7 @@ pub fn assemble(
         let movement = p.distance(q);
         let reference = *mesh.nodes.get(&id).ok_or("missing reference node")?;
         // Cumulative movement from immutable input, including local axis budgets.
-        let mut budget = source.policy.maximum_movement;
-        for axis in &source.axes {
-            if axis.anchors.iter().any(|a| a.node == i) {
-                let a = mesh.nodes[&source.node_ids[axis.endpoints[0]]];
-                let b = mesh.nodes[&source.node_ids[axis.endpoints[1]]];
-                budget = budget.min(source.policy.relative_movement * a.distance(b));
-            }
-        }
+        let budget = movement_budget(mesh, source, i);
         if movement > policy.junction_movement_limit
             || q.distance(reference) > budget + policy.precision
         {
@@ -510,7 +535,27 @@ pub fn assemble(
             );
             continue;
         }
-        maximum_closure_movement = maximum_closure_movement.max(movement);
+        closed_points.insert(id, q);
+    }
+    let hole_recovery = holes::recover(
+        &mut closed_points,
+        &holes::Context {
+            mesh,
+            source,
+            policy,
+            regions: &regions,
+            rings: &rings,
+            owners: &owners,
+            representatives: &support_representatives,
+            supports: &closed_supports,
+        },
+    );
+    let mut vertices = BTreeMap::new();
+    let mut vertex_source_nodes = vec![];
+    let mut maximum_closure_movement = 0.0_f64;
+    for (&id, &q) in &closed_points {
+        maximum_closure_movement = maximum_closure_movement
+            .max(q.distance(DVec3::from_array(source.candidate_points[lookup[&id]])));
         vertices.insert(
             id,
             model
@@ -521,7 +566,7 @@ pub fn assemble(
     }
     let mut surface_source_patches = vec![];
     let mut surface_stiffness = vec![];
-    for (region, mut loops) in rings {
+    for (region, loops) in rings {
         let (patch, stiffness, ids) = &regions[region];
         let patch = *patch;
         if loops.iter().flatten().any(|n| !vertices.contains_key(n)) {
@@ -534,21 +579,7 @@ pub fn assemble(
             continue;
         }
         let plane = &closed_supports[support_representatives[patch]];
-        let area = |ring: &Vec<u32>| {
-            let uv: Vec<_> = ring
-                .iter()
-                .map(|n| plane.project(model.vertices[vertices[n]]))
-                .collect();
-            (0..uv.len())
-                .map(|i| {
-                    let a = uv[i];
-                    let b = uv[(i + 1) % uv.len()];
-                    (a[0] - uv[0][0]) * (b[1] - uv[0][1]) - (a[1] - uv[0][1]) * (b[0] - uv[0][0])
-                })
-                .sum::<f64>()
-                .abs()
-        };
-        loops.sort_by(|a, b| area(b).total_cmp(&area(a)));
+        let area = |ring: &Vec<u32>| ring_area(ring, plane, |n| model.vertices[vertices[&n]]);
         let degenerate_hole = loops
             .iter()
             .skip(1)
@@ -584,6 +615,7 @@ pub fn assemble(
         surface_source_patches,
         surface_stiffness,
         pinched_region_splits,
+        hole_recovery,
         issues,
         maximum_closure_movement,
         rejected_vertices,
@@ -773,6 +805,342 @@ mod tests {
         }
     }
 
+    fn annulus(triangle: bool) -> MeshData {
+        use crate::input::ElementData;
+        let (outer, inner) = if triangle {
+            (
+                vec![[-2., -2., 0.], [2., -2., 0.], [0., 2., 0.]],
+                vec![[-0.005, 0., 0.], [0.005, 0., 0.], [0., 0.5, 0.]],
+            )
+        } else {
+            (
+                vec![[-2., -2., 0.], [2., -2., 0.], [2., 2., 0.], [-2., 2., 0.]],
+                vec![
+                    [-0.005, -0.2, 0.],
+                    [0.005, -0.2, 0.],
+                    [0.005, 0.2, 0.],
+                    [-0.005, 0.2, 0.],
+                ],
+            )
+        };
+        let n = outer.len() as u32;
+        let mut mesh = MeshData::default();
+        for (i, p) in outer.into_iter().chain(inner).enumerate() {
+            mesh.nodes.insert(i as u32 + 1, DVec3::from_array(p));
+        }
+        for i in 0..n {
+            mesh.elements.push(ElementData {
+                id: i + 1,
+                elem_type: 44,
+                stiff_id: 9,
+                nodes: vec![i + 1, (i + 1) % n + 1, (i + 1) % n + n + 1, i + n + 1],
+            });
+        }
+        mesh
+    }
+
+    #[test]
+    fn holes_restore_across_shapes_scales_rotations_and_renumbering() {
+        for triangle in [true, false] {
+            for scale in [0.1, 1., 10.] {
+                for transformed in [false, true] {
+                    let base = annulus(triangle);
+                    let count = if triangle { 3 } else { 4 };
+                    let rotation = if transformed {
+                        glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.71)
+                    } else {
+                        glam::DQuat::IDENTITY
+                    };
+                    let shift = DVec3::new(17., -29., 51.);
+                    let number = |n| if transformed { 100 - n } else { n };
+                    let mut mesh = base.clone();
+                    mesh.nodes = base
+                        .nodes
+                        .iter()
+                        .map(|(&n, &p)| (number(n), rotation * (p * scale) + shift))
+                        .collect();
+                    for e in &mut mesh.elements {
+                        e.id = number(e.id);
+                        for n in &mut e.nodes {
+                            *n = number(*n);
+                        }
+                        e.nodes.reverse();
+                    }
+                    if transformed {
+                        mesh.elements.reverse();
+                    }
+                    let mut f = planar_frame(&mesh, rotation * DVec3::Z);
+                    for n in count + 1..=2 * count {
+                        let mut p = base.nodes[&n];
+                        p.x = 0.;
+                        let i = f.node_ids.iter().position(|&i| i == number(n)).unwrap();
+                        f.candidate_points[i] = (rotation * (p * scale) + shift).to_array();
+                    }
+                    let policy = Policy {
+                        closure_tolerance: 0.001 * scale,
+                        junction_movement_limit: 0.05 * scale,
+                        precision: 1e-7 * scale,
+                        minimum_edge: 0.001 * scale,
+                    };
+                    let result = assemble(&mesh, &f, &policy).unwrap();
+                    assert!(result.all_surface_patches_built, "{:?}", result.issues);
+                    assert_eq!(result.hole_recovery.len(), 1);
+                    assert_eq!(result.hole_recovery[0].outcome, HoleOutcome::Restored);
+                    assert_eq!(result.preview.surfaces.len(), 1);
+                    assert_eq!(result.preview.surfaces[0].contours.len(), 2);
+                    assert_eq!(result.surface_stiffness, vec![9]);
+                    assert_eq!(
+                        result.preview.surfaces[0].source_elements.len(),
+                        count as usize
+                    );
+                    for n in count + 1..=2 * count {
+                        let i = result
+                            .vertex_source_nodes
+                            .iter()
+                            .position(|&i| i == number(n))
+                            .unwrap();
+                        assert!(
+                            DVec3::from_array(result.preview.vertices[i])
+                                .distance(mesh.nodes[&number(n)])
+                                < policy.precision
+                        );
+                    }
+                    assert!(result.maximum_closure_movement <= policy.junction_movement_limit);
+                    // Re-running the assembly is deterministic and leaves input intact.
+                    let again = assemble(&mesh, &f, &policy).unwrap();
+                    assert_eq!(
+                        serde_json::to_string(&result).unwrap(),
+                        serde_json::to_string(&again).unwrap()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiple_holes_in_one_region_restore_together() {
+        use crate::input::ElementData;
+        let mut mesh = MeshData::default();
+        for y in 0..4 {
+            for x in 0..6 {
+                mesh.nodes.insert(
+                    1 + x + 6 * y,
+                    DVec3::new(x as f64 * 0.01, y as f64 * 0.01, 0.),
+                );
+            }
+        }
+        for y in 0..3 {
+            for x in 0..5 {
+                if y == 1 && (x == 1 || x == 3) {
+                    continue;
+                }
+                let a = 1 + x + 6 * y;
+                mesh.elements.push(ElementData {
+                    id: mesh.elements.len() as u32 + 1,
+                    elem_type: 44,
+                    stiff_id: 9,
+                    nodes: vec![a, a + 1, a + 7, a + 6],
+                });
+            }
+        }
+        let mut f = planar_frame(&mesh, DVec3::Z);
+        for (i, &n) in f.node_ids.iter().enumerate() {
+            let p = mesh.nodes[&n];
+            if (n >= 8 && n <= 11) || (n >= 14 && n <= 17) {
+                f.candidate_points[i][0] = if p.x < 0.025 { 0.015 } else { 0.035 };
+            }
+        }
+        let policy = Policy {
+            closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
+            precision: 1e-7,
+            minimum_edge: 0.001,
+        };
+        let result = assemble(&mesh, &f, &policy).unwrap();
+        assert!(result.all_surface_patches_built, "{:?}", result.issues);
+        assert_eq!(result.hole_recovery.len(), 1);
+        assert_eq!(result.hole_recovery[0].outcome, HoleOutcome::Restored);
+        assert_eq!(result.hole_recovery[0].constraints.len(), 2);
+        assert_eq!(result.preview.surfaces[0].contours.len(), 3);
+        assert_eq!(result.preview.surfaces[0].source_elements.len(), 13);
+    }
+
+    #[test]
+    fn blocked_axis_hole_does_not_prevent_independent_recovery() {
+        let mut mesh = annulus(true);
+        let second = annulus(false);
+        mesh.nodes.extend(
+            second
+                .nodes
+                .iter()
+                .map(|(&n, &p)| (n + 20, p + DVec3::X * 10.)),
+        );
+        mesh.elements
+            .extend(second.elements.into_iter().map(|mut e| {
+                e.id += 20;
+                for n in &mut e.nodes {
+                    *n += 20;
+                }
+                e
+            }));
+        let mut f = planar_frame(&mesh, DVec3::Z);
+        for (i, &n) in f.node_ids.iter().enumerate() {
+            if (4..=6).contains(&n) {
+                f.candidate_points[i][0] = 0.;
+            }
+            if (25..=28).contains(&n) {
+                f.candidate_points[i][0] = 10.;
+            }
+        }
+        let anchor = f.node_ids.iter().position(|&n| n == 4).unwrap();
+        let end = f.node_ids.iter().position(|&n| n == 1).unwrap();
+        f.axes.push(frame::Axis {
+            endpoints: [anchor, end],
+            anchors: vec![frame::Anchor {
+                node: anchor,
+                t: 0.,
+            }],
+            spans: vec![],
+        });
+        let policy = Policy {
+            closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
+            precision: 1e-7,
+            minimum_edge: 0.001,
+        };
+        let result = assemble(&mesh, &f, &policy).unwrap();
+        assert_eq!(result.hole_recovery.len(), 2);
+        let blocked = result
+            .hole_recovery
+            .iter()
+            .find(|r| r.source_elements.contains(&1))
+            .unwrap();
+        assert_eq!(blocked.outcome, HoleOutcome::AxisAnchorRequiresJointRepair);
+        assert!(blocked.changes.is_empty());
+        assert!(result
+            .hole_recovery
+            .iter()
+            .any(|r| r.outcome == HoleOutcome::Restored));
+        assert_eq!(result.preview.surfaces.len(), 1);
+        assert_eq!(
+            result.preview.surfaces[0].source_elements,
+            vec![21, 22, 23, 24]
+        );
+        let index = result
+            .vertex_source_nodes
+            .iter()
+            .position(|&n| n == 4)
+            .unwrap();
+        assert!(
+            DVec3::from_array(result.preview.vertices[index])
+                .distance(DVec3::from_array(f.candidate_points[anchor]))
+                < policy.precision
+        );
+    }
+
+    #[test]
+    fn common_support_line_is_reported_without_moving_any_vertex() {
+        let mesh = annulus(true);
+        let f = planar_frame(&mesh, DVec3::Z);
+        let policy = Policy {
+            closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
+            precision: 1e-7,
+            minimum_edge: 0.001,
+        };
+        let regions = vec![(0, 9, vec![1, 2, 3])];
+        let rings = BTreeMap::from([(0, vec![vec![1, 2, 3], vec![4, 5, 6]])]);
+        let supports = vec![
+            PlaneFrame::new([0.; 3], [0., 0., 1.]).unwrap(),
+            PlaneFrame::new([0.; 3], [1., 0., 0.]).unwrap(),
+        ];
+        let owners = (1..=6)
+            .map(|n| (n, if n >= 4 { vec![0, 1] } else { vec![0] }))
+            .collect();
+        let mut points: BTreeMap<_, _> = mesh
+            .nodes
+            .iter()
+            .map(|(&n, &p)| (n, if n >= 4 { DVec3::new(0., p.y, 0.) } else { p }))
+            .collect();
+        let before = points.clone();
+        let reports = holes::recover(
+            &mut points,
+            &holes::Context {
+                mesh: &mesh,
+                source: &f,
+                policy: &policy,
+                regions: &regions,
+                rings: &rings,
+                owners: &owners,
+                representatives: &[0, 1],
+                supports: &supports,
+            },
+        );
+        assert_eq!(points, before);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].outcome,
+            HoleOutcome::CommonSupportsForceLineOrPoint
+        );
+        assert_eq!(reports[0].constraints[0].normal_rank, 2);
+        assert_eq!(reports[0].constraints[0].common_supports, vec![0, 1]);
+    }
+
+    #[test]
+    fn hole_recovery_cannot_degenerate_a_neighbor_and_rolls_back_all_vertices() {
+        let mut mesh = annulus(true);
+        mesh.nodes.insert(9, DVec3::new(0.1, -0.2, 0.));
+        let f = planar_frame(&mesh, DVec3::Z);
+        let policy = Policy {
+            closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
+            precision: 1e-7,
+            minimum_edge: 0.001,
+        };
+        let regions = vec![(0, 9, vec![1, 2, 3]), (0, 9, vec![4])];
+        let rings = BTreeMap::from([
+            (0, vec![vec![1, 2, 3], vec![4, 5, 6]]),
+            (1, vec![vec![4, 1, 9]]),
+        ]);
+        let supports = vec![PlaneFrame::new([0.; 3], [0., 0., 1.]).unwrap()];
+        let owners = mesh.nodes.keys().map(|&n| (n, vec![0])).collect();
+        let mut points: BTreeMap<_, _> = mesh
+            .nodes
+            .iter()
+            .map(|(&n, &p)| {
+                (
+                    n,
+                    if (4..=6).contains(&n) {
+                        DVec3::new(0., p.y, 0.)
+                    } else {
+                        p
+                    },
+                )
+            })
+            .collect();
+        // Neighbor is valid now; restoring vertex 4 would coincide with its
+        // other vertex 9. A local hole-only validator would miss this.
+        points.insert(9, mesh.nodes[&4]);
+        let before = points.clone();
+        let reports = holes::recover(
+            &mut points,
+            &holes::Context {
+                mesh: &mesh,
+                source: &f,
+                policy: &policy,
+                regions: &regions,
+                rings: &rings,
+                owners: &owners,
+                representatives: &[0],
+                supports: &supports,
+            },
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].outcome, HoleOutcome::ContourConflict);
+        assert!(reports[0].changes.is_empty());
+        assert_eq!(points, before);
+    }
+
     #[test]
     fn collapsed_hole_is_reported_with_source_nodes_and_never_filled() {
         use crate::input::ElementData;
@@ -824,6 +1192,7 @@ mod tests {
         assert!(result.preview.edges.is_empty());
         assert_eq!(result.issues.len(), 1);
         assert_eq!(result.issues[0].reason, "degenerate_hole_after_closure");
+        assert_eq!(result.hole_recovery[0].outcome, HoleOutcome::MovementBudget);
         assert_eq!(result.issues[0].source_elements, vec![1, 2, 3]);
         assert!(result.issues[0].boundary_source_nodes.iter().any(|r| r
             .iter()
