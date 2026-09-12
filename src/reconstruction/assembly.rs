@@ -1,5 +1,6 @@
 //! Surface topology preview. Engineering closure tolerance is distinct from
 //! numerical planarity. Mechanical ties and mesh readiness are not inferred.
+pub mod bars;
 mod holes;
 use super::{frame, planes, Model, PlaneFrame};
 use crate::input::MeshData;
@@ -44,6 +45,7 @@ pub struct Report {
     pub surface_stiffness: Vec<u32>,
     pub pinched_region_splits: Vec<RegionSplit>,
     pub hole_recovery: Vec<HoleRecovery>,
+    pub axis_assembly: bars::Report,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -606,6 +608,17 @@ pub fn assemble(
             }),
         }
     }
+    let axis_assembly = bars::assemble(
+        mesh,
+        source,
+        &mut model,
+        &mut vertex_source_nodes,
+        &closed_supports,
+        &support_representatives,
+        policy,
+    );
+    maximum_closure_movement =
+        maximum_closure_movement.max(axis_assembly.maximum_additional_movement);
     Ok(Report {
         policy: policy.clone(),
         export_ready: false,
@@ -616,6 +629,7 @@ pub fn assemble(
         surface_stiffness,
         pinched_region_splits,
         hole_recovery,
+        axis_assembly,
         issues,
         maximum_closure_movement,
         rejected_vertices,
