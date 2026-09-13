@@ -194,16 +194,45 @@ fn rejects_incomplete_geometry_and_reports_quality_failure() {
 }
 
 #[test]
-fn nonorthogonal_fragment_reports_bad_quality_without_losing_topology() {
-    let mut input = fixture::source();
-    for p in input.nodes.values_mut() {
-        p.x += 0.2 * p.y;
+fn nonorthogonal_fragment_passes_quality_under_transforms() {
+    for scale in [0.1, 1., 10.] {
+        for rotated in [false, true] {
+            let mut input = fixture::source();
+            for p in input.nodes.values_mut() {
+                p.x += 0.2 * p.y;
+            }
+            let (_, mesh) = run_input(input, scale, rotated);
+            assert!(
+                mesh.topology_valid && mesh.quality_passed,
+                "scale={scale}, rotated={rotated}, angle={}, {:?}",
+                mesh.minimum_angle_degrees,
+                mesh.blockers
+            );
+            assert!(mesh.blockers.is_empty());
+            assert!(!mesh.export_ready);
+        }
     }
-    let (_, mesh) = run_input(input, 1., true);
+}
+
+#[test]
+fn cantilever_keeps_topology_but_cannot_bypass_quality_gate() {
+    let mut input = fixture::source();
+    input.elements.retain(|e| {
+        e.elem_type != 10
+            || !e.nodes.iter().all(|n| input.nodes[n].z == 0.)
+            || e.nodes.iter().all(|n| input.nodes[n].x <= 2.)
+    });
+    let (topology, mesh) = run_input(input, 1., true);
     assert!(mesh.topology_valid, "{:?}", mesh.blockers);
-    // Locked constraints may prevent quality refinement even in valid geometry.
-    // This must stay an explicit failure, never a mesh-ready success.
     assert!(!mesh.quality_passed);
     assert!(mesh.blockers.iter().any(|b| b == "minimum_angle_not_met"));
     assert!(!mesh.export_ready);
+    assert_eq!(topology.axis_assembly.axes.len(), 2);
+    assert_eq!(
+        mesh.bars
+            .iter()
+            .map(|b| b.stiffness)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([50, 70])
+    );
 }

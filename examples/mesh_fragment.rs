@@ -1,17 +1,33 @@
 //! Run FE input through reconstruction and constrained mesh generation.
 #[path = "support/mesh_fixture.rs"]
 mod fixture;
+use clap::Parser;
 use topo_reconstruct_rs::{
     parsers::LiraParser,
     reconstruction::{assembly, frame, mesh, planes, recognize},
 };
 
+#[derive(Parser)]
+struct Args {
+    input: Option<String>,
+    /// Shear the built-in fixture in plan; never modifies a supplied input file.
+    #[arg(long, default_value_t = 0.)]
+    fixture_shear: f64,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let source = if let Some(path) = std::env::args().nth(1) {
+    let args = Args::parse();
+    if !args.fixture_shear.is_finite() || (args.input.is_some() && args.fixture_shear != 0.) {
+        return Err("fixture shear must be finite and applies only to the built-in fixture".into());
+    }
+    let mut source = if let Some(path) = args.input {
         LiraParser::parse(path)?
     } else {
         fixture::source()
     };
+    for p in source.nodes.values_mut() {
+        p.x += args.fixture_shear * p.y;
+    }
     let axes = recognize::recognize(
         &source,
         &recognize::Policy {

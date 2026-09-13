@@ -8,6 +8,7 @@ use spade::{
     AngleLimit, ConstrainedDelaunayTriangulation, Point2, RefinementParameters, Triangulation,
 };
 use std::collections::{BTreeMap, BTreeSet};
+mod domain;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Policy {
@@ -67,13 +68,16 @@ fn subdivide(
     vertices: &mut Vec<[f64; 3]>,
     spacing: f64,
     limit: usize,
+    precision: f64,
 ) -> Result<Vec<(f64, usize)>, &'static str> {
     let mut out = vec![chain[0]];
     for pair in chain.windows(2) {
         let [(ta, a), (tb, b)] = [pair[0], pair[1]];
         let pa = point(&vertices[a]);
         let pb = point(&vertices[b]);
-        let count = (pa.distance(pb) / spacing).ceil().max(1.);
+        // A rigid transform must not turn an exact two-way split into three
+        // pieces merely because the computed length is a few ulps longer.
+        let count = ((pa.distance(pb) - precision) / spacing).ceil().max(1.);
         if !count.is_finite() || count > limit as f64 {
             return Err("constraint subdivision limit");
         }
@@ -139,6 +143,7 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             &mut vertices,
             policy.boundary_spacing,
             policy.maximum_added_vertices_per_surface,
+            eps,
         )?);
     }
     let mut owners = vec![BTreeSet::new(); model.edges.len()];
@@ -187,6 +192,7 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             &mut vertices,
             policy.boundary_spacing,
             policy.maximum_added_vertices_per_surface,
+            eps,
         )?);
     }
     // Shared boundary subdivisions also become bar nodes where incidence is known.
@@ -339,63 +345,22 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             }
             cdt.add_constraint(handles[&a], handles[&b]);
         }
-        let refined = cdt.refine(
-            RefinementParameters::new()
-                .keep_constraint_edges()
-                .with_max_allowed_area(policy.maximum_area)
-                .with_angle_limit(AngleLimit::from_deg(policy.minimum_angle_degrees))
-                .with_max_additional_vertices(policy.maximum_added_vertices_per_surface),
-        );
-        if !refined.refinement_complete {
+        let (faces, complete) = domain::refine(
+            &cdt,
+            &global,
+            &boundary,
+            &constraints,
+            &plane,
+            &mut vertices,
+            policy,
+        )?;
+        if !complete {
             blockers.push(format!("refinement_limit: surface={s}"));
-        }
-        for vertex in cdt.vertices() {
-            global.entry(vertex.fix().index()).or_insert_with(|| {
-                let p = vertex.position();
-                let n = vertices.len();
-                vertices.push(plane.lift([p.x, p.y]));
-                n
-            });
-        }
-        // Traverse the dual graph from the exterior. Only surface boundaries
-        // toggle membership; internal beam constraints do not create holes.
-        let mut dual = BTreeMap::<usize, Vec<(usize, bool)>>::new();
-        for edge in cdt.undirected_edges() {
-            let d = edge.as_directed();
-            let a = d.face().fix().index();
-            let b = d.rev().face().fix().index();
-            let is_boundary = boundary.contains(&key(
-                global[&d.from().fix().index()],
-                global[&d.to().fix().index()],
-            ));
-            dual.entry(a).or_default().push((b, is_boundary));
-            dual.entry(b).or_default().push((a, is_boundary));
-        }
-        let outer = cdt.outer_face().fix().index();
-        let mut inside = BTreeMap::from([(outer, false)]);
-        let mut pending = vec![outer];
-        while let Some(a) = pending.pop() {
-            for &(b, toggle) in dual.get(&a).into_iter().flatten() {
-                let value = inside[&a] ^ toggle;
-                if let Some(previous) = inside.get(&b) {
-                    if *previous != value {
-                        return Err("inconsistent mesh boundary graph");
-                    }
-                } else {
-                    inside.insert(b, value);
-                    pending.push(b);
-                }
-            }
         }
         let mut counts = BTreeMap::new();
         let mut area = 0.;
         let mut used = BTreeSet::new();
-        for face in cdt.inner_faces() {
-            let local = face.vertices();
-            if !inside.get(&face.fix().index()).copied().unwrap_or(false) {
-                continue;
-            }
-            let ids = local.map(|v| global[&v.fix().index()]);
+        for ids in faces {
             let p = ids.map(|n| point(&vertices[n]));
             let normal = (p[1] - p[0]).cross(p[2] - p[0]);
             let ar = normal.length() / 2.;
@@ -490,4 +455,21 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
         blockers,
         export_ready: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn subdivision_respects_numerical_precision_and_resource_limit() {
+        let eps = 1e-7;
+        for (excess, expected) in [(eps * 0.5, 3), (eps * 2., 4)] {
+            let mut vertices = vec![[0., 0., 0.], [1. + excess, 0., 0.]];
+            let chain = subdivide(&[(0., 0), (1., 1)], &mut vertices, 0.5, 10, eps).unwrap();
+            assert_eq!(chain.len(), expected);
+            assert_eq!(vertices[1], [1. + excess, 0., 0.]);
+        }
+        let mut vertices = vec![[0., 0., 0.], [1., 0., 0.]];
+        assert!(subdivide(&[(0., 0), (1., 1)], &mut vertices, 0.5, 1, eps).is_err());
+    }
 }
