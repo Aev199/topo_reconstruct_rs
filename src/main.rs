@@ -70,7 +70,7 @@ struct Args {
 fn run_v2_preview(input: &str, output: &str, iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
     use topo_reconstruct_rs::{
         parsers::LiraParser as V2LiraParser,
-        reconstruction::{assembly, frame, planes, recognize},
+        reconstruction::{assembly, frame, graph, planes, recognize},
     };
 
     if iterations == 0 {
@@ -118,6 +118,7 @@ fn run_v2_preview(input: &str, output: &str, iterations: usize) -> Result<(), Bo
         },
     )?;
     let report = serde_json::json!({
+        "constraint_graph": graph::Graph::from_frame(&result),
         "frame": result,
         "topology": topology,
         "axis_recognition": axes,

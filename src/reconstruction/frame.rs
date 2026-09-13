@@ -876,6 +876,9 @@ mod tests {
         let result = solve(&m, &a, &p, &policy()).unwrap();
         assert!(result.accepted);
         assert_eq!(result.plane_families, vec![vec![0, 1]]);
+        let graph = super::super::graph::Graph::from_frame(&result);
+        assert_eq!(graph.components.len(), 1);
+        assert_eq!(graph.components[0].planes, vec![0, 1]);
         assert_eq!(result.surfaces[0].stiffness_regions.len(), 1);
         assert_eq!(result.surfaces[1].stiffness_regions.len(), 1);
     }
@@ -883,6 +886,11 @@ mod tests {
     #[test]
     fn plane_and_axes_share_interior_anchor_after_regularization() {
         let r = run(&source(), &policy());
+        let graph = super::super::graph::Graph::from_frame(&r);
+        assert_eq!(graph.components.len(), 1);
+        assert_eq!(graph.components[0].axes.len(), 2);
+        assert_eq!(graph.components[0].planes.len(), 1);
+        assert_eq!(graph.components[0].vertices.len(), r.node_ids.len());
         assert!(r.accepted, "{}", r.candidate_max_residual);
         assert_eq!(r.axes.len(), 2);
         for a in &r.axes {
@@ -916,6 +924,7 @@ mod tests {
     #[test]
     fn rigid_transform_with_up_preserves_a_feasible_solution() {
         let mut m = source();
+        let original_graph = super::super::graph::Graph::from_frame(&run(&m, &policy()));
         let rotation = glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.6);
         for v in m.nodes.values_mut() {
             *v = rotation * (*v) + DVec3::new(20., 30., 40.);
@@ -925,5 +934,9 @@ mod tests {
         let r = run(&m, &p);
         assert!(r.accepted);
         assert!(r.maximum_movement < 0.15);
+        assert_eq!(
+            serde_json::to_value(original_graph).unwrap(),
+            serde_json::to_value(super::super::graph::Graph::from_frame(&r)).unwrap()
+        );
     }
 }

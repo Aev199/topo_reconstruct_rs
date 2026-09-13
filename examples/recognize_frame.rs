@@ -1,7 +1,7 @@
 //! Joint geometric proposal. Not a meshing-ready model.
 use topo_reconstruct_rs::{
     parsers::LiraParser,
-    reconstruction::{assembly, frame, planes, recognize},
+    reconstruction::{assembly, frame, graph, planes, recognize},
 };
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     serde_json::to_writer_pretty(
         std::io::stdout().lock(),
-        &serde_json::json!({"frame":result,"topology":topology,"axis_recognition":axes,"plane_recognition":planes}),
+        &serde_json::json!({"constraint_graph":graph::Graph::from_frame(&result),"frame":result,"topology":topology,"axis_recognition":axes,"plane_recognition":planes}),
     )?;
     Ok(())
 }
