@@ -21,6 +21,7 @@ hashbrown = { version = "0.15", features = ["rayon"] }
 
 # 2D вычислительная геометрия и булевы операции
 geo = "0.29"
+spade = "2.15.1"
 
 # Сериализация в JSON
 serde = { version = "1.0", features = ["derive"] }

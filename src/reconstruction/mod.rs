@@ -3,6 +3,7 @@ pub mod assembly;
 pub mod axes;
 pub mod frame;
 pub mod graph;
+pub mod mesh;
 pub mod planes;
 pub mod recognize;
 
