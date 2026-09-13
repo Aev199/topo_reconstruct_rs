@@ -13,7 +13,7 @@ use config::ReconstructionConfig;
 use exporters::{DxfExporter, JsonExporter};
 use parsers::LiraParser;
 use reconstructors::TopologyPipeline;
-use std::time::Instant;
+use std::{fs::File, time::Instant};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -57,6 +57,79 @@ struct Args {
     /// Путь для сохранения DXF файла
     #[arg(short, long, default_value = "building_topology.dxf")]
     dxf: String,
+
+    /// Экспериментальный v2: записать recognize/frame/assembly JSON и не запускать legacy pipeline
+    #[arg(long, value_name = "PATH")]
+    v2_preview_json: Option<String>,
+
+    /// Число итераций совместного v2 frame solver
+    #[arg(long, default_value_t = 1000)]
+    v2_iterations: usize,
+}
+
+fn run_v2_preview(input: &str, output: &str, iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
+    use topo_reconstruct_rs::{
+        parsers::LiraParser as V2LiraParser,
+        reconstruction::{assembly, frame, planes, recognize},
+    };
+
+    if iterations == 0 {
+        return Err("--v2-iterations must be positive".into());
+    }
+    let mesh = V2LiraParser::parse(input)?;
+    let axes = recognize::recognize(
+        &mesh,
+        &recognize::Policy {
+            angle: 0.02,
+            line_tolerance: 0.01,
+            numerical_precision: 1e-8,
+        },
+    )?;
+    let plane_report = planes::recognize(
+        &mesh,
+        &planes::Policy {
+            angle: 0.02,
+            distance: 0.01,
+            precision: 1e-8,
+        },
+    )?;
+    let result = frame::solve(
+        &mesh,
+        &axes,
+        &plane_report,
+        &frame::Policy {
+            up: [0., 0., 1.],
+            angle: 0.02,
+            maximum_movement: 0.15,
+            relative_movement: 0.05,
+            minimum_length: 0.03,
+            residual_tolerance: 1e-7,
+            iterations,
+        },
+    )?;
+    let topology = assembly::assemble(
+        &mesh,
+        &result,
+        &assembly::Policy {
+            closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
+            precision: 1e-7,
+            minimum_edge: 0.001,
+        },
+    )?;
+    let report = serde_json::json!({
+        "frame": result,
+        "topology": topology,
+        "axis_recognition": axes,
+        "plane_recognition": plane_report,
+    });
+    if output == "-" {
+        serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+        println!();
+    } else {
+        serde_json::to_writer_pretty(File::create(output)?, &report)?;
+    }
+    Ok(())
 }
 
 fn main() {
@@ -75,6 +148,16 @@ fn main() {
             std::process::exit(2);
         }
     }
+
+    if let Some(path) = &args.v2_preview_json {
+        if let Err(error) = run_v2_preview(&args.input, path, args.v2_iterations) {
+            eprintln!("[V2 PREVIEW ERROR] {error}");
+            std::process::exit(1);
+        }
+        eprintln!("[V2 PREVIEW] JSON сохранен: {path}");
+        return;
+    }
+
     config.weld_tol = args.weld_tol;
     config.tol_dist = args.plane_tol;
     config.simplify_tol = args.simplify_tol;
@@ -87,7 +170,6 @@ fn main() {
 
     let total_start = Instant::now();
 
-    // 1. Чтение и парсинг
     println!("\n1. Чтение и параллельный парсинг расчетной схемы...");
     let parse_start = Instant::now();
     let mesh_data = match LiraParser::parse(&args.input) {
@@ -106,7 +188,6 @@ fn main() {
         }
     };
 
-    // 2. Реконструкция топологии
     println!("\n2. Параллельная реконструкция макроэлементов (Rayon)...");
     let recon_start = Instant::now();
     let pipeline = TopologyPipeline::new(&mesh_data, &config);
@@ -131,7 +212,6 @@ fn main() {
         eprintln!("   [DIAGNOSTIC] {}", message);
     }
 
-    // 3. Экспорт
     println!("\n3. Экспорт результатов...");
     let exp_start = Instant::now();
     if let Err(e) = JsonExporter::export(&report, &args.json) {
