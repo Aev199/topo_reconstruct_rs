@@ -384,6 +384,9 @@ pub fn assemble(
     source: &frame::Report,
     policy: &Policy,
 ) -> Result<Report, &'static str> {
+    if source.sliding_parameters.is_some() {
+        return Err("sliding frame is proposal-only until parameter transfer is implemented");
+    }
     if !policy.closure_tolerance.is_finite()
         || policy.closure_tolerance < policy.precision
         || !policy.junction_movement_limit.is_finite()

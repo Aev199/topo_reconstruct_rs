@@ -5,6 +5,7 @@ use crate::input::MeshData;
 use glam::DVec3;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+mod sliding;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Policy {
@@ -75,6 +76,10 @@ pub struct AxisFailure {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
+    /// Experimental nonlinear solve; original Axis::anchors and spans stay immutable.
+    pub sliding_parameters: Option<Vec<Vec<f64>>>,
+    pub nonlinear_steps: usize,
+    pub candidate_parameters_valid: bool,
     pub policy: Policy,
     pub accepted: bool,
     pub candidate_constraints_satisfied: bool,
@@ -204,11 +209,144 @@ fn support_families(mesh: &MeshData, report: &planes::Report) -> Vec<Vec<usize>>
     families
 }
 
+fn project(equations: &[Equation], x: &mut Vec<f64>, limit: usize, tolerance: f64) -> (f64, usize) {
+    // LSQR operates on A and A^T directly; avoid normal equations A A^T
+    // whose conditioning is squared for nearly dependent plane constraints.
+    let norm = |v: &[f64]| v.iter().fold(0.0_f64, |a, b| a.hypot(*b));
+    let scales: Vec<_> = equations
+        .iter()
+        .map(|e| e.terms.iter().map(|(_, a)| a * a).sum::<f64>().sqrt())
+        .collect();
+    let multiply = |v: &[f64]| -> Vec<f64> {
+        equations
+            .iter()
+            .zip(&scales)
+            .map(|(e, s)| e.value(v) / s)
+            .collect()
+    };
+    let transpose = |v: &[f64]| -> Vec<f64> {
+        let mut result = vec![0.0; x.len()];
+        for ((e, s), v) in equations.iter().zip(&scales).zip(v) {
+            for &(i, a) in &e.terms {
+                result[i] += a * v / s;
+            }
+        }
+        result
+    };
+    let mut u: Vec<_> = equations
+        .iter()
+        .zip(&scales)
+        .map(|(e, s)| -e.residual(&x) / s)
+        .collect();
+    let mut beta = norm(&u);
+    if beta > 0. {
+        for v in &mut u {
+            *v /= beta;
+        }
+    }
+    let mut v = transpose(&u);
+    let mut alpha = norm(&v);
+    if alpha > 0. {
+        for p in &mut v {
+            *p /= alpha;
+        }
+    }
+    let mut w = v.clone();
+    let mut rho_bar = alpha;
+    let mut phi_bar = beta;
+    let mut correction = vec![0.0; x.len()];
+    let original = x.clone();
+    let mut residual = equations
+        .iter()
+        .map(|e| e.residual(&x).abs())
+        .fold(0.0_f64, f64::max);
+    let mut iterations = 0;
+    for step in 0..limit {
+        if residual <= tolerance {
+            break;
+        }
+        let av = multiply(&v);
+        for (u, av) in u.iter_mut().zip(av) {
+            *u = av - alpha * (*u);
+        }
+        beta = norm(&u);
+        if beta > 0. {
+            for p in &mut u {
+                *p /= beta;
+            }
+        }
+        let atu = transpose(&u);
+        for (v, atu) in v.iter_mut().zip(atu) {
+            *v = atu - beta * (*v);
+        }
+        alpha = norm(&v);
+        if alpha > 0. {
+            for p in &mut v {
+                *p /= alpha;
+            }
+        }
+        let rho = rho_bar.hypot(beta);
+        if !rho.is_finite() || rho <= 1e-30 {
+            break;
+        }
+        let c = rho_bar / rho;
+        let s = beta / rho;
+        let theta = s * alpha;
+        rho_bar = -c * alpha;
+        let phi = c * phi_bar;
+        phi_bar *= s;
+        for ((dx, w), v) in correction.iter_mut().zip(&mut w).zip(&v) {
+            *dx += (phi / rho) * (*w);
+            *w = *v - (theta / rho) * (*w);
+        }
+        // No mutation of x until closure borrows end; assess true residual.
+        let candidate: Vec<_> = original
+            .iter()
+            .zip(&correction)
+            .map(|(a, b)| a + b)
+            .collect();
+        residual = equations
+            .iter()
+            .map(|e| e.residual(&candidate).abs())
+            .fold(0.0_f64, f64::max);
+        iterations = step + 1;
+    }
+    for ((x, o), d) in x.iter_mut().zip(original).zip(correction) {
+        *x = o + d;
+    }
+    (residual, iterations)
+}
+
 pub fn solve(
     mesh: &MeshData,
     axes: &recognize::Report,
     planes: &planes::Report,
     policy: &Policy,
+) -> Result<Report, &'static str> {
+    solve_impl(mesh, axes, planes, policy, 0)
+}
+
+/// Joint line/point/plane proposal with free interior line parameters.
+/// No topology repair or automatic acceptance into the assembly pipeline.
+pub fn solve_sliding(
+    mesh: &MeshData,
+    axes: &recognize::Report,
+    planes: &planes::Report,
+    policy: &Policy,
+    maximum_steps: usize,
+) -> Result<Report, &'static str> {
+    if maximum_steps == 0 {
+        return Err("nonlinear step limit must be positive");
+    }
+    solve_impl(mesh, axes, planes, policy, maximum_steps)
+}
+
+fn solve_impl(
+    mesh: &MeshData,
+    axes: &recognize::Report,
+    planes: &planes::Report,
+    policy: &Policy,
+    maximum_steps: usize,
 ) -> Result<Report, &'static str> {
     let up = DVec3::from_array(policy.up);
     if !up.is_finite()
@@ -404,114 +542,38 @@ pub fn solve(
         });
     }
     equations.retain(|e| !e.terms.is_empty());
-    // LSQR operates on A and A^T directly; avoid normal equations A A^T
-    // whose conditioning is squared for nearly dependent plane constraints.
-    let norm = |v: &[f64]| v.iter().fold(0.0_f64, |a, b| a.hypot(*b));
-    let scales: Vec<_> = equations
-        .iter()
-        .map(|e| e.terms.iter().map(|(_, a)| a * a).sum::<f64>().sqrt())
-        .collect();
-    let multiply = |v: &[f64]| -> Vec<f64> {
-        equations
-            .iter()
-            .zip(&scales)
-            .map(|(e, s)| e.value(v) / s)
-            .collect()
+    let (residual, iterations, nonlinear_steps, sliding_parameters) = if maximum_steps == 0 {
+        let (residual, iterations) = project(
+            &equations,
+            &mut x,
+            policy.iterations,
+            policy.residual_tolerance,
+        );
+        (residual, iterations, 0, None)
+    } else {
+        sliding::solve(
+            &mut equations,
+            &mut x,
+            &new_axes,
+            &reference,
+            &map,
+            policy,
+            maximum_steps,
+        )
     };
-    let transpose = |v: &[f64]| -> Vec<f64> {
-        let mut result = vec![0.0; x.len()];
-        for ((e, s), v) in equations.iter().zip(&scales).zip(v) {
-            for &(i, a) in &e.terms {
-                result[i] += a * v / s;
-            }
-        }
-        result
-    };
-    let mut u: Vec<_> = equations
-        .iter()
-        .zip(&scales)
-        .map(|(e, s)| -e.residual(&x) / s)
-        .collect();
-    let mut beta = norm(&u);
-    if beta > 0. {
-        for v in &mut u {
-            *v /= beta;
-        }
-    }
-    let mut v = transpose(&u);
-    let mut alpha = norm(&v);
-    if alpha > 0. {
-        for p in &mut v {
-            *p /= alpha;
-        }
-    }
-    let mut w = v.clone();
-    let mut rho_bar = alpha;
-    let mut phi_bar = beta;
-    let mut correction = vec![0.0; x.len()];
-    let original = x.clone();
-    let mut residual = equations
-        .iter()
-        .map(|e| e.residual(&x).abs())
-        .fold(0.0_f64, f64::max);
-    let mut iterations = 0;
-    for step in 0..policy.iterations {
-        if residual <= policy.residual_tolerance {
-            break;
-        }
-        let av = multiply(&v);
-        for (u, av) in u.iter_mut().zip(av) {
-            *u = av - alpha * (*u);
-        }
-        beta = norm(&u);
-        if beta > 0. {
-            for p in &mut u {
-                *p /= beta;
-            }
-        }
-        let atu = transpose(&u);
-        for (v, atu) in v.iter_mut().zip(atu) {
-            *v = atu - beta * (*v);
-        }
-        alpha = norm(&v);
-        if alpha > 0. {
-            for p in &mut v {
-                *p /= alpha;
-            }
-        }
-        let rho = rho_bar.hypot(beta);
-        if !rho.is_finite() || rho <= 1e-30 {
-            break;
-        }
-        let c = rho_bar / rho;
-        let s = beta / rho;
-        let theta = s * alpha;
-        rho_bar = -c * alpha;
-        let phi = c * phi_bar;
-        phi_bar *= s;
-        for ((dx, w), v) in correction.iter_mut().zip(&mut w).zip(&v) {
-            *dx += (phi / rho) * (*w);
-            *w = *v - (theta / rho) * (*w);
-        }
-        // No mutation of x until closure borrows end; assess true residual.
-        let candidate: Vec<_> = original
-            .iter()
-            .zip(&correction)
-            .map(|(a, b)| a + b)
-            .collect();
-        residual = equations
-            .iter()
-            .map(|e| e.residual(&candidate).abs())
-            .fold(0.0_f64, f64::max);
-        iterations = step + 1;
-    }
-    for ((x, o), d) in x.iter_mut().zip(original).zip(correction) {
-        *x = o + d;
-    }
     let candidate: Vec<_> = (0..reference.len())
         .map(|i| center + DVec3::new(x[i * 3], x[i * 3 + 1], x[i * 3 + 2]))
         .collect();
-    let valid = candidate.iter().all(|p| p.is_finite())
+    let valid_parameters = sliding_parameters.as_ref().is_none_or(|parameters| {
+        parameters.iter().zip(&new_axes).all(|(ts, axis)| {
+            let mut ordered: Vec<_> = axis.anchors.iter().zip(ts).collect();
+            ordered.sort_by(|(a, _), (b, _)| a.t.total_cmp(&b.t));
+            ts.iter().all(|t| t.is_finite() && *t >= 0.0 && *t <= 1.0)
+                && ordered.windows(2).all(|w| w[0].1 < w[1].1)
+        })
+    });
+    let valid = valid_parameters
+        && candidate.iter().all(|p| p.is_finite())
         && new_axes.iter().all(|a| {
             let [i, j] = a.endpoints;
             let d = candidate[j] - candidate[i];
@@ -520,6 +582,9 @@ pub fn solve(
                     .minimum_length
                     .min(reference[j].distance(reference[i]))
                 && d.dot(reference[j] - reference[i]) > 0.0
+                && (sliding_parameters.is_none()
+                    || d.normalize().dot((reference[j] - reference[i]).normalize())
+                        >= policy.angle.cos())
         });
     let within_budget = candidate
         .iter()
@@ -582,16 +647,21 @@ pub fn solve(
             let old = reference[j] - reference[i];
             let new = candidate[j] - candidate[i];
             (new.length() + policy.residual_tolerance < policy.minimum_length.min(old.length())
-                || new.dot(old) <= 0.0)
-                .then_some(AxisFailure {
-                    axis,
-                    original_length: old.length(),
-                    candidate_length: new.length(),
-                    source_elements: a.spans.iter().map(|s| s.element).collect(),
-                })
+                || new.dot(old) <= 0.0
+                || (sliding_parameters.is_some()
+                    && new.normalize().dot(old.normalize()) < policy.angle.cos()))
+            .then_some(AxisFailure {
+                axis,
+                original_length: old.length(),
+                candidate_length: new.length(),
+                source_elements: a.spans.iter().map(|s| s.element).collect(),
+            })
         })
         .collect();
     Ok(Report {
+        sliding_parameters,
+        nonlinear_steps,
+        candidate_parameters_valid: valid_parameters,
         policy: policy.clone(),
         accepted,
         candidate_constraints_satisfied: residual <= policy.residual_tolerance,
@@ -601,6 +671,8 @@ pub fn solve(
         axis_failures,
         reason: if accepted {
             "converged"
+        } else if !valid_parameters {
+            "invalid_anchor_order"
         } else if !within_budget {
             "movement_budget_exceeded"
         } else if !valid {
@@ -694,6 +766,138 @@ mod tests {
                 },
             ],
         }
+    }
+    fn run_sliding(m: &MeshData, p: &Policy, scale: f64) -> Report {
+        let axes = recognize::recognize(
+            m,
+            &recognize::Policy {
+                angle: 0.02,
+                line_tolerance: 0.01 * scale,
+                numerical_precision: 1e-8 * scale,
+            },
+        )
+        .unwrap();
+        let planes = planes::recognize(
+            m,
+            &planes::Policy {
+                angle: 0.02,
+                distance: 0.01 * scale,
+                precision: 1e-8 * scale,
+            },
+        )
+        .unwrap();
+        solve_sliding(m, &axes, &planes, p, 12).unwrap()
+    }
+
+    #[test]
+    fn joint_slides_along_whole_beam_under_scale_rotation_and_renumbering() {
+        let baseline = run_sliding(&source(), &policy(), 1.);
+        for scale in [0.1, 1., 10.] {
+            for transformed in [false, true] {
+                let mut m = source();
+                let rotation = if transformed {
+                    glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.6)
+                } else {
+                    glam::DQuat::IDENTITY
+                };
+                let shift = if transformed {
+                    DVec3::new(20., 30., 40.)
+                } else {
+                    DVec3::ZERO
+                };
+                let id = |n: u32| if transformed { 100 - n } else { n };
+                m.nodes = m
+                    .nodes
+                    .into_iter()
+                    .map(|(n, v)| (id(n), rotation * (v * scale) + shift))
+                    .collect();
+                for e in &mut m.elements {
+                    for n in &mut e.nodes {
+                        *n = id(*n);
+                    }
+                }
+                if transformed {
+                    m.elements.reverse();
+                }
+                let mut p = policy();
+                p.up = (rotation * DVec3::Z).to_array();
+                p.maximum_movement *= scale;
+                p.minimum_length *= scale;
+                p.residual_tolerance *= scale;
+                let r = run_sliding(&m, &p, scale);
+                assert!(r.accepted, "{}: {}", r.reason, r.candidate_max_residual);
+                for (&n, point) in baseline.node_ids.iter().zip(&baseline.points) {
+                    let i = r.node_ids.iter().position(|&v| v == id(n)).unwrap();
+                    let expected = rotation * (DVec3::from_array(*point) * scale) + shift;
+                    assert!(DVec3::from_array(r.points[i]).distance(expected) < 1e-6 * scale);
+                }
+                let ts = r.sliding_parameters.as_ref().unwrap();
+                assert!(r.axes.iter().zip(ts).any(|(a, t)| a
+                    .anchors
+                    .iter()
+                    .zip(t)
+                    .any(|(c, t)| (c.t - t).abs() > 1e-5)));
+                for (axis, ts) in r.axes.iter().zip(ts) {
+                    let [a, b] = axis.endpoints.map(|i| DVec3::from_array(r.points[i]));
+                    for (anchor, t) in axis.anchors.iter().zip(ts) {
+                        assert!(
+                            DVec3::from_array(r.points[anchor.node]).distance(a + t * (b - a))
+                                < 3. * p.residual_tolerance
+                        );
+                    }
+                }
+                for surface in &r.surfaces {
+                    for &n in &surface.nodes {
+                        assert!(
+                            surface.plane.distance(r.points[n]).abs() < 3. * p.residual_tolerance
+                        );
+                    }
+                }
+                let spans: BTreeMap<_, _> = r
+                    .axes
+                    .iter()
+                    .flat_map(|a| a.spans.iter().map(|s| (s.element, s.stiffness)))
+                    .collect();
+                assert_eq!(spans, BTreeMap::from([(1, 1), (2, 2), (3, 3)]));
+                let beam = r.axes.iter().find(|a| a.spans.len() == 2).unwrap();
+                assert_eq!(beam.spans[0].end_t, beam.spans[1].start_t);
+            }
+        }
+    }
+
+    #[test]
+    fn sliding_failure_keeps_reference_geometry_and_short_features() {
+        let mut p = policy();
+        p.maximum_movement = 1e-6;
+        let r = run_sliding(&source(), &p, 1.);
+        assert!(!r.accepted);
+        assert_eq!(r.points, r.reference_points);
+        assert!(!r.movement_failures.is_empty());
+        let r = run_sliding(&short_feature(true), &policy(), 1.);
+        assert!(!r.accepted);
+        assert_eq!(r.points, r.reference_points);
+        assert_eq!(r.axes[0].spans[0].element, 10);
+    }
+
+    #[test]
+    fn sliding_proposal_cannot_enter_assembly_with_old_property_parameters() {
+        let mesh = source();
+        let r = run_sliding(&mesh, &policy(), 1.);
+        assert!(r.accepted);
+        let result = super::super::assembly::assemble(
+            &mesh,
+            &r,
+            &super::super::assembly::Policy {
+                closure_tolerance: 0.001,
+                junction_movement_limit: 0.05,
+                precision: 1e-7,
+                minimum_edge: 0.001,
+            },
+        );
+        assert!(matches!(
+            result,
+            Err("sliding frame is proposal-only until parameter transfer is implemented")
+        ));
     }
     fn policy() -> Policy {
         Policy {
