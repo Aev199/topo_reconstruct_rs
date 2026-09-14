@@ -287,12 +287,16 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
         );
         let mut constraints = BTreeSet::new();
         let mut boundary = BTreeSet::new();
+        let mut barriers = BTreeSet::new();
+        let mut has_open_internal_constraint = false;
         let mut nodes = BTreeSet::new();
         for edge in surface.boundaries.iter().flatten() {
             for pair in edge_nodes[edge.edge].windows(2) {
                 boundary.insert(key(pair[0].1, pair[1].1));
             }
         }
+        barriers.extend(&boundary);
+        let boundary_nodes: BTreeSet<_> = boundary.iter().flatten().copied().collect();
         constraints.extend(&boundary);
         for c in contacts {
             match *c {
@@ -318,10 +322,32 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
                     {
                         return Err("contact endpoint requires explicit intersection vertex");
                     }
+                    let mut interval_edges = Vec::new();
                     for pair in chain.windows(2) {
                         if pair[0].0 >= start_t - tolerance && pair[1].0 <= end_t + tolerance {
-                            constraints.insert(key(pair[0].1, pair[1].1));
+                            let edge = key(pair[0].1, pair[1].1);
+                            constraints.insert(edge);
+                            interval_edges.push(edge);
                         }
+                    }
+                    // A complete boundary-to-boundary construction line is a
+                    // legitimate domain divider. An open line is not: keeping
+                    // it inside one material domain lets refinement form a
+                    // quality fan at its free endpoint.
+                    let start_node = chain
+                        .iter()
+                        .find(|(t, _)| (*t - start_t).abs() <= tolerance)
+                        .map(|(_, n)| *n);
+                    let end_node = chain
+                        .iter()
+                        .find(|(t, _)| (*t - end_t).abs() <= tolerance)
+                        .map(|(_, n)| *n);
+                    if start_node.is_some_and(|n| boundary_nodes.contains(&n))
+                        && end_node.is_some_and(|n| boundary_nodes.contains(&n))
+                    {
+                        barriers.extend(interval_edges);
+                    } else {
+                        has_open_internal_constraint = true;
                     }
                 }
                 _ => {}
@@ -350,17 +376,72 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             }
             cdt.add_constraint(handles[&a], handles[&b]);
         }
-        let (faces, complete) = domain::refine(
+        let (mut faces, complete) = domain::refine(
             &cdt,
             &global,
             &boundary,
+            &barriers,
             &constraints,
+            has_open_internal_constraint,
             &plane,
             &mut vertices,
             policy,
         )?;
         if !complete {
             blockers.push(format!("refinement_limit: surface={s}"));
+        }
+        // Refinement may split a constrained bar edge by inserting Steiner
+        // vertices. Promote those vertices to parametric axis anchors before
+        // emitting bars, and canonicalize equal generated points across
+        // adjacent surfaces. Otherwise the surface mesh and the bar mesh
+        // would describe different subdivisions of the same construction.
+        let face_nodes: BTreeSet<_> = faces.iter().flatten().copied().collect();
+        let mut remap = BTreeMap::new();
+        for c in contacts {
+            let Contact::Interval {
+                axis,
+                surface,
+                start_t,
+                end_t,
+                ..
+            } = *c else {
+                continue;
+            };
+            if surface != s {
+                continue;
+            }
+            let [a, b] = axes[axis].endpoints;
+            let length = point(&vertices[a]).distance(point(&vertices[b]));
+            let tolerance = eps / length;
+            for node in face_nodes.iter().copied() {
+                let Some(t) = parameter(point(&vertices[node]), point(&vertices[a]), point(&vertices[b]), eps) else {
+                    continue;
+                };
+                if t < start_t - tolerance || t > end_t + tolerance {
+                    continue;
+                }
+                let canonical = axis_nodes[axis]
+                    .iter()
+                    .find(|(u, _)| (t - *u).abs() <= tolerance)
+                    .map(|(_, n)| *n)
+                    .unwrap_or_else(|| {
+                        axis_nodes[axis].push((t, node));
+                        node
+                    });
+                if canonical != node {
+                    remap.insert(node, canonical);
+                }
+            }
+        }
+        for triangle in &mut faces {
+            for node in triangle {
+                if let Some(&canonical) = remap.get(node) {
+                    *node = canonical;
+                }
+            }
+        }
+        for chain in &mut axis_nodes {
+            sorted(chain, &vertices, eps)?;
         }
         let mut counts = BTreeMap::new();
         let mut area = 0.;

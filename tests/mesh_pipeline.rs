@@ -217,7 +217,7 @@ fn nonorthogonal_fragment_passes_quality_under_transforms() {
 }
 
 #[test]
-fn cantilever_keeps_topology_but_cannot_bypass_quality_gate() {
+fn cantilever_keeps_topology_and_refines_around_open_constraint() {
     let mut input = fixture::source();
     input.elements.retain(|e| {
         e.elem_type != 10
@@ -226,8 +226,8 @@ fn cantilever_keeps_topology_but_cannot_bypass_quality_gate() {
     });
     let (topology, mesh) = run_input(input, 1., true);
     assert!(mesh.topology_valid, "{:?}", mesh.blockers);
-    assert!(!mesh.quality_passed);
-    assert!(mesh.blockers.iter().any(|b| b == "minimum_angle_not_met"));
+    assert!(mesh.quality_passed, "{:?}", mesh.blockers);
+    assert!(mesh.maximum_edge_ratio.is_finite() && mesh.maximum_edge_ratio >= 1.0);
     assert!(!mesh.export_ready);
     assert_eq!(topology.axis_assembly.axes.len(), 2);
     assert_eq!(
@@ -237,4 +237,24 @@ fn cantilever_keeps_topology_but_cannot_bypass_quality_gate() {
             .collect::<BTreeSet<_>>(),
         BTreeSet::from([50, 70])
     );
+    let mut triangle_edges = BTreeMap::<[usize; 2], usize>::new();
+    for triangle in &mesh.triangles {
+        for i in 0..3 {
+            let edge = [triangle.vertices[i], triangle.vertices[(i + 1) % 3]];
+            let edge = [edge[0].min(edge[1]), edge[0].max(edge[1])];
+            *triangle_edges.entry(edge).or_default() += 1;
+        }
+    }
+    // The free endpoint is internal to the slab, but the beam remains a
+    // conforming two-sided constraint rather than a disconnected overlay.
+    for bar in &mesh.bars {
+        if bar.axis != 0 {
+            continue;
+        }
+        let edge = [
+            bar.vertices[0].min(bar.vertices[1]),
+            bar.vertices[0].max(bar.vertices[1]),
+        ];
+        assert_eq!(triangle_edges.get(&edge), Some(&2));
+    }
 }

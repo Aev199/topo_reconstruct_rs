@@ -45,7 +45,9 @@ pub(super) fn refine(
     cdt: &Cdt,
     global: &BTreeMap<usize, usize>,
     boundary: &BTreeSet<[usize; 2]>,
+    barriers: &BTreeSet<[usize; 2]>,
     constraints: &BTreeSet<[usize; 2]>,
+    refine_outer_faces: bool,
     plane: &super::super::PlaneFrame,
     vertices: &mut Vec<[f64; 3]>,
     policy: &Policy,
@@ -53,10 +55,18 @@ pub(super) fn refine(
     let mut remaining = interior(cdt, global, boundary)?;
     let mut neighbors = BTreeMap::<usize, Vec<usize>>::new();
     for edge in cdt.undirected_edges() {
-        if edge.is_constraint_edge() {
+        // Only material boundaries split the refinement domain. Internal
+        // construction lines (for example, a beam ending inside a slab) are
+        // still constrained edges, but they must remain in one 2D domain so
+        // the refinement can build a quality fan around their endpoint.
+        let d = edge.as_directed();
+        let global_edge = key(
+            global[&d.from().fix().index()],
+            global[&d.to().fix().index()],
+        );
+        if barriers.contains(&global_edge) {
             continue;
         }
-        let d = edge.as_directed();
         let a = d.face().fix().index();
         let b = d.rev().face().fix().index();
         if remaining.contains(&a) && remaining.contains(&b) {
@@ -118,18 +128,19 @@ pub(super) fn refine(
             region.add_constraint(handles[&edge[0]], handles[&edge[1]]);
         }
         let before = region.num_vertices();
-        let refined = region.refine(
-            RefinementParameters::new()
-                .keep_constraint_edges()
-                .exclude_outer_faces(true)
-                .with_max_allowed_area(policy.maximum_area)
-                .with_angle_limit(AngleLimit::from_deg(policy.minimum_angle_degrees))
-                .with_max_additional_vertices(
-                    policy
-                        .maximum_added_vertices_per_surface
-                        .saturating_sub(added),
-                ),
-        );
+        let mut parameters = RefinementParameters::new()
+            .keep_constraint_edges()
+            .with_max_allowed_area(policy.maximum_area)
+            .with_angle_limit(AngleLimit::from_deg(policy.minimum_angle_degrees))
+            .with_max_additional_vertices(
+                policy
+                    .maximum_added_vertices_per_surface
+                    .saturating_sub(added),
+            );
+        if !refine_outer_faces {
+            parameters = parameters.exclude_outer_faces(true);
+        }
+        let refined = region.refine(parameters);
         added += region.num_vertices() - before;
         complete &= refined.refinement_complete;
         for vertex in region.vertices() {
