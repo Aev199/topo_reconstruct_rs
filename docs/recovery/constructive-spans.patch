@@ -1,0 +1,112 @@
+diff --git a/src/reconstruction/frame.rs b/src/reconstruction/frame.rs
+--- a/src/reconstruction/frame.rs
++++ b/src/reconstruction/frame.rs
+@@ -8,2 +8,3 @@
+ mod sliding;
++mod segments;
+ 
+@@ -26,2 +27,4 @@
+ pub struct Axis {
++    /// Geometric segment of a chain; shared endpoints do not imply releases.
++    pub constructive_segment: bool,
+     pub endpoints: [usize; 2],
+@@ -404,3 +407,4 @@
+     let mut new_axes = vec![];
+-    for (axis_index, a) in axes.axes.iter().enumerate() {
++    let segments = segments::split(mesh, axes, planes);
++    for (axis_index, (a, constructive_segment)) in segments.iter().enumerate() {
+         if a.endpoint_nodes.iter().any(|n| !map.contains_key(n))
+@@ -457,3 +461,3 @@
+         }
+-        let directions = if length < policy.minimum_length {
++        let directions = if *constructive_segment || length < policy.minimum_length {
+             vec![]
+@@ -475,2 +479,3 @@
+         new_axes.push(Axis {
++            constructive_segment: *constructive_segment,
+             endpoints: ends,
+diff --git a/src/reconstruction/assembly/bars.rs b/src/reconstruction/assembly/bars.rs
+--- a/src/reconstruction/assembly/bars.rs
++++ b/src/reconstruction/assembly/bars.rs
+@@ -214,2 +214,4 @@
+         reference.normalize()
++    } else if axis.constructive_segment {
++        raw.normalize()
+     } else if cosine >= source.policy.angle.cos() {
+@@ -292,2 +294,7 @@
+             for plane in &owned {
++                // Avoid dividing a satisfied coplanar residual by a tiny slope.
++                if plane.distance((origin + direction * t).to_array()).abs()
++                    <= policy.precision {
++                    continue;
++                }
+                 let slope = DVec3::from_array(plane.normal).dot(direction);
+diff --git a/src/reconstruction/assembly.rs b/src/reconstruction/assembly.rs
+--- a/src/reconstruction/assembly.rs
++++ b/src/reconstruction/assembly.rs
+@@ -1014,2 +1014,3 @@
+         f.axes.push(frame::Axis {
++            constructive_segment: false,
+             endpoints: [anchor, end],
+diff --git a/src/reconstruction/frame/segments.rs b/src/reconstruction/frame/segments.rs
+new file mode 100644
+--- /dev/null
++++ b/src/reconstruction/frame/segments.rs
+@@ -0,0 +1,57 @@
++//! Constructive spans, independent of source FE subdivision and property changes.
++use super::*;
++
++pub(super) fn split(
++    mesh: &MeshData,
++    report: &recognize::Report,
++    planes: &planes::Report,
++) -> Vec<(recognize::RecognizedAxis, bool)> {
++    let mut incidence = BTreeMap::<u32, BTreeSet<usize>>::new();
++    for (i, axis) in report.axes.iter().enumerate() {
++        for a in &axis.anchors {
++            incidence.entry(a.node).or_default().insert(i);
++        }
++    }
++    let mut owners = BTreeMap::<u32, BTreeSet<usize>>::new();
++    for (i, plane) in planes.patches.iter().enumerate() {
++        for &n in &plane.source_nodes {
++            owners.entry(n).or_default().insert(i);
++        }
++    }
++    let mut result = vec![];
++    for axis in &report.axes {
++        let mut anchors = axis.anchors.clone();
++        anchors.sort_by(|a, b| a.t.total_cmp(&b.t));
++        let direction = (mesh.nodes[&axis.endpoint_nodes[1]]
++            - mesh.nodes[&axis.endpoint_nodes[0]]).normalize();
++        let mut cuts = vec![0];
++        for i in 1..anchors.len()-1 {
++            let n = anchors[i].node;
++            let contact = incidence[&n].len() > 1 || owners.get(&n).is_some_and(|ps| {
++                ps.iter().any(|&p| {
++                    let transverse = DVec3::from_array(planes.patches[p].plane.normal)
++                        .dot(direction).abs() > report.policy.angle.sin();
++                    // A continuous coplanar connection has only entry/exit cuts.
++                    transverse || !owners.get(&anchors[i-1].node).is_some_and(|s| s.contains(&p))
++                        || !owners.get(&anchors[i+1].node).is_some_and(|s| s.contains(&p))
++                })
++            });
++            if contact { cuts.push(i); }
++        }
++        cuts.push(anchors.len()-1);
++        let segmented = cuts.len() > 2;
++        for w in cuts.windows(2) {
++            let lo = anchors[w[0]].t;
++            let hi = anchors[w[1]].t;
++            let mut part = axis.clone();
++            part.endpoint_nodes = [anchors[w[0]].node, anchors[w[1]].node];
++            part.endpoints = part.endpoint_nodes.map(|n| mesh.nodes[&n].to_array());
++            part.anchors = anchors[w[0]..=w[1]].to_vec();
++            for a in &mut part.anchors { a.t = (a.t-lo)/(hi-lo); }
++            part.spans = axis.spans.iter().filter(|s| s.start_t >= lo && s.end_t <= hi)
++                .cloned().map(|mut s| {s.start_t=(s.start_t-lo)/(hi-lo);s.end_t=(s.end_t-lo)/(hi-lo);s}).collect();
++            result.push((part, segmented));
++        }
++    }
++    result
++}
