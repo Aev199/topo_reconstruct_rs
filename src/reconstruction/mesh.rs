@@ -40,6 +40,10 @@ pub struct Report {
     pub surface_source_elements: Vec<Vec<u32>>,
     pub minimum_angle_degrees: f64,
     pub maximum_triangle_area: f64,
+    /// Maximum ratio between the longest and shortest edge of a non-degenerate
+    /// emitted triangle. This is diagnostic only; the acceptance threshold is
+    /// intentionally profile-specific and is not hard-coded here.
+    pub maximum_edge_ratio: f64,
     pub topology_valid: bool,
     pub quality_passed: bool,
     pub blockers: Vec<String>,
@@ -230,6 +234,7 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
     let mut topology_valid = true;
     let mut minimum_angle = 180.0_f64;
     let mut max_area = 0.0_f64;
+    let mut maximum_edge_ratio = 0.0_f64;
     for (s, surface) in model.surfaces.iter().enumerate() {
         let support = &model.planes[surface.plane];
         // A boundary-aligned, local numerical chart avoids loss of significant
@@ -368,6 +373,21 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
                 minimum_angle = 0.;
                 blockers.push(format!("degenerate_or_inverted_triangle: surface={s}"));
             }
+            let lengths = [
+                p[0].distance(p[1]),
+                p[1].distance(p[2]),
+                p[2].distance(p[0]),
+            ];
+            let shortest = lengths
+                .iter()
+                .copied()
+                .fold(f64::INFINITY, f64::min);
+            let longest = lengths.iter().copied().fold(0.0_f64, f64::max);
+            if shortest.is_finite() && shortest > eps {
+                maximum_edge_ratio = maximum_edge_ratio.max(longest / shortest);
+            } else {
+                blockers.push(format!("short_triangle_edge: surface={s}"));
+            }
             area += ar;
             max_area = max_area.max(ar);
             for i in 0..3 {
@@ -450,6 +470,7 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             .collect(),
         minimum_angle_degrees: minimum_angle,
         maximum_triangle_area: max_area,
+        maximum_edge_ratio,
         topology_valid,
         quality_passed,
         blockers,

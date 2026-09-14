@@ -109,6 +109,7 @@ fn fe_to_mesh_preserves_opening_properties_and_shared_joints() {
                 mesh.blockers,
                 mesh.minimum_angle_degrees
             );
+            assert!(mesh.maximum_edge_ratio.is_finite() && mesh.maximum_edge_ratio >= 1.0);
             assert_eq!(topology.preview.surfaces().len(), 4);
             assert_eq!(topology.axis_assembly.axes.len(), 2);
             assert_eq!(
@@ -209,6 +210,7 @@ fn nonorthogonal_fragment_passes_quality_under_transforms() {
                 mesh.blockers
             );
             assert!(mesh.blockers.is_empty());
+            assert!(mesh.maximum_edge_ratio.is_finite() && mesh.maximum_edge_ratio >= 1.0);
             assert!(!mesh.export_ready);
         }
     }
