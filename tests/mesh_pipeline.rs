@@ -111,7 +111,7 @@ fn fe_to_mesh_preserves_opening_properties_and_shared_joints() {
             );
             assert!(mesh.maximum_edge_ratio.is_finite() && mesh.maximum_edge_ratio >= 1.0);
             assert_eq!(topology.preview.surfaces().len(), 4);
-            assert_eq!(topology.axis_assembly.axes.len(), 2);
+            assert_eq!(topology.axis_assembly.axes.len(), 3);
             assert_eq!(
                 topology
                     .preview
@@ -202,7 +202,7 @@ fn nonorthogonal_fragment_passes_quality_under_transforms() {
             for p in input.nodes.values_mut() {
                 p.x += 0.2 * p.y;
             }
-            let (_, mesh) = run_input(input, scale, rotated);
+            let (_topology, mesh) = run_input(input, scale, rotated);
             assert!(
                 mesh.topology_valid && mesh.quality_passed,
                 "scale={scale}, rotated={rotated}, angle={}, {:?}",

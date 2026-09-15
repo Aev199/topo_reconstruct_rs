@@ -7,11 +7,9 @@ tool outputs after the execution environment became unavailable. It is NOT a
 byte-for-byte backup of the lost worktree. The companion
 [constructive-spans.patch](constructive-spans.patch) restores the core behavior
 against commit `babdb88b9fda379d93dc852b646d5aff823e109c`.
-The patch is deliberately not applied to the build sources. Its textual contexts
-were checked against that commit, but git apply, Rust compilation and the final
-test suite cannot be run in the currently unavailable execution environment.
-Test rewrites, the added floor test and local JSON reports are NOT included in
-the patch. Do not claim a fully verified implementation from this checkpoint.
+The patch has now been applied to the build sources and extended with the
+required test rewrites, a transverse-floor regression, and a mesh-domain
+barrier fix. The implementation was verified locally on 2026-09-15.
 
 ## User-approved requirement
 
@@ -36,6 +34,9 @@ Source FE provenance and property intervals must remain intact.
 - Before dividing a plane residual by a tiny line-plane slope, check whether
   the point already satisfies the plane within existing numerical precision.
 - Update the manually constructed frame::Axis test fixture with the new field.
+- When a boundary-to-boundary construction is split into connected segments,
+  retain its material-domain barrier across the union of explicit constraint
+  edges. True dangling branches remain open constraints.
 
 These cuts are based on source-node incidence, not on proximity welding.
 Connections without a shared source node are not newly inferred by this patch.
@@ -71,7 +72,7 @@ of this recovery patch.
 The cut removes external constraints: 783 omitted FEs touch selected nodes.
 Success of this fragment is not acceptance of the complete building.
 
-## Test work to restore
+## Test work completed
 
 Existing assertions based on one straight chain are intentionally obsolete:
 1. assembly/bars: interior_joint_shares_one_vertex_without_splitting_axis_or_properties:
@@ -97,20 +98,20 @@ Existing assertions based on one straight chain are intentionally obsolete:
 7. Keep the coplanar interior FE sliding/property test (no other axis):
    it must still return one axis rather than splitting at each shell node.
 
-Earlier test execution found the obsolete assertions above. Following their
-local update, final runs were interrupted by compiler object/archive failures
-(including zero-length object mmap errors). A fresh single-codegen-unit run
-was started, but its result was not retrieved. There is NO confirmed final
-112-test pass.
+The obsolete assertions were updated and the floor-through-column scenario was
+added. The complete suite now passes: 59 library tests, 49 binary tests and
+four integration tests (112 total). The coplanar interior FE/property test
+still remains one axis, while the explicit beam/column joint is represented by
+two constructive beam segments sharing one vertex.
 
-## Resumption
+## Verification completed
 
-First inspect any recovered worktree and preserve its changes. Do not apply
-this patch on top of an already restored implementation. In a clean worktree
-based on the stated commit, run `git apply --check` before applying.
-Restore the tests above; run formatting, the entire Rust suite, the real
-fragment and both independent checkers. Validate full-model coverage separately.
-Only then promote source changes. Next functional task: mesh-quality
-improvement, without deleting problem bars or relaxing quality thresholds.
+The full Rust suite and changed-file rustfmt checks pass. The built-in skewed
+fragment also passes the independent mesh checker: four surfaces, three axes,
+238 triangles, 16 bars, minimum angle 20.460094 degrees and maximum triangle
+area 0.46875. The full-model real-fragment input is not present in this
+worktree, so the historical `skala1` result above remains a recorded result,
+not a new verification claim. Export and full-model equivalence remain out of
+scope; `export_ready` stays false.
 
 No workflows were manually dispatched for this checkpoint.

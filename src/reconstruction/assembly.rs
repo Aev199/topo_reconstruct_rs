@@ -1012,6 +1012,7 @@ mod tests {
         let anchor = f.node_ids.iter().position(|&n| n == 4).unwrap();
         let end = f.node_ids.iter().position(|&n| n == 1).unwrap();
         f.axes.push(frame::Axis {
+            constructive_segment: false,
             endpoints: [anchor, end],
             anchors: vec![frame::Anchor {
                 node: anchor,

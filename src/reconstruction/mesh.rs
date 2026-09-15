@@ -289,6 +289,7 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
         let mut boundary = BTreeSet::new();
         let mut barriers = BTreeSet::new();
         let mut has_open_internal_constraint = false;
+        let mut internal_constraint_edges = BTreeSet::new();
         let mut nodes = BTreeSet::new();
         for edge in surface.boundaries.iter().flatten() {
             for pair in edge_nodes[edge.edge].windows(2) {
@@ -330,27 +331,51 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
                             interval_edges.push(edge);
                         }
                     }
-                    // A complete boundary-to-boundary construction line is a
-                    // legitimate domain divider. An open line is not: keeping
-                    // it inside one material domain lets refinement form a
-                    // quality fan at its free endpoint.
-                    let start_node = chain
-                        .iter()
-                        .find(|(t, _)| (*t - start_t).abs() <= tolerance)
-                        .map(|(_, n)| *n);
-                    let end_node = chain
-                        .iter()
-                        .find(|(t, _)| (*t - end_t).abs() <= tolerance)
-                        .map(|(_, n)| *n);
-                    if start_node.is_some_and(|n| boundary_nodes.contains(&n))
-                        && end_node.is_some_and(|n| boundary_nodes.contains(&n))
-                    {
-                        barriers.extend(interval_edges);
-                    } else {
-                        has_open_internal_constraint = true;
-                    }
+                    // Segmenting a boundary-to-boundary construction can
+                    // make each individual interval look open. Defer the
+                    // barrier decision until all explicitly connected
+                    // interval edges on this surface are known.
+                    internal_constraint_edges.extend(interval_edges);
                 }
                 _ => {}
+            }
+        }
+        // An internal constraint edge is a material-domain barrier exactly
+        // when it belongs to a path between two distinct source boundary
+        // vertices. This preserves a continuous boundary-to-boundary chain
+        // across constructive segments while leaving true dangling branches
+        // in one refinement domain.
+        let mut graph = BTreeMap::<usize, BTreeSet<usize>>::new();
+        for &[a, b] in &internal_constraint_edges {
+            graph.entry(a).or_default().insert(b);
+            graph.entry(b).or_default().insert(a);
+        }
+        let reachable_without = |start: usize, blocked: [usize; 2]| {
+            let mut seen = BTreeSet::from([start]);
+            let mut pending = vec![start];
+            while let Some(node) = pending.pop() {
+                for &next in graph.get(&node).into_iter().flatten() {
+                    if key(node, next) == blocked || !seen.insert(next) {
+                        continue;
+                    }
+                    pending.push(next);
+                }
+            }
+            seen
+        };
+        for &edge in &internal_constraint_edges {
+            let left = reachable_without(edge[0], edge);
+            let right = reachable_without(edge[1], edge);
+            let left_boundary: BTreeSet<_> = left.intersection(&boundary_nodes).copied().collect();
+            let right_boundary: BTreeSet<_> =
+                right.intersection(&boundary_nodes).copied().collect();
+            if left_boundary
+                .iter()
+                .any(|a| right_boundary.iter().any(|b| a != b))
+            {
+                barriers.insert(edge);
+            } else {
+                has_open_internal_constraint = true;
             }
         }
         nodes.extend(constraints.iter().flatten().copied());
@@ -404,7 +429,8 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
                 start_t,
                 end_t,
                 ..
-            } = *c else {
+            } = *c
+            else {
                 continue;
             };
             if surface != s {
@@ -414,7 +440,12 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             let length = point(&vertices[a]).distance(point(&vertices[b]));
             let tolerance = eps / length;
             for node in face_nodes.iter().copied() {
-                let Some(t) = parameter(point(&vertices[node]), point(&vertices[a]), point(&vertices[b]), eps) else {
+                let Some(t) = parameter(
+                    point(&vertices[node]),
+                    point(&vertices[a]),
+                    point(&vertices[b]),
+                    eps,
+                ) else {
                     continue;
                 };
                 if t < start_t - tolerance || t > end_t + tolerance {
@@ -459,10 +490,7 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
                 p[1].distance(p[2]),
                 p[2].distance(p[0]),
             ];
-            let shortest = lengths
-                .iter()
-                .copied()
-                .fold(f64::INFINITY, f64::min);
+            let shortest = lengths.iter().copied().fold(f64::INFINITY, f64::min);
             let longest = lengths.iter().copied().fold(0.0_f64, f64::max);
             if shortest.is_finite() && shortest > eps {
                 maximum_edge_ratio = maximum_edge_ratio.max(longest / shortest);

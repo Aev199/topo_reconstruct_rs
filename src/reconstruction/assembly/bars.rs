@@ -212,6 +212,8 @@ fn propose(
     let cosine = reference.normalize().dot(up).abs();
     let direction = if short {
         reference.normalize()
+    } else if axis.constructive_segment {
+        raw.normalize()
     } else if cosine >= source.policy.angle.cos() {
         up * reference.dot(up).signum()
     } else if cosine <= source.policy.angle.sin() {
@@ -290,6 +292,10 @@ fn propose(
                 .map(|&i| &supports[i])
                 .collect();
             for plane in &owned {
+                // Avoid dividing a satisfied coplanar residual by a tiny slope.
+                if plane.distance((origin + direction * t).to_array()).abs() <= policy.precision {
+                    continue;
+                }
                 let slope = DVec3::from_array(plane.normal).dot(direction);
                 if slope.abs() > 1e-10 {
                     t = -plane.distance(origin.to_array()) / slope;
@@ -798,7 +804,7 @@ mod tests {
         assert!(!r.axis_assembly.all_axes_built);
     }
     #[test]
-    fn interior_joint_shares_one_vertex_without_splitting_axis_or_properties() {
+    fn interior_joint_shares_one_vertex_with_constructive_segments_and_properties() {
         for scale in [0.1, 1., 10.] {
             for transformed in [false, true] {
                 let mut mesh = slab_beam_column();
@@ -829,23 +835,30 @@ mod tests {
                 let r = &result.axis_assembly;
                 assert!(result.all_surface_patches_built);
                 assert!(r.all_axes_built, "{:?}", r.issues);
-                assert_eq!(r.axes.len(), 2);
-                let beam = r.axes.iter().find(|a| a.spans.len() == 2).unwrap();
-                assert_eq!(beam.endpoints.len(), 2);
+                assert_eq!(r.axes.len(), 3);
+                let beams: Vec<_> = r
+                    .axes
+                    .iter()
+                    .filter(|a| a.spans.len() == 1 && matches!(a.spans[0].stiffness, 10 | 20))
+                    .collect();
+                assert_eq!(beams.len(), 2);
                 assert_eq!(
-                    beam.spans
+                    beams
                         .iter()
-                        .map(|s| s.stiffness)
+                        .map(|a| a.spans[0].stiffness)
                         .collect::<BTreeSet<_>>(),
                     BTreeSet::from([10, 20])
                 );
-                let middle = beam
-                    .anchors
+                let middle = r
+                    .axes
                     .iter()
+                    .flat_map(|a| a.anchors.iter())
                     .find(|a| a.source_node == id(5))
                     .unwrap();
-                assert!((middle.t - 0.5).abs() < 1e-7);
-                let column = r.axes.iter().find(|a| a.spans.len() == 1).unwrap();
+                assert!(beams
+                    .iter()
+                    .all(|beam| beam.endpoints.contains(&middle.vertex)));
+                let column = r.axes.iter().find(|a| a.spans[0].stiffness == 30).unwrap();
                 assert!(column.endpoints.contains(&middle.vertex));
                 assert_eq!(
                     result
@@ -943,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_middle_joint_rejects_bent_beam_without_moving_surface_vertices() {
+    fn fixed_middle_joint_accepts_bent_chain_as_constructive_segments() {
         let mesh = slab_beam_column();
         let mut f = frame(&mesh, DVec3::Z);
         let n = f.node_ids.iter().position(|&n| n == 5).unwrap();
@@ -952,22 +965,21 @@ mod tests {
         let r = assembly::assemble(&mesh, &f, &policy(1.)).unwrap();
         assert_eq!(f.candidate_points, before);
         assert!(r.all_surface_patches_built);
-        assert!(!r.axis_assembly.all_axes_built);
-        assert_eq!(r.axis_assembly.axes.len(), 1);
-        assert_eq!(r.axis_assembly.issues.len(), 1);
-        assert_eq!(
-            r.axis_assembly.issues[0].reason,
-            "shared_anchors_not_collinear"
+        assert!(
+            r.axis_assembly.all_axes_built,
+            "{:?}",
+            r.axis_assembly.issues
         );
+        assert_eq!(r.axis_assembly.axes.len(), 3);
+        assert!(r.axis_assembly.issues.is_empty());
         assert_eq!(
-            r.axis_assembly.issues[0]
-                .source_elements
+            r.axis_assembly
+                .axes
                 .iter()
-                .copied()
+                .flat_map(|a| a.spans.iter().map(|s| s.element))
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([5, 6])
+            BTreeSet::from([5, 6, 7])
         );
-        assert_eq!(r.axis_assembly.issues[0].source_nodes, vec![5]);
         let vertex = r.vertex_source_nodes.iter().position(|&n| n == 5).unwrap();
         assert!(
             DVec3::from_array(r.preview.vertices[vertex]).distance(DVec3::new(1., 1.002, 0.))

@@ -5,6 +5,7 @@ use crate::input::MeshData;
 use glam::DVec3;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+mod segments;
 mod sliding;
 
 #[derive(Debug, Clone, Serialize)]
@@ -24,6 +25,8 @@ pub struct Anchor {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Axis {
+    /// Geometric segment of a chain; shared endpoints do not imply releases.
+    pub constructive_segment: bool,
     pub endpoints: [usize; 2],
     pub anchors: Vec<Anchor>,
     pub spans: Vec<recognize::SourceSpan>,
@@ -402,7 +405,8 @@ fn solve_impl(
     let mut equations = vec![];
     let mut budgets = vec![policy.maximum_movement; reference.len()];
     let mut new_axes = vec![];
-    for (axis_index, a) in axes.axes.iter().enumerate() {
+    let segments = segments::split(mesh, axes, planes);
+    for (axis_index, (a, constructive_segment)) in segments.iter().enumerate() {
         if a.endpoint_nodes.iter().any(|n| !map.contains_key(n))
             || a.anchors
                 .iter()
@@ -455,7 +459,7 @@ fn solve_impl(
                 equations.push(e);
             }
         }
-        let directions = if length < policy.minimum_length {
+        let directions = if *constructive_segment || length < policy.minimum_length {
             vec![]
         } else if cosine >= policy.angle.cos() {
             vec![u, v]
@@ -473,6 +477,7 @@ fn solve_impl(
             ));
         }
         new_axes.push(Axis {
+            constructive_segment: *constructive_segment,
             endpoints: ends,
             anchors,
             spans: a.spans.clone(),
@@ -767,6 +772,37 @@ mod tests {
             ],
         }
     }
+
+    fn column_through_floors() -> MeshData {
+        let mut mesh = MeshData::default();
+        for (id, z) in (0..=4).enumerate() {
+            mesh.nodes.insert(
+                id as u32 + 1,
+                DVec3::new(if z == 2 { 0.003 } else { 0. }, 0., z as f64),
+            );
+        }
+        for i in 0..4 {
+            mesh.elements.push(ElementData {
+                id: i + 1,
+                elem_type: 10,
+                stiff_id: 100 + i,
+                nodes: vec![i + 1, i + 2],
+            });
+        }
+        for (i, z) in [0., 2., 4.].into_iter().enumerate() {
+            let axis_node = i * 2 + 1;
+            let first = 10 + i as u32 * 3;
+            mesh.nodes.insert(first, DVec3::new(1., 0., z));
+            mesh.nodes.insert(first + 1, DVec3::new(0., 1., z));
+            mesh.elements.push(ElementData {
+                id: 10 + i as u32,
+                elem_type: 42,
+                stiff_id: 200 + i as u32,
+                nodes: vec![axis_node as u32, first, first + 1],
+            });
+        }
+        mesh
+    }
     fn run_sliding(m: &MeshData, p: &Policy, scale: f64) -> Report {
         let axes = recognize::recognize(
             m,
@@ -832,11 +868,15 @@ mod tests {
                     assert!(DVec3::from_array(r.points[i]).distance(expected) < 1e-6 * scale);
                 }
                 let ts = r.sliding_parameters.as_ref().unwrap();
-                assert!(r.axes.iter().zip(ts).any(|(a, t)| a
-                    .anchors
-                    .iter()
-                    .zip(t)
-                    .any(|(c, t)| (c.t - t).abs() > 1e-5)));
+                assert_eq!(r.axes.len(), 3);
+                assert!(r.axes.iter().all(|a| a.spans.len() == 1));
+                assert_eq!(r.axes.iter().filter(|a| a.constructive_segment).count(), 2);
+                assert!(r.axes.iter().zip(ts).all(|(a, t)| {
+                    a.anchors
+                        .iter()
+                        .zip(t)
+                        .all(|(c, t)| (c.t - t).abs() <= 1e-5)
+                }));
                 for (axis, ts) in r.axes.iter().zip(ts) {
                     let [a, b] = axis.endpoints.map(|i| DVec3::from_array(r.points[i]));
                     for (anchor, t) in axis.anchors.iter().zip(ts) {
@@ -859,8 +899,106 @@ mod tests {
                     .flat_map(|a| a.spans.iter().map(|s| (s.element, s.stiffness)))
                     .collect();
                 assert_eq!(spans, BTreeMap::from([(1, 1), (2, 2), (3, 3)]));
-                let beam = r.axes.iter().find(|a| a.spans.len() == 2).unwrap();
-                assert_eq!(beam.spans[0].end_t, beam.spans[1].start_t);
+                let beam: Vec<_> = r
+                    .axes
+                    .iter()
+                    .filter(|a| matches!(a.spans[0].element, 1 | 2))
+                    .collect();
+                assert_eq!(beam.len(), 2);
+                assert!(beam.iter().all(|a| a.anchors.len() == 2));
+            }
+        }
+    }
+
+    #[test]
+    fn column_through_transverse_floors_splits_only_at_structural_supports() {
+        for scale in [0.1, 1., 10.] {
+            for transformed in [false, true] {
+                let mut m = column_through_floors();
+                let rotation = if transformed {
+                    glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.6)
+                } else {
+                    glam::DQuat::IDENTITY
+                };
+                let shift = if transformed {
+                    DVec3::new(20., 30., 40.)
+                } else {
+                    DVec3::ZERO
+                };
+                let node_id = |n: u32| if transformed { 1000 - n } else { n };
+                let element_id = |e: u32| if transformed { 2000 - e } else { e };
+                m.nodes = m
+                    .nodes
+                    .into_iter()
+                    .map(|(n, p)| (node_id(n), rotation * (p * scale) + shift))
+                    .collect();
+                for e in &mut m.elements {
+                    e.id = element_id(e.id);
+                    for n in &mut e.nodes {
+                        *n = node_id(*n);
+                    }
+                    e.nodes.reverse();
+                }
+                if transformed {
+                    m.elements.reverse();
+                }
+                let recognized = recognize::recognize(
+                    &m,
+                    &recognize::Policy {
+                        angle: 0.02,
+                        line_tolerance: 0.01 * scale,
+                        numerical_precision: 1e-8 * scale,
+                    },
+                )
+                .unwrap();
+                assert_eq!(recognized.axes.len(), 1);
+                let supports = planes::recognize(
+                    &m,
+                    &planes::Policy {
+                        angle: 0.02,
+                        distance: 0.01 * scale,
+                        precision: 1e-8 * scale,
+                    },
+                )
+                .unwrap();
+                assert_eq!(supports.patches.len(), 3);
+                let pieces = segments::split(&m, &recognized, &supports);
+                assert_eq!(pieces.len(), 2);
+                assert!(pieces.iter().all(|(_, constructive)| *constructive));
+                assert!(pieces.iter().all(|(axis, _)| {
+                    axis.spans.len() == 2
+                        && axis.anchors.len() == 3
+                        && (axis.anchors[1].t - 0.5).abs() < 1e-8
+                }));
+                assert_eq!(
+                    pieces
+                        .iter()
+                        .flat_map(|(axis, _)| axis.spans.iter().map(|s| s.element))
+                        .map(|e| if transformed { 2000 - e } else { e })
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from([1, 2, 3, 4])
+                );
+                assert!(pieces
+                    .iter()
+                    .any(|(axis, _)| { axis.endpoint_nodes.contains(&node_id(3)) }));
+                let result = solve(
+                    &m,
+                    &recognized,
+                    &supports,
+                    &Policy {
+                        up: (rotation * DVec3::Z).to_array(),
+                        angle: 0.02,
+                        maximum_movement: 0.15 * scale,
+                        relative_movement: 0.05,
+                        minimum_length: 0.03 * scale,
+                        residual_tolerance: 1e-8 * scale,
+                        iterations: 2000,
+                    },
+                )
+                .unwrap();
+                assert!(result.accepted, "{}", result.candidate_max_residual);
+                assert_eq!(result.axes.len(), 2);
+                assert!(result.axes.iter().all(|axis| axis.spans.len() == 2));
             }
         }
     }
@@ -1092,11 +1230,11 @@ mod tests {
         let r = run(&source(), &policy());
         let graph = super::super::graph::Graph::from_frame(&r);
         assert_eq!(graph.components.len(), 1);
-        assert_eq!(graph.components[0].axes.len(), 2);
+        assert_eq!(graph.components[0].axes.len(), 3);
         assert_eq!(graph.components[0].planes.len(), 1);
         assert_eq!(graph.components[0].vertices.len(), r.node_ids.len());
         assert!(r.accepted, "{}", r.candidate_max_residual);
-        assert_eq!(r.axes.len(), 2);
+        assert_eq!(r.axes.len(), 3);
         for a in &r.axes {
             let x = DVec3::from_array(r.points[a.endpoints[0]]);
             let y = DVec3::from_array(r.points[a.endpoints[1]]);
