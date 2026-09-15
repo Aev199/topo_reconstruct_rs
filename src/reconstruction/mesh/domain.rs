@@ -140,7 +140,14 @@ pub(super) fn refine(
         if !refine_outer_faces {
             parameters = parameters.exclude_outer_faces(true);
         }
-        let refined = region.refine(parameters);
+        // Spade currently has an internal panic path in `refine` for some
+        // valid-looking constrained configurations (it reports "Failed to
+        // locate position"). Mesh generation is a diagnostic gate, so an
+        // upstream triangulator panic must become an ordinary rejection of
+        // this mesh candidate rather than aborting the whole reconstruction.
+        let refined =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| region.refine(parameters)))
+                .map_err(|_| "CDT refinement panicked")?;
         added += region.num_vertices() - before;
         complete &= refined.refinement_complete;
         for vertex in region.vertices() {
@@ -162,3 +169,4 @@ pub(super) fn refine(
     }
     Ok((result, complete))
 }
+

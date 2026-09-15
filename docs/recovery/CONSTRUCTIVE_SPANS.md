@@ -109,9 +109,12 @@ two constructive beam segments sharing one vertex.
 The full Rust suite and changed-file rustfmt checks pass. The built-in skewed
 fragment also passes the independent mesh checker: four surfaces, three axes,
 238 triangles, 16 bars, minimum angle 20.460094 degrees and maximum triangle
-area 0.46875. The full-model real-fragment input is not present in this
-worktree, so the historical `skala1` result above remains a recorded result,
-not a new verification claim. Export and full-model equivalence remain out of
-scope; `export_ready` stays false.
+area 0.46875. The uploaded full-model input was rerun on 2026-09-15. The
+current real-fragment result is recorded in `docs/REAL_FRAGMENT.md`: frame and
+assembly pass for the selected fragment, while the mesh gate receives the
+upstream Spade refinement panic as `mesh_error: CDT refinement panicked`. The
+visualization-only triangulation is not an accepted FE mesh. Export and
+full-model equivalence remain out of scope; `export_ready` stays false.
 
 No workflows were manually dispatched for this checkpoint.
+

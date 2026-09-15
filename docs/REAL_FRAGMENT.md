@@ -35,3 +35,21 @@ It is not a new finite-element mesh and carries no mesh-quality acceptance.
 Next: reconcile the frame and shared-anchor numerical acceptance criteria,
 then rerun the mesh gate with both rejected axes retained. Do not silently
 remove those axes or interpret a cut-fragment result as global success.
+
+## Latest rerun (2026-09-15)
+
+The uploaded `скала1.txt` was parsed and rerun with the current v2 pipeline.
+The full preview recognizes 348 axes with no recognition rejections. The
+selected fragment (surfaces 267, 32 and 9) contains 877 nodes, 1046 source
+elements (651 shells and 395 bars), 65/65 accepted axes, 271 contacts, and
+783 omitted elements touching selected nodes. Frame and assembly are accepted;
+`export_ready` remains false.
+
+The mesh gate now rejects the fragment as `mesh_error: CDT refinement
+panicked`. This is the upstream Spade 2.15.1 internal panic
+`Failed to locate position`, converted by the mesh layer into a regular
+diagnostic result so the reconstruction report and `display_triangles` are
+still emitted. `display_triangles` contains 152 visualization triangles; it
+is not an accepted FE mesh. No source elements, releases, loads or supports
+are invented or transferred.
+
