@@ -45,11 +45,19 @@ elements (651 shells and 395 bars), 65/65 accepted axes, 271 contacts, and
 783 omitted elements touching selected nodes. Frame and assembly are accepted;
 `export_ready` remains false.
 
-The mesh gate now rejects the fragment as `mesh_error: CDT refinement
-panicked`. This is the upstream Spade 2.15.1 internal panic
-`Failed to locate position`, converted by the mesh layer into a regular
-diagnostic result so the reconstruction report and `display_triangles` are
-still emitted. `display_triangles` contains 152 visualization triangles; it
-is not an accepted FE mesh. No source elements, releases, loads or supports
-are invented or transferred.
+The mesh gate now reaches the emitted FE-candidate mesh. It contains 1065
+triangles, 708 bar elements and 4336 vertices; `topology_valid=true`, while
+`quality_passed=false` because the minimum angle is 12.17047° against the
+20° profile threshold. The maximum triangle area is 0.492107 m² against the
+0.5 m² limit, and the maximum edge ratio is 4.62125. `export_ready` remains
+false. The run also exercises a guard for the upstream Spade 2.15.1 panic
+(`Failed to locate position`); a conservative retry prevents that library
+failure from aborting the report.
 
+The refinement uses a relative minimum-area hint (0.1% of the configured
+maximum area) to stop an acute constrained fan from generating microscopic
+triangles. This is not a quality waiver: every emitted triangle is still
+measured, and the fragment remains rejected until the 20° criterion is met.
+`display_triangles` contains 152 visualization triangles; it is not an
+accepted FE mesh. No source elements, releases, loads or supports are
+invented or transferred.

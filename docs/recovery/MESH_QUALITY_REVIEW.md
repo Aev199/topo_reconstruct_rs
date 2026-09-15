@@ -1,7 +1,7 @@
-# Mesh quality: source review, 2026-09-14
+# Mesh quality: source review, 2026-09-15
 
-Status: static review only; execution environment still unavailable.
-This is an implementation handoff, not a completed mesh-quality fix.
+Status: real-fragment rerun completed; the mesh is topologically valid but is
+still rejected by the strict quality gate.
 
 ## Evidence in current source
 
@@ -15,9 +15,11 @@ with keep_constraint_edges(). Their generated interior nodes are appended
 independently. There is no feedback stage that requests new subdivisions of a
 global constraint and propagates them to every owning surface and bar.
 
-The recovered fragment report had topology_valid=true and quality_passed=false,
-with minimum_angle_not_met and maximum_area_not_met, but no refinement_limit
-blocker. Therefore simply increasing the resource budget is not an
+The current `скала1.txt` fragment has `topology_valid=true`, 1065 triangles,
+708 bars and 4336 vertices. Its maximum area is within the configured limit,
+but its minimum angle is 12.17047° with a 20° requirement. The previous
+unbounded acute-angle attempt created a 0.01690° sliver and a much larger
+diagnostic edge ratio; increasing the vertex budget is therefore not an
 evidence-supported fix.
 
 ## Interpretation, not yet a demonstrated root cause
@@ -28,6 +30,16 @@ near boundaries or bar contacts. The exact cause of the worst 2.088-degree and
 Other candidates include a genuinely acute domain corner, close mandatory
 anchors, or faces excluded by refinement. Do not label all of them as a
 single confirmed defect.
+
+## Implemented stabilization
+
+The mesh refinement keeps the canonical pre-subdivided constraint edges so
+neighboring surfaces and bar chains cannot silently diverge. It catches the
+known Spade refinement panic and retries with excluded outer faces. A small
+minimum-required-area hint, relative to the configured maximum area, prevents
+an acute constrained fan from endlessly producing microscopic triangles. The
+quality gate still evaluates every emitted triangle and does not accept this
+fragment.
 
 ## Next implementation
 

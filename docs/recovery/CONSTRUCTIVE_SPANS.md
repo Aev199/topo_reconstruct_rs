@@ -111,10 +111,10 @@ fragment also passes the independent mesh checker: four surfaces, three axes,
 238 triangles, 16 bars, minimum angle 20.460094 degrees and maximum triangle
 area 0.46875. The uploaded full-model input was rerun on 2026-09-15. The
 current real-fragment result is recorded in `docs/REAL_FRAGMENT.md`: frame and
-assembly pass for the selected fragment, while the mesh gate receives the
-upstream Spade refinement panic as `mesh_error: CDT refinement panicked`. The
+assembly pass, and the mesh candidate is topologically valid, but the quality
+gate rejects it at 12.17047° minimum angle versus 20°. The mesh layer also
+guards the upstream Spade refinement panic with a conservative retry. The
 visualization-only triangulation is not an accepted FE mesh. Export and
 full-model equivalence remain out of scope; `export_ready` stays false.
 
 No workflows were manually dispatched for this checkpoint.
-

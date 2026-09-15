@@ -2,6 +2,11 @@
 use super::*;
 type Cdt = ConstrainedDelaunayTriangulation<Point2<f64>>;
 
+// Spade's acute-angle refinement can create a long sequence of ever-smaller
+// triangles around a fixed constraint vertex. Keep the floor relative to the
+// requested area so rigid scaling does not change the refinement behavior.
+const MIN_REQUIRED_AREA_RATIO: f64 = 1e-3;
+
 fn interior(
     cdt: &Cdt,
     global: &BTreeMap<usize, usize>,
@@ -110,44 +115,62 @@ pub(super) fn refine(
             .iter()
             .filter_map(|(&e, &count)| (count == 1).then_some(e))
             .collect();
-        let mut region = Cdt::new();
-        let mut handles = BTreeMap::new();
-        let mut mapping = BTreeMap::new();
-        for n in nodes {
-            let h = region.insert(uv[&n]).map_err(|_| "invalid region vertex")?;
-            handles.insert(n, h);
-            mapping.insert(h.index(), n);
-        }
-        for edge in counts
-            .keys()
-            .filter(|e| region_boundary.contains(*e) || constraints.contains(*e))
-        {
-            if !region.can_add_constraint(handles[&edge[0]], handles[&edge[1]]) {
-                return Err("invalid region constraint");
+        let construct_region = || -> Result<(Cdt, BTreeMap<usize, usize>), &'static str> {
+            let mut region = Cdt::new();
+            let mut handles = BTreeMap::new();
+            let mut mapping = BTreeMap::new();
+            for &n in &nodes {
+                let h = region.insert(uv[&n]).map_err(|_| "invalid region vertex")?;
+                handles.insert(n, h);
+                mapping.insert(h.index(), n);
             }
-            region.add_constraint(handles[&edge[0]], handles[&edge[1]]);
-        }
-        let before = region.num_vertices();
-        let mut parameters = RefinementParameters::new()
-            .keep_constraint_edges()
-            .with_max_allowed_area(policy.maximum_area)
-            .with_angle_limit(AngleLimit::from_deg(policy.minimum_angle_degrees))
-            .with_max_additional_vertices(
-                policy
-                    .maximum_added_vertices_per_surface
-                    .saturating_sub(added),
-            );
-        if !refine_outer_faces {
-            parameters = parameters.exclude_outer_faces(true);
-        }
-        // Spade currently has an internal panic path in `refine` for some
-        // valid-looking constrained configurations (it reports "Failed to
-        // locate position"). Mesh generation is a diagnostic gate, so an
-        // upstream triangulator panic must become an ordinary rejection of
-        // this mesh candidate rather than aborting the whole reconstruction.
-        let refined =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| region.refine(parameters)))
-                .map_err(|_| "CDT refinement panicked")?;
+            for edge in counts
+                .keys()
+                .filter(|e| region_boundary.contains(*e) || constraints.contains(*e))
+            {
+                if !region.can_add_constraint(handles[&edge[0]], handles[&edge[1]]) {
+                    return Err("invalid region constraint");
+                }
+                region.add_constraint(handles[&edge[0]], handles[&edge[1]]);
+            }
+            Ok((region, mapping))
+        };
+        let refine_region = |exclude_outer_faces: bool| {
+            let (mut region, mapping) = construct_region()?;
+            let before = region.num_vertices();
+            let mut parameters = RefinementParameters::new()
+                .keep_constraint_edges()
+                // A small relative floor prevents Spade from endlessly
+                // chasing acute fans around source constraints. It is a
+                // refinement hint only; the mesh gate still measures every
+                // emitted triangle against the configured quality policy.
+                .with_min_required_area(policy.maximum_area * MIN_REQUIRED_AREA_RATIO)
+                .with_max_allowed_area(policy.maximum_area)
+                .with_angle_limit(AngleLimit::from_deg(policy.minimum_angle_degrees))
+                .with_max_additional_vertices(
+                    policy
+                        .maximum_added_vertices_per_surface
+                        .saturating_sub(added),
+                );
+            if exclude_outer_faces {
+                parameters = parameters.exclude_outer_faces(true);
+            }
+            // Spade currently has an internal panic path in `refine` for some
+            // valid-looking constrained configurations (it reports "Failed to
+            // locate position"). Mesh generation is a diagnostic gate, so an
+            // upstream triangulator panic must become an ordinary rejection
+            // or trigger the conservative retry below.
+            let refined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                region.refine(parameters)
+            }))
+            .map_err(|_| "CDT refinement panicked")?;
+            Ok((region, mapping, before, refined))
+        };
+        let (region, mut mapping, before, refined) = match refine_region(!refine_outer_faces) {
+            Ok(result) => result,
+            Err("CDT refinement panicked") if refine_outer_faces => refine_region(true)?,
+            Err(error) => return Err(error),
+        };
         added += region.num_vertices() - before;
         complete &= refined.refinement_complete;
         for vertex in region.vertices() {
@@ -169,4 +192,3 @@ pub(super) fn refine(
     }
     Ok((result, complete))
 }
-
