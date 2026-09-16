@@ -224,6 +224,113 @@ fn rejects_incomplete_geometry_and_reports_quality_failure() {
 }
 
 #[test]
+fn partial_mesh_keeps_unresolved_source_coverage_as_a_blocker() {
+    let (mut topology, _) = run(1., false);
+    topology.all_surface_patches_built = false;
+    topology.issues.push(assembly::Issue {
+        patch: 99,
+        source_elements: vec![9001],
+        reason: "synthetic unresolved surface".into(),
+        boundary_source_nodes: vec![],
+    });
+    topology.axis_assembly.all_axes_built = false;
+    topology.axis_assembly.issues.push(assembly::bars::Issue {
+        source_axis: 99,
+        source_elements: vec![9002],
+        source_nodes: vec![1],
+        reason: "synthetic unresolved axis".into(),
+    });
+    let policy = mesh::Policy {
+        boundary_spacing: 0.5,
+        maximum_area: 0.5,
+        minimum_angle_degrees: 20.,
+        maximum_added_vertices_per_surface: 10000,
+    };
+    assert!(mesh::build(&topology, &policy).is_err());
+    let partial = mesh::build_partial(&topology, &policy).unwrap();
+    assert!(!partial.source_coverage_complete);
+    assert_eq!(partial.unresolved_surface_source_elements, vec![9001]);
+    assert_eq!(partial.unresolved_axis_source_elements, vec![9002]);
+    assert!(!partial.triangles.is_empty());
+    assert!(!partial.external_mesher_ready);
+    assert!(partial
+        .external_mesher_blockers
+        .contains(&"unresolved_surface_assembly".to_string()));
+    assert!(partial
+        .external_mesher_blockers
+        .contains(&"unresolved_axis_assembly".to_string()));
+}
+
+#[test]
+fn subresolution_hole_is_reported_without_silent_filling() {
+    let mut model = topo_reconstruct_rs::reconstruction::Model::new(1e-7, 0.001).unwrap();
+    let plane = model.add_plane(
+        topo_reconstruct_rs::reconstruction::PlaneFrame::new([0., 0., 0.], [0., 0., 1.]).unwrap(),
+    );
+    let points = [
+        [0., 0., 0.],
+        [10., 0., 0.],
+        [10., 10., 0.],
+        [0., 10., 0.],
+        [4., 4., 0.],
+        [4.4, 4., 0.],
+        [4.2, 4.00000001, 0.],
+    ];
+    let vertices: Vec<_> = points
+        .into_iter()
+        .map(|point| model.add_vertex(point).unwrap())
+        .collect();
+    model
+        .add_surface(
+            plane,
+            vec![vertices[..4].to_vec(), vertices[4..].to_vec()],
+            vec![1],
+        )
+        .unwrap();
+    let topology = assembly::Report {
+        policy: assembly::Policy {
+            closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
+            precision: 1e-7,
+            minimum_edge: 0.001,
+        },
+        export_ready: false,
+        all_surface_patches_built: true,
+        preview: model,
+        vertex_source_nodes: (1..=7).collect(),
+        surface_source_patches: vec![0],
+        surface_stiffness: vec![10],
+        pinched_region_splits: vec![],
+        hole_recovery: vec![],
+        axis_assembly: assembly::bars::Report::default(),
+        issues: vec![],
+        maximum_closure_movement: 0.,
+        rejected_vertices: BTreeMap::new(),
+        support_representatives: vec![0],
+        support_offset_projection_applied: false,
+    };
+    let report = mesh::build_partial(
+        &topology,
+        &mesh::Policy {
+            boundary_spacing: 0.5,
+            maximum_area: 0.5,
+            minimum_angle_degrees: 20.,
+            maximum_added_vertices_per_surface: 100,
+        },
+    )
+    .unwrap();
+    assert!(report.triangles.is_empty());
+    assert_eq!(report.mesh_surface_errors.len(), 1);
+    assert_eq!(report.mesh_surface_errors[0].surface, 0);
+    assert!(report.mesh_surface_errors[0]
+        .reason
+        .starts_with("hole_area_below_mesh_resolution"));
+    assert_eq!(report.unresolved_surface_source_elements, vec![1]);
+    assert!(!report.source_coverage_complete);
+    assert!(!report.external_mesher_ready);
+}
+
+#[test]
 fn nonorthogonal_fragment_passes_quality_under_transforms() {
     for scale in [0.1, 1., 10.] {
         for rotated in [false, true] {

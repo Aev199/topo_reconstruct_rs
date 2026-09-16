@@ -71,6 +71,14 @@ pub struct Report {
     pub blockers: Vec<String>,
     pub quality_diagnostics: Vec<QualityDiagnostic>,
     pub constraint_synchronization: ConstraintSynchronization,
+    /// Surface-level failures that prevented a partial mesh from being emitted.
+    pub mesh_surface_errors: Vec<SurfaceBuildDiagnostic>,
+    /// Whether every source surface and axis is represented in this report.
+    pub source_coverage_complete: bool,
+    /// Source elements withheld because their surface assembly is unresolved.
+    pub unresolved_surface_source_elements: Vec<u32>,
+    /// Source elements withheld because their axis assembly is unresolved.
+    pub unresolved_axis_source_elements: Vec<u32>,
     /// Handoff gate for an external mesher.  This checks that the assembled
     /// trial geometry is usable, but deliberately does not apply the local
     /// angle/area quality profile used by the Rust probe.
@@ -79,10 +87,21 @@ pub struct Report {
     pub export_ready: bool,
 }
 
+#[derive(Debug, Serialize)]
+pub struct SurfaceBuildDiagnostic {
+    pub surface: usize,
+    pub source_elements: Vec<u32>,
+    pub reason: String,
+}
+
 fn compute_external_mesher_blockers(
     topology_valid: bool,
     triangles: &[Triangle],
     diagnostics: &[QualityDiagnostic],
+    surface_coverage_complete: bool,
+    axis_coverage_complete: bool,
+    unresolved_surface_source_elements: &[u32],
+    unresolved_axis_source_elements: &[u32],
 ) -> Vec<String> {
     let mut blockers = Vec::new();
     if triangles.is_empty() {
@@ -101,6 +120,12 @@ fn compute_external_mesher_blockers(
     }) {
         blockers.push("degenerate_or_short_trial_geometry".into());
     }
+    if !surface_coverage_complete || !unresolved_surface_source_elements.is_empty() {
+        blockers.push("unresolved_surface_assembly".into());
+    }
+    if !axis_coverage_complete || !unresolved_axis_source_elements.is_empty() {
+        blockers.push("unresolved_axis_assembly".into());
+    }
     blockers
 }
 fn key(a: usize, b: usize) -> [usize; 2] {
@@ -112,6 +137,29 @@ fn key(a: usize, b: usize) -> [usize; 2] {
 }
 fn point(v: &[f64; 3]) -> DVec3 {
     DVec3::from_array(*v)
+}
+fn contour_area(contour: &[[f64; 2]]) -> f64 {
+    0.5 * contour
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let b = contour[(i + 1) % contour.len()];
+            a[0] * b[1] - b[0] * a[1]
+        })
+        .sum::<f64>()
+        .abs()
+}
+fn contour_extent(contour: &[[f64; 2]]) -> f64 {
+    contour
+        .iter()
+        .flat_map(|a| {
+            contour.iter().map(move |b| {
+                let dx = a[0] - b[0];
+                let dy = a[1] - b[1];
+                dx.hypot(dy)
+            })
+        })
+        .fold(0.0_f64, f64::max)
 }
 fn parameter(p: DVec3, a: DVec3, b: DVec3, eps: f64) -> Option<f64> {
     let d = b - a;
@@ -167,10 +215,42 @@ fn sorted(
 }
 
 pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'static str> {
-    if !source.all_surface_patches_built
-        || !source.issues.is_empty()
-        || !source.axis_assembly.all_axes_built
-    {
+    build_impl(source, policy, false)
+}
+
+/// Build a diagnostic mesh from the successfully assembled portion of a
+/// fragment. Unresolved surfaces and axes remain provenance blockers in the
+/// returned report; this is never an export-ready or external-handoff gate.
+pub fn build_partial(source: &assembly::Report, policy: &Policy) -> Result<Report, &'static str> {
+    build_impl(source, policy, true)
+}
+
+fn build_impl(
+    source: &assembly::Report,
+    policy: &Policy,
+    allow_unresolved: bool,
+) -> Result<Report, &'static str> {
+    let mut unresolved_surface_source_elements: Vec<_> = source
+        .issues
+        .iter()
+        .flat_map(|issue| issue.source_elements.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let unresolved_axis_source_elements: Vec<_> = source
+        .axis_assembly
+        .issues
+        .iter()
+        .flat_map(|issue| issue.source_elements.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut surface_coverage_complete =
+        source.all_surface_patches_built && source.issues.is_empty();
+    let axis_coverage_complete =
+        source.axis_assembly.all_axes_built && source.axis_assembly.issues.is_empty();
+    let mut source_coverage_complete = surface_coverage_complete && axis_coverage_complete;
+    if !source_coverage_complete && !allow_unresolved {
         return Err("mesh probe requires a completely assembled fragment");
     }
     if !policy.boundary_spacing.is_finite()
@@ -195,11 +275,18 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
     let constraint_synchronization = synchronized.report;
     let mut triangles = Vec::new();
     let mut blockers = Vec::new();
+    if !source.all_surface_patches_built || !source.issues.is_empty() {
+        blockers.push("unresolved_surface_assembly".into());
+    }
+    if !source.axis_assembly.all_axes_built || !source.axis_assembly.issues.is_empty() {
+        blockers.push("unresolved_axis_assembly".into());
+    }
     let mut topology_valid = true;
     let mut minimum_angle = 180.0_f64;
     let mut max_area = 0.0_f64;
     let mut maximum_edge_ratio = 0.0_f64;
     let mut quality_diagnostics = Vec::new();
+    let mut mesh_surface_errors = Vec::new();
     for (s, surface) in model.surfaces.iter().enumerate() {
         let support = &model.planes[surface.plane];
         // A boundary-aligned, local numerical chart avoids loss of significant
@@ -250,6 +337,39 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             ring(&contours[0]),
             contours.iter().skip(1).map(ring).collect(),
         );
+        // A hole whose area is below precision × its own extent is not
+        // numerically representable by the constrained triangulator. Keep it
+        // as an explicit surface blocker instead of letting CDT fail with an
+        // opaque boundary-parity error or silently filling the opening.
+        if let Some((ring_index, area, hole_resolution)) = contours
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, ring)| {
+                (
+                    i,
+                    contour_area(ring),
+                    eps * contour_extent(ring).max(source.policy.minimum_edge),
+                )
+            })
+            .find(|(_, area, resolution)| *area <= *resolution)
+        {
+            if !allow_unresolved {
+                return Err("hole below mesh numerical resolution");
+            }
+            surface_coverage_complete = false;
+            topology_valid = false;
+            blockers.push(format!("mesh_surface_unresolved: surface={s}"));
+            unresolved_surface_source_elements.extend(surface.source_elements.iter().copied());
+            mesh_surface_errors.push(SurfaceBuildDiagnostic {
+                surface: s,
+                source_elements: surface.source_elements.clone(),
+                reason: format!(
+                    "hole_area_below_mesh_resolution: ring={ring_index}, area={area:e}, threshold={hole_resolution:e}"
+                ),
+            });
+            continue;
+        }
         let mut constraints = BTreeSet::new();
         let mut boundary = BTreeSet::new();
         let mut barriers = BTreeSet::new();
@@ -366,7 +486,7 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             }
             cdt.add_constraint(handles[&a], handles[&b]);
         }
-        let (mut faces, complete) = domain::refine(
+        let (mut faces, complete) = match domain::refine(
             &cdt,
             &global,
             &boundary,
@@ -376,7 +496,24 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             &plane,
             &mut vertices,
             policy,
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                if !allow_unresolved {
+                    return Err(error);
+                }
+                surface_coverage_complete = false;
+                topology_valid = false;
+                blockers.push(format!("mesh_surface_unresolved: surface={s}"));
+                unresolved_surface_source_elements.extend(surface.source_elements.iter().copied());
+                mesh_surface_errors.push(SurfaceBuildDiagnostic {
+                    surface: s,
+                    source_elements: surface.source_elements.clone(),
+                    reason: error.into(),
+                });
+                continue;
+            }
+        };
         if !complete {
             blockers.push(format!("refinement_limit: surface={s}"));
         }
@@ -569,8 +706,18 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
     if max_area > policy.maximum_area * (1. + 1e-7) {
         blockers.push("maximum_area_not_met".into());
     }
-    let external_mesher_blockers =
-        compute_external_mesher_blockers(topology_valid, &triangles, &quality_diagnostics);
+    unresolved_surface_source_elements.sort_unstable();
+    unresolved_surface_source_elements.dedup();
+    source_coverage_complete = surface_coverage_complete && axis_coverage_complete;
+    let external_mesher_blockers = compute_external_mesher_blockers(
+        topology_valid,
+        &triangles,
+        &quality_diagnostics,
+        surface_coverage_complete,
+        axis_coverage_complete,
+        &unresolved_surface_source_elements,
+        &unresolved_axis_source_elements,
+    );
     let external_mesher_ready = external_mesher_blockers.is_empty();
     Ok(Report {
         policy: policy.clone(),
@@ -590,6 +737,10 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
         blockers,
         quality_diagnostics,
         constraint_synchronization,
+        mesh_surface_errors,
+        source_coverage_complete,
+        unresolved_surface_source_elements,
+        unresolved_axis_source_elements,
         external_mesher_ready,
         external_mesher_blockers,
         export_ready: false,

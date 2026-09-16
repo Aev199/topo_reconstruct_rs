@@ -65,16 +65,21 @@ struct Args {
     /// Число итераций совместного v2 frame solver
     #[arg(long, default_value_t = 1000)]
     v2_iterations: usize,
+
+    /// Экспериментальный v2: записать mesh-preview, включая частично собранную модель
+    #[arg(long, value_name = "PATH")]
+    v2_mesh_preview_json: Option<String>,
 }
 
 fn run_v2_preview(
     input: &str,
     output: &str,
     iterations: usize,
+    include_mesh: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use topo_reconstruct_rs::{
         parsers::LiraParser as V2LiraParser,
-        reconstruction::{assembly, frame, graph, planes, recognize, reconcile},
+        reconstruction::{assembly, frame, graph, mesh, planes, recognize, reconcile},
     };
 
     if iterations == 0 {
@@ -126,7 +131,23 @@ fn run_v2_preview(
     )?;
     let reconciliation =
         reconcile::solve(&mesh, &result, &topology, &reconcile::Policy::default())?;
-    let report = serde_json::json!({
+    let (mesh_report, mesh_error) = if include_mesh {
+        match mesh::build_partial(
+            &topology,
+            &mesh::Policy {
+                boundary_spacing: 0.5,
+                maximum_area: 0.5,
+                minimum_angle_degrees: 20.,
+                maximum_added_vertices_per_surface: 10000,
+            },
+        ) {
+            Ok(mesh) => (Some(mesh), None),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    let mut report = serde_json::json!({
         "constraint_graph": graph::Graph::from_frame(&result),
         "frame": result,
         "topology": topology,
@@ -134,6 +155,10 @@ fn run_v2_preview(
         "axis_recognition": axes,
         "plane_recognition": plane_report,
     });
+    if include_mesh {
+        report["mesh"] = serde_json::to_value(mesh_report)?;
+        report["mesh_error"] = serde_json::to_value(mesh_error)?;
+    }
     if output == "-" {
         serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
         println!();
@@ -161,11 +186,23 @@ fn main() {
     }
 
     if let Some(path) = &args.v2_preview_json {
-        if let Err(error) = run_v2_preview(&args.input, path, args.v2_iterations) {
+        if args.v2_mesh_preview_json.is_some() {
+            eprintln!("Нельзя одновременно задавать --v2-preview-json и --v2-mesh-preview-json.");
+            std::process::exit(2);
+        }
+        if let Err(error) = run_v2_preview(&args.input, path, args.v2_iterations, false) {
             eprintln!("[V2 PREVIEW ERROR] {error}");
             std::process::exit(1);
         }
         eprintln!("[V2 PREVIEW] JSON сохранен: {path}");
+        return;
+    }
+    if let Some(path) = &args.v2_mesh_preview_json {
+        if let Err(error) = run_v2_preview(&args.input, path, args.v2_iterations, true) {
+            eprintln!("[V2 MESH PREVIEW ERROR] {error}");
+            std::process::exit(1);
+        }
+        eprintln!("[V2 MESH PREVIEW] JSON сохранен: {path}");
         return;
     }
 

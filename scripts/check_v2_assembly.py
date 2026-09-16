@@ -5,6 +5,146 @@ import json
 import math
 
 
+def _id(value, size):
+    assert isinstance(value, int) and not isinstance(value, bool)
+    assert 0 <= value < size
+
+
+def _finite_vector(value, length):
+    assert isinstance(value, list) and len(value) == length
+    assert all(isinstance(x, (int, float)) and math.isfinite(x) for x in value)
+
+
+def _sorted_unique_ids(value):
+    assert isinstance(value, list)
+    assert all(isinstance(x, int) and not isinstance(x, bool) for x in value)
+    assert value == sorted(set(value))
+
+
+def check_mesh(mesh, model, bars):
+    """Check optional diagnostic mesh data without treating it as export proof."""
+    assert isinstance(mesh, dict)
+    vertices = mesh["vertices"]
+    surface_source_elements = mesh["surface_source_elements"]
+    surface_count = len(model["surfaces"])
+    axis_count = len(bars["axes"])
+    assert vertices
+    for vertex in vertices:
+        _finite_vector(vertex, 3)
+
+    expected_surface_sources = [s["source_elements"] for s in model["surfaces"]]
+    assert surface_source_elements == expected_surface_sources
+    assert len(surface_source_elements) == surface_count
+
+    for triangle in mesh["triangles"]:
+        ids = triangle["vertices"]
+        assert isinstance(ids, list) and len(ids) == 3
+        assert len(set(ids)) == 3
+        for vertex in ids:
+            _id(vertex, len(vertices))
+        _id(triangle["surface"], surface_count)
+        assert isinstance(triangle["stiffness"], int)
+
+    for bar in mesh["bars"]:
+        ids = bar["vertices"]
+        assert isinstance(ids, list) and len(ids) == 2
+        assert ids[0] != ids[1]
+        for vertex in ids:
+            _id(vertex, len(vertices))
+        _id(bar["axis"], axis_count)
+        source = (bar["source_element"], bar["stiffness"])
+        spans = {
+            (span["element"], span["stiffness"])
+            for span in bars["axes"][bar["axis"]]["spans"]
+        }
+        assert source in spans
+
+    triangle_surfaces = {triangle["surface"] for triangle in mesh["triangles"]}
+    diagnostic_surfaces = set()
+    for diagnostic in mesh["mesh_surface_errors"]:
+        _id(diagnostic["surface"], surface_count)
+        assert diagnostic["surface"] not in diagnostic_surfaces
+        diagnostic_surfaces.add(diagnostic["surface"])
+        assert isinstance(diagnostic["reason"], str) and diagnostic["reason"]
+        assert set(diagnostic["source_elements"]) <= set(
+            surface_source_elements[diagnostic["surface"]]
+        )
+        assert diagnostic["surface"] not in triangle_surfaces
+
+    for diagnostic in mesh["quality_diagnostics"]:
+        _id(diagnostic["surface"], surface_count)
+        assert set(diagnostic["source_elements"]) <= set(
+            surface_source_elements[diagnostic["surface"]]
+        )
+        assert isinstance(diagnostic["vertices"], list)
+        assert len(diagnostic["vertices"]) == 3
+        for vertex in diagnostic["vertices"]:
+            _id(vertex, len(vertices))
+        assert len(diagnostic["source_nodes"]) == 3
+        for node in diagnostic["source_nodes"]:
+            if node is not None:
+                assert isinstance(node, int) and not isinstance(node, bool)
+        for edge in diagnostic["constrained_edges"]:
+            assert isinstance(edge, list) and len(edge) == 2
+            for vertex in edge:
+                _id(vertex, len(vertices))
+        assert diagnostic["reasons"]
+        assert all(isinstance(reason, str) for reason in diagnostic["reasons"])
+        for field in ("area", "minimum_angle_degrees", "edge_ratio"):
+            assert math.isfinite(diagnostic[field])
+
+    unresolved_surface = mesh["unresolved_surface_source_elements"]
+    unresolved_axis = mesh["unresolved_axis_source_elements"]
+    _sorted_unique_ids(unresolved_surface)
+    _sorted_unique_ids(unresolved_axis)
+    for diagnostic in mesh["mesh_surface_errors"]:
+        assert set(diagnostic["source_elements"]) <= set(unresolved_surface)
+
+    assert isinstance(mesh["source_coverage_complete"], bool)
+    assert isinstance(mesh["topology_valid"], bool)
+    assert isinstance(mesh["quality_passed"], bool)
+    assert isinstance(mesh["export_ready"], bool)
+    assert not mesh["export_ready"]
+    assert all(isinstance(blocker, str) for blocker in mesh["blockers"])
+    assert all(
+        isinstance(blocker, str) for blocker in mesh["external_mesher_blockers"]
+    )
+    assert mesh["external_mesher_ready"] == (not mesh["external_mesher_blockers"])
+    if mesh["source_coverage_complete"]:
+        assert not unresolved_surface and not unresolved_axis
+        assert not mesh["mesh_surface_errors"]
+    else:
+        assert not mesh["external_mesher_ready"]
+    if mesh["mesh_surface_errors"]:
+        assert not mesh["source_coverage_complete"]
+        assert not mesh["topology_valid"]
+
+    synchronization = mesh["constraint_synchronization"]
+    bindings = synchronization["endpoint_bindings"]
+    assert synchronization["synchronized_interval_endpoints"] == len(bindings)
+    assert synchronization["axis_node_count"] <= len(vertices)
+    assert synchronization["edge_node_count"] <= len(vertices)
+    assert synchronization["interval_contact_count"] <= len(bars["contacts"])
+    for binding in bindings:
+        _id(binding["axis"], axis_count)
+        _id(binding["surface"], surface_count)
+        _id(binding["contact"], len(bars["contacts"]))
+        _id(binding["vertex"], len(vertices))
+        assert binding["role"] in ("start", "end")
+        assert math.isfinite(binding["parameter"])
+        assert 0.0 <= binding["parameter"] <= 1.0
+
+    for field in ("minimum_angle_degrees", "maximum_triangle_area", "maximum_edge_ratio"):
+        assert math.isfinite(mesh[field])
+    return {
+        "vertices": len(vertices),
+        "triangles": len(mesh["triangles"]),
+        "bars": len(mesh["bars"]),
+        "source_coverage_complete": mesh["source_coverage_complete"],
+        "external_mesher_ready": mesh["external_mesher_ready"],
+    }
+
+
 def check(data, baseline=None):
     frame, topology = data["frame"], data["topology"]
     model, bars = topology["preview"], topology["axis_assembly"]
@@ -115,9 +255,17 @@ def check(data, baseline=None):
                 assert current_by_node[n] == old
     assert not topology["export_ready"]
     assert not bars["mesh_constraints_complete"]
-    return {"surfaces": len(model["surfaces"]), "axes": len(bars["axes"]),
-            "rejected_axes": len(bars["issues"]), "shell_elements": len(actual_shells),
-            "bar_elements": len(actual_bars), "contacts": len(bars["contacts"])}
+    result = {"surfaces": len(model["surfaces"]), "axes": len(bars["axes"]),
+              "rejected_axes": len(bars["issues"]), "shell_elements": len(actual_shells),
+              "bar_elements": len(actual_bars), "contacts": len(bars["contacts"])}
+    if "mesh" in data:
+        mesh = data["mesh"]
+        if mesh is None:
+            assert isinstance(data.get("mesh_error"), str) and data["mesh_error"]
+        else:
+            assert data.get("mesh_error") is None
+            result["mesh"] = check_mesh(mesh, model, bars)
+    return result
 
 
 if __name__ == "__main__":

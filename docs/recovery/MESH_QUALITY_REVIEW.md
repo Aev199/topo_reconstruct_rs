@@ -49,6 +49,13 @@ degenerate or too-short emitted geometry. On the current fragment it is true
 with no external-mesher blockers. This is not an exporter or a waiver of the
 strict quality profile, and `export_ready` remains false.
 
+The full model now also has a diagnostic `--v2-mesh-preview-json` path. It
+meshes the assembled portion while retaining unresolved source provenance. On
+`скала1` this produced 15203 triangles and 4273 bar segments; one additional
+surface was withheld because its hole area (`3.081e-9`) is below the numerical
+resolution threshold (`3.749e-8`). The report records its 1742 source elements,
+so this preview is not treated as complete or export-ready.
+
 ## Next implementation
 
 1. Locate failing triangles by surface, coordinates, neighboring constrained
@@ -74,5 +81,4 @@ rotation, translation and renumbering; full source/property coverage.
 The same real fragment must be rerun after applying and validating the recovered
 constructive-span patch. Full-building acceptance remains separate.
 
-No runtime metrics were newly measured for this review. No build workflow
-was manually dispatched.
+No build workflow was manually dispatched.
