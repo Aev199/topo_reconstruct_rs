@@ -8,7 +8,9 @@ use spade::{
     AngleLimit, ConstrainedDelaunayTriangulation, Point2, RefinementParameters, Triangulation,
 };
 use std::collections::{BTreeMap, BTreeSet};
+mod constraints;
 mod domain;
+pub use constraints::{EndpointBinding, EndpointRole, Report as ConstraintSynchronization};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Policy {
@@ -31,6 +33,26 @@ pub struct Bar {
     pub stiffness: u32,
 }
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualityReason {
+    DegenerateOrInverted,
+    ShortEdge,
+    MinimumAngle,
+    MaximumArea,
+}
+#[derive(Debug, Serialize)]
+pub struct QualityDiagnostic {
+    pub surface: usize,
+    pub source_elements: Vec<u32>,
+    pub vertices: [usize; 3],
+    pub source_nodes: [Option<u32>; 3],
+    pub constrained_edges: Vec<[usize; 2]>,
+    pub area: f64,
+    pub minimum_angle_degrees: f64,
+    pub edge_ratio: f64,
+    pub reasons: Vec<QualityReason>,
+}
+#[derive(Debug, Serialize)]
 pub struct Report {
     pub policy: Policy,
     pub vertices: Vec<[f64; 3]>,
@@ -47,7 +69,39 @@ pub struct Report {
     pub topology_valid: bool,
     pub quality_passed: bool,
     pub blockers: Vec<String>,
+    pub quality_diagnostics: Vec<QualityDiagnostic>,
+    pub constraint_synchronization: ConstraintSynchronization,
+    /// Handoff gate for an external mesher.  This checks that the assembled
+    /// trial geometry is usable, but deliberately does not apply the local
+    /// angle/area quality profile used by the Rust probe.
+    pub external_mesher_ready: bool,
+    pub external_mesher_blockers: Vec<String>,
     pub export_ready: bool,
+}
+
+fn compute_external_mesher_blockers(
+    topology_valid: bool,
+    triangles: &[Triangle],
+    diagnostics: &[QualityDiagnostic],
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if triangles.is_empty() {
+        blockers.push("empty_trial_mesh".into());
+    }
+    if !topology_valid {
+        blockers.push("invalid_trial_topology".into());
+    }
+    if diagnostics.iter().any(|diagnostic| {
+        diagnostic.reasons.iter().any(|reason| {
+            matches!(
+                reason,
+                QualityReason::DegenerateOrInverted | QualityReason::ShortEdge
+            )
+        })
+    }) {
+        blockers.push("degenerate_or_short_trial_geometry".into());
+    }
+    blockers
 }
 fn key(a: usize, b: usize) -> [usize; 2] {
     if a < b {
@@ -135,106 +189,17 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
     let mut vertices = model.vertices.clone();
     let axes = &source.axis_assembly.axes;
     let contacts = &source.axis_assembly.contacts;
-    let mut axis_nodes = Vec::new();
-    for axis in axes {
-        let mut chain: Vec<_> = axis.anchors.iter().map(|a| (a.t, a.vertex)).collect();
-        sorted(&mut chain, &vertices, eps)?;
-        if chain.len() < 2 {
-            return Err("empty axis");
-        }
-        axis_nodes.push(subdivide(
-            &chain,
-            &mut vertices,
-            policy.boundary_spacing,
-            policy.maximum_added_vertices_per_surface,
-            eps,
-        )?);
-    }
-    let mut owners = vec![BTreeSet::new(); model.edges.len()];
-    for (s, surface) in model.surfaces.iter().enumerate() {
-        for edge in surface.boundaries.iter().flatten() {
-            owners[edge.edge].insert(s);
-        }
-    }
-    let mut edge_nodes = Vec::new();
-    for (e, &[a, b]) in model.edges.iter().enumerate() {
-        let mut chain = vec![(0., a), (1., b)];
-        let pa = point(&vertices[a]);
-        let pb = point(&vertices[b]);
-        for c in contacts {
-            let (surface, candidates) = match *c {
-                Contact::Point {
-                    vertex, surface, ..
-                } => (surface, vec![vertex]),
-                Contact::Interval {
-                    axis,
-                    surface,
-                    start_t,
-                    end_t,
-                    ..
-                } => (
-                    surface,
-                    axis_nodes[axis]
-                        .iter()
-                        .filter(|(t, _)| *t >= start_t && *t <= end_t)
-                        .map(|(_, n)| *n)
-                        .collect(),
-                ),
-            };
-            if !owners[e].contains(&surface) {
-                continue;
-            }
-            for node in candidates {
-                if let Some(t) = parameter(point(&vertices[node]), pa, pb, eps) {
-                    chain.push((t, node));
-                }
-            }
-        }
-        sorted(&mut chain, &vertices, eps)?;
-        edge_nodes.push(subdivide(
-            &chain,
-            &mut vertices,
-            policy.boundary_spacing,
-            policy.maximum_added_vertices_per_surface,
-            eps,
-        )?);
-    }
-    // Shared boundary subdivisions also become bar nodes where incidence is known.
-    for c in contacts {
-        if let Contact::Interval {
-            axis,
-            surface,
-            start_t,
-            end_t,
-            ..
-        } = *c
-        {
-            let [a, b] = axes[axis].endpoints;
-            for edge in model.surfaces[surface].boundaries.iter().flatten() {
-                for &(_, node) in &edge_nodes[edge.edge] {
-                    if let Some(t) = parameter(
-                        point(&vertices[node]),
-                        point(&vertices[a]),
-                        point(&vertices[b]),
-                        eps,
-                    ) {
-                        if t >= start_t && t <= end_t {
-                            axis_nodes[axis].push((t, node));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for chain in &mut axis_nodes {
-        sorted(chain, &vertices, eps)?;
-    }
+    let synchronized = constraints::synchronize(model, axes, contacts, &mut vertices, policy, eps)?;
+    let mut axis_nodes = synchronized.axis_nodes;
+    let edge_nodes = synchronized.edge_nodes;
+    let constraint_synchronization = synchronized.report;
     let mut triangles = Vec::new();
     let mut blockers = Vec::new();
     let mut topology_valid = true;
     let mut minimum_angle = 180.0_f64;
     let mut max_area = 0.0_f64;
     let mut maximum_edge_ratio = 0.0_f64;
+    let mut quality_diagnostics = Vec::new();
     for (s, surface) in model.surfaces.iter().enumerate() {
         let support = &model.planes[surface.plane];
         // A boundary-aligned, local numerical chart avoids loss of significant
@@ -481,9 +446,11 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
             let p = ids.map(|n| point(&vertices[n]));
             let normal = (p[1] - p[0]).cross(p[2] - p[0]);
             let ar = normal.length() / 2.;
+            let mut reasons = Vec::new();
             if !ar.is_finite() || ar <= eps * eps || normal.dot(point(&plane.normal)) <= 0. {
                 minimum_angle = 0.;
                 blockers.push(format!("degenerate_or_inverted_triangle: surface={s}"));
+                reasons.push(QualityReason::DegenerateOrInverted);
             }
             let lengths = [
                 p[0].distance(p[1]),
@@ -496,20 +463,55 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
                 maximum_edge_ratio = maximum_edge_ratio.max(longest / shortest);
             } else {
                 blockers.push(format!("short_triangle_edge: surface={s}"));
+                reasons.push(QualityReason::ShortEdge);
             }
             area += ar;
             max_area = max_area.max(ar);
+            let mut triangle_minimum_angle = 180.0_f64;
             for i in 0..3 {
-                let angle = (p[(i + 1) % 3] - p[i])
-                    .normalize()
-                    .dot((p[(i + 2) % 3] - p[i]).normalize())
-                    .clamp(-1., 1.)
-                    .acos()
-                    .to_degrees();
+                let angle = if lengths[(i + 1) % 3] > eps && lengths[(i + 2) % 3] > eps {
+                    (p[(i + 1) % 3] - p[i])
+                        .normalize()
+                        .dot((p[(i + 2) % 3] - p[i]).normalize())
+                        .clamp(-1., 1.)
+                        .acos()
+                        .to_degrees()
+                } else {
+                    0.
+                };
+                triangle_minimum_angle = triangle_minimum_angle.min(angle);
                 minimum_angle = minimum_angle.min(angle);
                 *counts
                     .entry(key(ids[i], ids[(i + 1) % 3]))
                     .or_insert(0usize) += 1;
+            }
+            if triangle_minimum_angle + 1e-7 < policy.minimum_angle_degrees {
+                reasons.push(QualityReason::MinimumAngle);
+            }
+            if ar > policy.maximum_area * (1. + 1e-7) {
+                reasons.push(QualityReason::MaximumArea);
+            }
+            if !reasons.is_empty() {
+                let constrained_edges = (0..3)
+                    .map(|i| key(ids[i], ids[(i + 1) % 3]))
+                    .filter(|edge| constraints.contains(edge) || boundary.contains(edge))
+                    .collect();
+                let edge_ratio = if shortest.is_finite() && shortest > eps {
+                    longest / shortest
+                } else {
+                    f64::INFINITY
+                };
+                quality_diagnostics.push(QualityDiagnostic {
+                    surface: s,
+                    source_elements: surface.source_elements.clone(),
+                    vertices: ids,
+                    source_nodes: ids.map(|n| source.vertex_source_nodes.get(n).copied()),
+                    constrained_edges,
+                    area: ar,
+                    minimum_angle_degrees: triangle_minimum_angle,
+                    edge_ratio,
+                    reasons,
+                });
             }
             used.extend(ids);
             triangles.push(Triangle {
@@ -567,6 +569,9 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
     if max_area > policy.maximum_area * (1. + 1e-7) {
         blockers.push("maximum_area_not_met".into());
     }
+    let external_mesher_blockers =
+        compute_external_mesher_blockers(topology_valid, &triangles, &quality_diagnostics);
+    let external_mesher_ready = external_mesher_blockers.is_empty();
     Ok(Report {
         policy: policy.clone(),
         vertices,
@@ -583,6 +588,10 @@ pub fn build(source: &assembly::Report, policy: &Policy) -> Result<Report, &'sta
         topology_valid,
         quality_passed,
         blockers,
+        quality_diagnostics,
+        constraint_synchronization,
+        external_mesher_ready,
+        external_mesher_blockers,
         export_ready: false,
     })
 }

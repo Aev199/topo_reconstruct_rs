@@ -1,7 +1,8 @@
-# Mesh quality: source review, 2026-09-15
+# Mesh quality: source review, 2026-09-16
 
-Status: real-fragment rerun completed; the mesh is topologically valid but is
-still rejected by the strict quality gate.
+Status: real-fragment rerun completed; the mesh is topologically valid. It is
+still rejected by the strict local quality gate, while the separate external
+mesher handoff gate is ready.
 
 ## Evidence in current source
 
@@ -40,6 +41,13 @@ minimum-required-area hint, relative to the configured maximum area, prevents
 an acute constrained fan from endlessly producing microscopic triangles. The
 quality gate still evaluates every emitted triangle and does not accept this
 fragment.
+
+The report now separates this local result from the external handoff. The
+`external_mesher_ready` gate ignores only the configured angle/area quality
+warnings; it still blocks an empty or topologically invalid trial mesh and
+degenerate or too-short emitted geometry. On the current fragment it is true
+with no external-mesher blockers. This is not an exporter or a waiver of the
+strict quality profile, and `export_ready` remains false.
 
 ## Next implementation
 

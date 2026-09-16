@@ -6,6 +6,7 @@ pub mod graph;
 pub mod mesh;
 pub mod planes;
 pub mod recognize;
+pub mod reconcile;
 
 use geo::{Contains, Intersects, Line, LineString, Polygon};
 use glam::DVec3;

@@ -212,6 +212,14 @@ fn propose(
     let cosine = reference.normalize().dot(up).abs();
     let direction = if short {
         reference.normalize()
+    } else if fixed.len() >= 2 {
+        // Once both endpoints are fixed by already accepted geometry, their
+        // exact chord is the only line that satisfies both endpoint
+        // constraints.  This is especially important for a branch at a
+        // structural joint: snapping a nearly vertical/horizontal branch to
+        // the preferred global direction can create a false collinearity
+        // rejection.  The angular check below still rejects a real conflict.
+        raw.normalize()
     } else if axis.constructive_segment {
         raw.normalize()
     } else if cosine >= source.policy.angle.cos() {
@@ -986,6 +994,86 @@ mod tests {
                 < 1e-7
         );
     }
+
+    #[test]
+    fn fixed_branch_uses_exact_endpoint_chord_before_preferred_direction() {
+        let mesh = MeshData {
+            nodes: BTreeMap::from([(1, DVec3::ZERO), (2, DVec3::new(1e-7, 0., -4.))])
+                .into_iter()
+                .collect(),
+            elements: vec![ElementData {
+                id: 1,
+                elem_type: 10,
+                stiff_id: 5,
+                nodes: vec![1, 2],
+            }],
+        };
+        let axis = frame::Axis {
+            constructive_segment: false,
+            endpoints: [0, 1],
+            anchors: vec![
+                frame::Anchor { node: 0, t: 0. },
+                frame::Anchor { node: 1, t: 1. },
+            ],
+            spans: vec![SourceSpan {
+                element: 1,
+                stiffness: 5,
+                start_t: 0.,
+                end_t: 1.,
+            }],
+        };
+        let source = frame::Report {
+            sliding_parameters: None,
+            nonlinear_steps: 0,
+            candidate_parameters_valid: true,
+            policy: frame::Policy {
+                up: DVec3::Z.to_array(),
+                angle: 0.02,
+                maximum_movement: 0.15,
+                relative_movement: 0.05,
+                minimum_length: 0.03,
+                residual_tolerance: 1e-7,
+                iterations: 10,
+            },
+            accepted: true,
+            candidate_constraints_satisfied: true,
+            violating_equations: 0,
+            largest_constraint_failures: vec![],
+            movement_failures: vec![],
+            axis_failures: vec![],
+            reason: "test".into(),
+            iterations: 0,
+            candidate_max_residual: 0.,
+            candidate_maximum_movement: 0.,
+            candidate_over_budget_node_ids: vec![],
+            maximum_movement: 0.15,
+            node_ids: vec![1, 2],
+            reference_points: vec![[0., 0., 0.], [1e-7, 0., -4.]],
+            candidate_points: vec![[0., 0., 0.], [1e-7, 0., -4.]],
+            candidate_planes: vec![],
+            points: vec![[0., 0., 0.], [1e-7, 0., -4.]],
+            axes: vec![axis.clone()],
+            surfaces: vec![],
+            plane_families: vec![],
+            equation_count: 0,
+            short_axis_indices: vec![],
+        };
+        let locked = BTreeMap::from([(1, DVec3::ZERO), (2, DVec3::new(1e-7, 0., -4.))]);
+        let proposal = propose(
+            &mesh,
+            &source,
+            &axis,
+            &locked,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &[],
+            &policy(1.),
+        )
+        .expect("the exact fixed endpoint chord is a valid branch");
+        assert_eq!(proposal.points[&1], DVec3::ZERO);
+        assert_eq!(proposal.points[&2], DVec3::new(1e-7, 0., -4.));
+    }
+
     #[test]
     fn coplanar_intervals_respect_holes_and_boundary_roles() {
         let contours = vec![

@@ -112,6 +112,22 @@ fn fe_to_mesh_preserves_opening_properties_and_shared_joints() {
             assert!(mesh.maximum_edge_ratio.is_finite() && mesh.maximum_edge_ratio >= 1.0);
             assert_eq!(topology.preview.surfaces().len(), 4);
             assert_eq!(topology.axis_assembly.axes.len(), 3);
+            let interval_contacts = topology
+                .axis_assembly
+                .contacts
+                .iter()
+                .filter(|contact| matches!(contact, assembly::bars::Contact::Interval { .. }))
+                .count();
+            assert!(mesh.constraint_synchronization.shared_edge_count > 0);
+            assert_eq!(
+                mesh.constraint_synchronization.interval_contact_count,
+                interval_contacts
+            );
+            assert_eq!(
+                mesh.constraint_synchronization
+                    .synchronized_interval_endpoints,
+                interval_contacts * 2
+            );
             assert_eq!(
                 topology
                     .preview
@@ -121,6 +137,12 @@ fn fe_to_mesh_preserves_opening_properties_and_shared_joints() {
                     .count(),
                 1
             );
+            assert!(
+                mesh.external_mesher_ready,
+                "{:?}",
+                mesh.external_mesher_blockers
+            );
+            assert!(mesh.external_mesher_blockers.is_empty());
             assert_eq!(
                 mesh.triangles
                     .iter()
@@ -189,6 +211,13 @@ fn rejects_incomplete_geometry_and_reports_quality_failure() {
     };
     let m = mesh::build(&topology, &policy).unwrap();
     assert!(!m.quality_passed);
+    assert!(m.external_mesher_ready, "{:?}", m.external_mesher_blockers);
+    assert!(m.external_mesher_blockers.is_empty());
+    assert!(!m.quality_diagnostics.is_empty());
+    assert!(m
+        .quality_diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.source_elements.is_empty()));
     topology.all_surface_patches_built = false;
     policy.maximum_area = 0.5;
     assert!(mesh::build(&topology, &policy).is_err());

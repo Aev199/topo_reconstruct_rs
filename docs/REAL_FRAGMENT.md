@@ -36,7 +36,7 @@ Next: reconcile the frame and shared-anchor numerical acceptance criteria,
 then rerun the mesh gate with both rejected axes retained. Do not silently
 remove those axes or interpret a cut-fragment result as global success.
 
-## Latest rerun (2026-09-15)
+## Latest rerun (2026-09-16)
 
 The uploaded `скала1.txt` was parsed and rerun with the current v2 pipeline.
 The full preview recognizes 348 axes with no recognition rejections. The
@@ -49,7 +49,10 @@ The mesh gate now reaches the emitted FE-candidate mesh. It contains 1065
 triangles, 708 bar elements and 4336 vertices; `topology_valid=true`, while
 `quality_passed=false` because the minimum angle is 12.17047° against the
 20° profile threshold. The maximum triangle area is 0.492107 m² against the
-0.5 m² limit, and the maximum edge ratio is 4.62125. `export_ready` remains
+0.5 m² limit, and the maximum edge ratio is 4.62125. The independent handoff
+gate reports `external_mesher_ready=true` with no
+`external_mesher_blockers`: this local angle warning does not by itself block
+passing the checked geometry to an external mesher. `export_ready` remains
 false. The run also exercises a guard for the upstream Spade 2.15.1 panic
 (`Failed to locate position`); a conservative retry prevents that library
 failure from aborting the report.

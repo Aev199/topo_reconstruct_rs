@@ -67,10 +67,14 @@ struct Args {
     v2_iterations: usize,
 }
 
-fn run_v2_preview(input: &str, output: &str, iterations: usize) -> Result<(), Box<dyn std::error::Error>> {
+fn run_v2_preview(
+    input: &str,
+    output: &str,
+    iterations: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     use topo_reconstruct_rs::{
         parsers::LiraParser as V2LiraParser,
-        reconstruction::{assembly, frame, graph, planes, recognize},
+        reconstruction::{assembly, frame, graph, planes, recognize, reconcile},
     };
 
     if iterations == 0 {
@@ -117,10 +121,13 @@ fn run_v2_preview(input: &str, output: &str, iterations: usize) -> Result<(), Bo
             minimum_edge: 0.001,
         },
     )?;
+    let reconciliation =
+        reconcile::solve(&mesh, &result, &topology, &reconcile::Policy::default())?;
     let report = serde_json::json!({
         "constraint_graph": graph::Graph::from_frame(&result),
         "frame": result,
         "topology": topology,
+        "reconciliation": reconciliation,
         "axis_recognition": axes,
         "plane_recognition": plane_report,
     });

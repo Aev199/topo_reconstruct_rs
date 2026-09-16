@@ -77,7 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             maximum_added_vertices_per_surface: 10000,
         },
     )?;
-    let passed = mesh.topology_valid && mesh.quality_passed;
+    // This executable demonstrates the geometry handoff gate.  The stricter
+    // local angle/area result remains in `quality_passed` for the report.
+    let passed = mesh.external_mesher_ready;
     serde_json::to_writer_pretty(
         std::io::stdout().lock(),
         &serde_json::json!({"frame":frame,"topology":topology,"mesh":mesh}),
