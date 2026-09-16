@@ -329,6 +329,50 @@ pub fn solve(
     solve_impl(mesh, axes, planes, policy, 0)
 }
 
+/// Retry only a numerically incomplete continuous solve with a bounded LSQR
+/// budget. Tolerances, source coordinates and movement budgets are unchanged;
+/// structural, length and budget failures are returned immediately.
+pub fn solve_with_retry(
+    mesh: &MeshData,
+    axes: &recognize::Report,
+    planes: &planes::Report,
+    policy: &Policy,
+    maximum_attempts: usize,
+) -> Result<Report, &'static str> {
+    if maximum_attempts == 0 {
+        return Err("frame retry limit must be positive");
+    }
+    let mut attempt_policy = policy.clone();
+    let mut best = None;
+    for attempt in 0..maximum_attempts {
+        let result = solve(mesh, axes, planes, &attempt_policy)?;
+        let improved = best.as_ref().is_none_or(|previous: &Report| {
+            result.candidate_max_residual < previous.candidate_max_residual
+        });
+        if improved {
+            best = Some(result.clone());
+        }
+        let retryable = !result.accepted
+            && result.candidate_parameters_valid
+            && result.movement_failures.is_empty()
+            && result.axis_failures.is_empty()
+            && result.violating_equations > 0
+            && result.candidate_max_residual.is_finite()
+            && result.candidate_max_residual > attempt_policy.residual_tolerance;
+        if !retryable || !improved || attempt + 1 == maximum_attempts {
+            break;
+        }
+        let Some(iterations) = attempt_policy.iterations.checked_mul(2) else {
+            break;
+        };
+        if iterations <= attempt_policy.iterations {
+            break;
+        }
+        attempt_policy.iterations = iterations;
+    }
+    best.ok_or("frame solve produced no result")
+}
+
 /// Joint line/point/plane proposal with free interior line parameters.
 /// No topology repair or automatic acceptance into the assembly pipeline.
 pub fn solve_sliding(
@@ -1037,6 +1081,40 @@ mod tests {
             Err("sliding frame is proposal-only until parameter transfer is implemented")
         ));
     }
+
+    #[test]
+    fn retry_doubles_only_a_numerical_iteration_budget() {
+        let mesh = source();
+        let axes = recognize::recognize(
+            &mesh,
+            &recognize::Policy {
+                angle: 0.02,
+                line_tolerance: 0.01,
+                numerical_precision: 1e-8,
+            },
+        )
+        .unwrap();
+        let planes = planes::recognize(
+            &mesh,
+            &planes::Policy {
+                angle: 0.02,
+                distance: 0.01,
+                precision: 1e-8,
+            },
+        )
+        .unwrap();
+        let mut policy = policy();
+        policy.iterations = 1;
+        let first = solve(&mesh, &axes, &planes, &policy).unwrap();
+        assert!(!first.accepted);
+        let retried = solve_with_retry(&mesh, &axes, &planes, &policy, 12).unwrap();
+        assert!(retried.accepted, "{}", retried.candidate_max_residual);
+        assert!(retried.iterations > policy.iterations);
+        assert_eq!(retried.policy.residual_tolerance, policy.residual_tolerance);
+        assert_eq!(retried.policy.maximum_movement, policy.maximum_movement);
+        assert_eq!(retried.policy.minimum_length, policy.minimum_length);
+    }
+
     fn policy() -> Policy {
         Policy {
             up: [0., 0., 1.],

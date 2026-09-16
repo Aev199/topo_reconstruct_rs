@@ -97,7 +97,9 @@ fn run_v2_preview(
             precision: 1e-8,
         },
     )?;
-    let result = frame::solve(
+    // A finite residual with no movement/axis failure is retried with a
+    // doubled LSQR budget. The tolerance and all geometric budgets stay fixed.
+    let result = frame::solve_with_retry(
         &mesh,
         &axes,
         &plane_report,
@@ -110,6 +112,7 @@ fn run_v2_preview(
             residual_tolerance: 1e-7,
             iterations,
         },
+        3,
     )?;
     let topology = assembly::assemble(
         &mesh,

@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         return Ok(());
     }
-    let result = frame::solve(&mesh, &axes, &planes, &policy)?;
+    let result = frame::solve_with_retry(&mesh, &axes, &planes, &policy, 3)?;
     let topology = assembly::assemble(
         &mesh,
         &result,
