@@ -302,6 +302,8 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         surface_stiffness: vec![10],
         pinched_region_splits: vec![],
         hole_recovery: vec![],
+        feature_policy: None,
+        simplified_holes: vec![],
         axis_assembly: assembly::bars::Report::default(),
         issues: vec![],
         maximum_closure_movement: 0.,

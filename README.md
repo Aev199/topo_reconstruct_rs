@@ -611,3 +611,12 @@ cargo run -- --v2-mesh-preview-json full-mesh-preview.json model.txt
 ```sh
 python3 scripts/check_v2_assembly.py full-mesh-preview.json
 ```
+
+
+### Геотехнический приоритет геометрии
+
+V2 по умолчанию применяет контролируемое закрытие численно вырожденных отверстий.
+Исходные узлы примыканий сохраняются как ограничения сетки; каждое упрощение
+записывается в `topology.simplified_holes`. Для строгого сохранения деталей есть
+`--v2-preserve-details`. Политика, проверенные результаты полной «скала1» и границы
+готовности описаны в [GEOTECHNICAL_GEOMETRY.md](docs/GEOTECHNICAL_GEOMETRY.md).

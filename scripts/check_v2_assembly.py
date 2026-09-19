@@ -265,6 +265,16 @@ def check(data, baseline=None):
         else:
             assert data.get("mesh_error") is None
             result["mesh"] = check_mesh(mesh, model, bars)
+            # Removed material boundaries must not erase shared source joints.
+            for hole in topology.get("simplified_holes", []):
+                surfaces = [i for i, surface in enumerate(model["surfaces"])
+                            if surface["source_elements"] == hole["source_elements"]]
+                assert len(surfaces) == 1
+                used = {v for tri in mesh["triangles"] if tri["surface"] == surfaces[0]
+                        for v in tri["vertices"]}
+                if mesh["topology_valid"]:
+                    assert all(source_nodes.index(n) in used for n in hole["source_nodes"])
+
     return result
 
 
@@ -280,3 +290,4 @@ if __name__ == "__main__":
         with open(args.baseline, encoding="utf-8") as stream:
             baseline = json.load(stream)
     print(json.dumps(check(data, baseline), ensure_ascii=False, indent=2))
+

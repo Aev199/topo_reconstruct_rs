@@ -1,9 +1,11 @@
 //! Surface topology preview. Engineering closure tolerance is distinct from
 //! numerical planarity. Mechanical ties and mesh readiness are not inferred.
 pub mod bars;
+mod features;
 mod holes;
 use super::{frame, planes, Model, PlaneFrame};
 use crate::input::MeshData;
+pub use features::{FeaturePolicy, SimplifiedHole};
 use glam::DVec3;
 pub use holes::{HoleConstraint, HoleNodeChange, HoleOutcome, HoleRecovery};
 use serde::Serialize;
@@ -45,6 +47,8 @@ pub struct Report {
     pub surface_stiffness: Vec<u32>,
     pub pinched_region_splits: Vec<RegionSplit>,
     pub hole_recovery: Vec<HoleRecovery>,
+    pub feature_policy: Option<FeaturePolicy>,
+    pub simplified_holes: Vec<SimplifiedHole>,
     pub axis_assembly: bars::Report,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
@@ -384,6 +388,32 @@ pub fn assemble(
     source: &frame::Report,
     policy: &Policy,
 ) -> Result<Report, &'static str> {
+    assemble_impl(mesh, source, policy, None)
+}
+
+pub fn assemble_geotechnical(
+    mesh: &MeshData,
+    source: &frame::Report,
+    policy: &Policy,
+    features: &FeaturePolicy,
+) -> Result<Report, &'static str> {
+    if !features.maximum_source_width.is_finite()
+        || features.maximum_source_width <= 0.
+        || !features.maximum_filled_area_ratio.is_finite()
+        || features.maximum_filled_area_ratio <= 0.
+        || features.maximum_filled_area_ratio >= 1.
+    {
+        return Err("invalid feature simplification policy");
+    }
+    assemble_impl(mesh, source, policy, Some(features))
+}
+
+fn assemble_impl(
+    mesh: &MeshData,
+    source: &frame::Report,
+    policy: &Policy,
+    features: Option<&FeaturePolicy>,
+) -> Result<Report, &'static str> {
     if source.sliding_parameters.is_some() {
         return Err("sliding frame is proposal-only until parameter transfer is implemented");
     }
@@ -571,7 +601,8 @@ pub fn assemble(
     }
     let mut surface_source_patches = vec![];
     let mut surface_stiffness = vec![];
-    for (region, loops) in rings {
+    let mut simplified_holes = vec![];
+    for (region, mut loops) in rings {
         let (patch, stiffness, ids) = &regions[region];
         let patch = *patch;
         if loops.iter().flatten().any(|n| !vertices.contains_key(n)) {
@@ -584,6 +615,20 @@ pub fn assemble(
             continue;
         }
         let plane = &closed_supports[support_representatives[patch]];
+        let changes = if let Some(features) = features {
+            features::simplify(
+                &mut loops,
+                mesh,
+                &closed_points,
+                plane,
+                policy.precision,
+                features,
+                patch,
+                ids,
+            )
+        } else {
+            vec![]
+        };
         let area = |ring: &Vec<u32>| ring_area(ring, plane, |n| model.vertices[vertices[&n]]);
         let degenerate_hole = loops
             .iter()
@@ -596,6 +641,7 @@ pub fn assemble(
             .collect();
         match model.add_surface(plane_id, mapped, ids.clone()) {
             Ok(_) => {
+                simplified_holes.extend(changes);
                 surface_source_patches.push(patch);
                 surface_stiffness.push(*stiffness);
             }
@@ -632,6 +678,8 @@ pub fn assemble(
         surface_stiffness,
         pinched_region_splits,
         hole_recovery,
+        feature_policy: features.cloned(),
+        simplified_holes,
         axis_assembly,
         issues,
         maximum_closure_movement,
@@ -1212,6 +1260,35 @@ mod tests {
         assert_eq!(result.issues[0].reason, "degenerate_hole_after_closure");
         assert_eq!(result.hole_recovery[0].outcome, HoleOutcome::MovementBudget);
         assert_eq!(result.issues[0].source_elements, vec![1, 2, 3]);
+        let repaired =
+            assemble_geotechnical(&mesh, &f, &policy, &FeaturePolicy::default()).unwrap();
+        assert!(repaired.all_surface_patches_built);
+        assert_eq!(repaired.preview.surfaces[0].contours.len(), 1);
+        assert_eq!(repaired.preview.surfaces[0].source_elements, vec![1, 2, 3]);
+        assert_eq!(repaired.simplified_holes.len(), 1);
+        assert_eq!(repaired.preview.vertices, result.preview.vertices);
+        let trial = crate::reconstruction::mesh::build(
+            &repaired,
+            &crate::reconstruction::mesh::Policy {
+                boundary_spacing: 0.5,
+                maximum_area: 0.5,
+                minimum_angle_degrees: 20.,
+                maximum_added_vertices_per_surface: 1000,
+            },
+        )
+        .unwrap();
+        assert!(trial.topology_valid);
+        let used: BTreeSet<_> = trial.triangles.iter().flat_map(|t| t.vertices).collect();
+        for n in &repaired.simplified_holes[0].source_nodes {
+            assert!(used.contains(
+                &repaired
+                    .vertex_source_nodes
+                    .iter()
+                    .position(|id| id == n)
+                    .unwrap()
+            ));
+        }
+
         assert!(result.issues[0].boundary_source_nodes.iter().any(|r| r
             .iter()
             .copied()

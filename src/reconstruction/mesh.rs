@@ -376,6 +376,33 @@ fn build_impl(
         let mut has_open_internal_constraint = false;
         let mut internal_constraint_edges = BTreeSet::new();
         let mut nodes = BTreeSet::new();
+        // Closing a collapsed opening removes only its material boundary.
+        // Keep its source vertices as interior constraints, including joints
+        // owned by neighboring surfaces or bars. Reuse existing shared edges.
+        let mut simplified_nodes = BTreeSet::new();
+        for hole in &source.simplified_holes {
+            if hole.source_elements != surface.source_elements {
+                continue;
+            }
+            for n in &hole.source_nodes {
+                let vertex = source
+                    .vertex_source_nodes
+                    .iter()
+                    .position(|id| id == n)
+                    .ok_or("missing simplified-hole junction")?;
+                simplified_nodes.insert(vertex);
+            }
+        }
+        nodes.extend(&simplified_nodes);
+        for (edge, endpoints) in model.edges.iter().enumerate() {
+            if endpoints.iter().all(|n| simplified_nodes.contains(n)) {
+                for pair in edge_nodes[edge].windows(2) {
+                    let segment = key(pair[0].1, pair[1].1);
+                    constraints.insert(segment);
+                    internal_constraint_edges.insert(segment);
+                }
+            }
+        }
         for edge in surface.boundaries.iter().flatten() {
             for pair in edge_nodes[edge.edge].windows(2) {
                 boundary.insert(key(pair[0].1, pair[1].1));

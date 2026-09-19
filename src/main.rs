@@ -69,6 +69,10 @@ struct Args {
     /// Экспериментальный v2: записать mesh-preview, включая частично собранную модель
     #[arg(long, value_name = "PATH")]
     v2_mesh_preview_json: Option<String>,
+
+    /// Сохранить даже вырожденные отверстия вместо геотехнического упрощения
+    #[arg(long)]
+    v2_preserve_details: bool,
 }
 
 fn run_v2_preview(
@@ -76,6 +80,7 @@ fn run_v2_preview(
     output: &str,
     iterations: usize,
     include_mesh: bool,
+    preserve_details: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use topo_reconstruct_rs::{
         parsers::LiraParser as V2LiraParser,
@@ -119,16 +124,22 @@ fn run_v2_preview(
         },
         3,
     )?;
-    let topology = assembly::assemble(
-        &mesh,
-        &result,
-        &assembly::Policy {
-            closure_tolerance: 0.001,
-            junction_movement_limit: 0.05,
-            precision: 1e-7,
-            minimum_edge: 0.001,
-        },
-    )?;
+    let assembly_policy = assembly::Policy {
+        closure_tolerance: 0.001,
+        junction_movement_limit: 0.05,
+        precision: 1e-7,
+        minimum_edge: 0.001,
+    };
+    let topology = if preserve_details {
+        assembly::assemble(&mesh, &result, &assembly_policy)?
+    } else {
+        assembly::assemble_geotechnical(
+            &mesh,
+            &result,
+            &assembly_policy,
+            &assembly::FeaturePolicy::default(),
+        )?
+    };
     let reconciliation =
         reconcile::solve(&mesh, &result, &topology, &reconcile::Policy::default())?;
     let (mesh_report, mesh_error) = if include_mesh {
@@ -190,7 +201,13 @@ fn main() {
             eprintln!("Нельзя одновременно задавать --v2-preview-json и --v2-mesh-preview-json.");
             std::process::exit(2);
         }
-        if let Err(error) = run_v2_preview(&args.input, path, args.v2_iterations, false) {
+        if let Err(error) = run_v2_preview(
+            &args.input,
+            path,
+            args.v2_iterations,
+            false,
+            args.v2_preserve_details,
+        ) {
             eprintln!("[V2 PREVIEW ERROR] {error}");
             std::process::exit(1);
         }
@@ -198,7 +215,13 @@ fn main() {
         return;
     }
     if let Some(path) = &args.v2_mesh_preview_json {
-        if let Err(error) = run_v2_preview(&args.input, path, args.v2_iterations, true) {
+        if let Err(error) = run_v2_preview(
+            &args.input,
+            path,
+            args.v2_iterations,
+            true,
+            args.v2_preserve_details,
+        ) {
             eprintln!("[V2 MESH PREVIEW ERROR] {error}");
             std::process::exit(1);
         }
