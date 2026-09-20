@@ -584,7 +584,7 @@ pub fn conform(model: &mut Model, precision: f64) -> Result<Report, &'static str
         push_unique_point(&mut split_points, segment.start, &segment.surfaces, precision);
         push_unique_point(&mut split_points, segment.end, &segment.surfaces, precision);
 
-        // Preserve the union of existing edge breakpoints along the junction.
+        // Preserve the union of existing owner-edge breakpoints along the junction.
         // Without this, one owner may keep [a-m, m-b] while the other receives
         // one long [a-b] constraint. Independent subdivision of those
         // overlapping edges would later create duplicate CDT points.
