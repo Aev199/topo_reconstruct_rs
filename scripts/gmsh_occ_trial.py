@@ -2436,6 +2436,110 @@ def self_test() -> dict:
     )
     assert unsupported["unintended_shared_node_count"] == 1
     assert unsupported["unsupported_axis_axis_shared_node_count"] == 1
+
+    # Near-vertex regularization regression. Node 1 is an explicit source
+    # corner only 10 mm from exact multi-surface OCC junction node 2. The
+    # source corner may move to the exact junction because the short edge
+    # creates a severe sliver and is not an original source boundary edge.
+    regularization_data = {
+        "surfaces": [
+            {
+                "rings": [[
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.02, 0.0],
+                    [0.0, 1.0, 0.0],
+                ]],
+                "ring_source_nodes": [[10, 11, 12]],
+            },
+            {
+                "rings": [[
+                    [0.01, 1.0, 0.0],
+                    [0.01, 0.0, 1.0],
+                    [0.01, 1.0, 1.0],
+                ]],
+                "ring_source_nodes": [[20, 21, 22]],
+            },
+        ]
+    }
+    regularization_coords = {
+        1: (0.0, 0.0, 0.0),
+        2: (0.01, 0.0, 0.0),
+        3: (1.0, 0.02, 0.0),
+        4: (0.0, 1.0, 0.0),
+        5: (0.01, 1.0, 0.0),
+        6: (0.01, 0.0, 1.0),
+        7: (0.01, 1.0, 1.0),
+    }
+    regularization_triangles = [
+        {"nodes": (1, 2, 3), "source_surface": 0, "output_surface": 1, "stiffness": 10},
+        {"nodes": (1, 3, 4), "source_surface": 0, "output_surface": 1, "stiffness": 10},
+        {"nodes": (2, 5, 6), "source_surface": 1, "output_surface": 2, "stiffness": 20},
+        {"nodes": (2, 6, 7), "source_surface": 1, "output_surface": 2, "stiffness": 20},
+    ]
+    (
+        regularized_coords,
+        regularized_triangles,
+        regularized_bars,
+        regularization_report,
+    ) = regularize_near_vertex_junctions(
+        regularization_data,
+        regularization_coords,
+        regularization_triangles,
+        [],
+        0.05,
+        0.001,
+        1e-8,
+    )
+    assert regularization_report["accepted_count"] == 1
+    assert regularization_report["moved_node_count"] == 1
+    assert regularization_report["maximum_node_movement"] < 0.05
+    assert len(regularized_triangles) == 3
+    assert regularized_bars == []
+    assert regularized_coords[2] == (0.01, 0.0, 0.0)
+
+    # An isolated geometric point coincidence with no common source node,
+    # shared surface edge or declared mixed-dimensional contact must be split
+    # by identity while preserving exactly the same coordinates.
+    point_data = {
+        "surfaces": [
+            {
+                "rings": [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
+                "ring_source_nodes": [[100, 101, 102]],
+            },
+            {
+                "rings": [[[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]]],
+                "ring_source_nodes": [[200, 201, 202]],
+            },
+        ],
+        "axes": [],
+        "contacts": [],
+    }
+    point_coords = {
+        1: (0.5, 0.5, 0.5),
+        2: (1.0, 0.0, 0.0),
+        3: (0.0, 1.0, 0.0),
+        4: (1.0, 0.0, 1.0),
+        5: (0.0, 1.0, 1.0),
+    }
+    point_triangles = [
+        {"nodes": (1, 2, 3), "source_surface": 0, "output_surface": 1, "stiffness": 10},
+        {"nodes": (1, 4, 5), "source_surface": 1, "output_surface": 2, "stiffness": 20},
+    ]
+    point_audit = audit_semantic_shared_nodes(
+        point_data, point_coords, point_triangles, [], 1e-8
+    )
+    assert point_audit["unintended_shared_node_count"] == 1
+    split_coords, split_triangles, split_bars, split_report = split_unintended_shared_nodes(
+        point_coords, point_triangles, [], point_audit
+    )
+    assert split_report["split_shared_node_count"] == 1
+    assert split_report["created_duplicate_node_count"] == 1
+    assert split_bars == []
+    assert len(split_coords) == len(point_coords) + 1
+    assert split_coords[1] in split_coords.values()
+    assert audit_semantic_shared_nodes(
+        point_data, split_coords, split_triangles, split_bars, 1e-8
+    )["unintended_shared_node_count"] == 0
     return result
 
 
