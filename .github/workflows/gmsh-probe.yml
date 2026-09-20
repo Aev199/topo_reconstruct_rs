@@ -24,6 +24,9 @@ jobs:
       - name: Download Gmsh wheel
         run: python -m pip download --no-deps gmsh==4.15.2 -d gmsh-wheel
 
+      - name: Install Gmsh runtime dependency
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libglu1-mesa
+
       - name: Install Gmsh
         run: python -m pip install --no-deps gmsh-wheel/*.whl
 
