@@ -1928,6 +1928,7 @@ def run_backend(
     policy = data["policy"]
     precision = float(policy["precision"])
     minimum_edge = float(policy["minimum_edge"])
+    junction_movement_limit = float(policy["junction_movement_limit"])
     mesh_size = float(policy["target_mesh_size"])
 
     gmsh.clear()
@@ -2059,16 +2060,32 @@ def run_backend(
     raw_quality = quality(coords, triangles)
     raw_shared = shared_mesh_edges_by_source(triangles)
     raw_contact_audit = audit_contacts(data, coords, triangles, bars, precision)
-    semantic_node_audit = audit_semantic_shared_nodes(
+    raw_semantic_node_audit = audit_semantic_shared_nodes(
         data, coords, triangles, bars, precision
     )
+
+    (
+        regularized_coords,
+        regularized_triangles,
+        regularized_bars,
+        junction_regularization,
+    ) = regularize_near_vertex_junctions(
+        data,
+        coords,
+        triangles,
+        bars,
+        junction_movement_limit,
+        minimum_edge,
+        precision,
+    )
+
     healed_triangles, node_mapping, healing = heal_micro_edges(
-        coords, triangles, minimum_edge, precision
+        regularized_coords, regularized_triangles, minimum_edge, precision
     )
 
     healed_bars = []
     removed_degenerate_bars = 0
-    for bar in bars:
+    for bar in regularized_bars:
         nodes = tuple(node_mapping.get(node, node) for node in bar["nodes"])
         if nodes[0] == nodes[1]:
             removed_degenerate_bars += 1
@@ -2076,26 +2093,43 @@ def run_backend(
         healed_bars.append({**bar, "nodes": nodes})
     healing["removed_degenerate_bars"] = removed_degenerate_bars
 
-    healed_quality = quality(coords, healed_triangles)
-    healed_shared = shared_mesh_edges_by_source(healed_triangles)
-    strict_healed_contact_audit = audit_contacts(
-        data, coords, healed_triangles, healed_bars, precision
+    semantic_before_point_split = audit_semantic_shared_nodes(
+        data, regularized_coords, healed_triangles, healed_bars, precision
     )
-    contact_audit = reconcile_healed_contact_audit(
+    (
+        final_coords,
+        final_triangles,
+        final_bars,
+        isolated_point_split,
+    ) = split_unintended_shared_nodes(
+        regularized_coords,
+        healed_triangles,
+        healed_bars,
+        semantic_before_point_split,
+    )
+    final_semantic_node_audit = audit_semantic_shared_nodes(
+        data, final_coords, final_triangles, final_bars, precision
+    )
+
+    final_quality = quality(final_coords, final_triangles)
+    final_shared = shared_mesh_edges_by_source(final_triangles)
+    strict_final_contact_audit = audit_contacts(
+        data, final_coords, final_triangles, final_bars, precision
+    )
+    contact_audit = reconcile_moved_contact_audit(
         data,
         raw_contact_audit,
-        strict_healed_contact_audit,
-        healing,
+        strict_final_contact_audit,
+        [junction_regularization, healing],
         precision,
-        minimum_edge,
     )
 
     used_nodes = sorted(
-        {node for triangle in healed_triangles for node in triangle["nodes"]}
-        | {node for bar in healed_bars for node in bar["nodes"]}
+        {node for triangle in final_triangles for node in triangle["nodes"]}
+        | {node for bar in final_bars for node in bar["nodes"]}
     )
     compact_index = {tag: index for index, tag in enumerate(used_nodes)}
-    compact_vertices = [coords[tag] for tag in used_nodes]
+    compact_vertices = [final_coords[tag] for tag in used_nodes]
     compact_triangles = [
         {
             "vertices": [compact_index[node] for node in triangle["nodes"]],
@@ -2103,7 +2137,7 @@ def run_backend(
             "source_surface": triangle["source_surface"],
             "stiffness": triangle["stiffness"],
         }
-        for triangle in healed_triangles
+        for triangle in final_triangles
     ]
     compact_bars = [
         {
@@ -2115,7 +2149,7 @@ def run_backend(
             "stiffness": bar["stiffness"],
             "source_elements": bar["source_elements"],
         }
-        for bar in healed_bars
+        for bar in final_bars
     ]
 
     solver_mesh, solver_mesh_audit = build_solver_mesh_package(
@@ -2146,7 +2180,7 @@ def run_backend(
         blockers.append("near_degenerate_triangle_after_healing")
     if contact_audit["failed_contact_count"]:
         blockers.append("nonconforming_bar_surface_contact")
-    if semantic_node_audit["unintended_shared_node_count"]:
+    if final_semantic_node_audit["unintended_shared_node_count"]:
         blockers.append("unintended_shared_mesh_node")
     if not solver_mesh_audit["clean"]:
         blockers.append("solver_mesh_coverage_failure")
@@ -2181,10 +2215,14 @@ def run_backend(
         "unmapped_output_surfaces": unmapped_output_surfaces,
         "physical_groups": groups,
         "contact_embedding": contact_embedding,
-        "bar_surface_contacts_before_healing": summarize_contact_audit(raw_contact_audit),
-        "semantic_shared_nodes_before_healing": semantic_node_audit,
-        "bar_surface_contacts_strict_after_healing": summarize_contact_audit(
-            strict_healed_contact_audit
+        "bar_surface_contacts_before_repairs": summarize_contact_audit(raw_contact_audit),
+        "semantic_shared_nodes_before_repairs": raw_semantic_node_audit,
+        "junction_regularization": junction_regularization,
+        "semantic_shared_nodes_before_point_split": semantic_before_point_split,
+        "isolated_point_split": isolated_point_split,
+        "semantic_shared_nodes_after_repairs": final_semantic_node_audit,
+        "bar_surface_contacts_strict_after_repairs": summarize_contact_audit(
+            strict_final_contact_audit
         ),
         "raw_mesh": {
             **raw_quality,
@@ -2196,10 +2234,10 @@ def run_backend(
         "solver_mesh_audit": solver_mesh_audit,
         "solver_mesh": solver_mesh,
         "mesh": {
-            **healed_quality,
+            **final_quality,
             "bar_count": len(compact_bars),
-            "shared_surface_pair_count": len(healed_shared),
-            "shared_mesh_edge_count": sum(healed_shared.values()),
+            "shared_surface_pair_count": len(final_shared),
+            "shared_mesh_edge_count": sum(final_shared.values()),
             "vertices": compact_vertices,
             "triangles": compact_triangles,
             "bars": compact_bars,
