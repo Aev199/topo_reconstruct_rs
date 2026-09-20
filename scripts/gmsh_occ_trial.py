@@ -247,7 +247,7 @@ def heal_micro_edges(
     triangles: list[dict],
     minimum_edge: float,
     precision: float,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[dict], dict[int, int], dict]:
     """Collapse only proven junction-local sub-resolution edge components.
 
     A component is eligible only when it contains an already shared node owned
@@ -351,7 +351,7 @@ def heal_micro_edges(
             continue
         healed.append({**triangle, "nodes": nodes})
 
-    return healed, {
+    return healed, mapping, {
         "minimum_edge": minimum_edge,
         "short_edge_count_before": len(short_edges),
         "component_count": len(components),
@@ -537,7 +537,7 @@ def run_backend(
 
     raw_quality = quality(coords, triangles)
     raw_shared = shared_mesh_edges_by_source(triangles)
-    healed_triangles, healing = heal_micro_edges(
+    healed_triangles, node_mapping, healing = heal_micro_edges(
         coords, triangles, minimum_edge, precision
     )
     healed_quality = quality(coords, healed_triangles)
@@ -679,10 +679,11 @@ def self_test() -> dict:
         {"nodes": (1, 3, 6), "source_surface": 1, "output_surface": 2, "stiffness": 20},
         {"nodes": (1, 6, 7), "source_surface": 1, "output_surface": 2, "stiffness": 20},
     ]
-    healed, report = heal_micro_edges(coords, triangles, 0.001, 1e-8)
+    healed, mapping, report = heal_micro_edges(coords, triangles, 0.001, 1e-8)
     assert report["collapsed_component_count"] == 1
     assert report["unresolved_component_count"] == 0
     assert report["maximum_node_movement"] < 0.001
+    assert mapping == {2: 1, 3: 1}
     assert all(1 in triangle["nodes"] for triangle in healed)
     return result
 
