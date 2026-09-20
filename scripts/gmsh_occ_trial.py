@@ -155,6 +155,129 @@ def add_surface(surface: dict) -> int:
     return gmsh.model.occ.addPlaneSurface(wires)
 
 
+def axis_point(axis: dict, t: float) -> tuple[float, float, float]:
+    a = axis["endpoints"][0]
+    b = axis["endpoints"][1]
+    return tuple(float(a[i]) + t * (float(b[i]) - float(a[i])) for i in range(3))
+
+
+def axis_length(axis: dict) -> float:
+    return distance(axis["endpoints"][0], axis["endpoints"][1])
+
+
+def unique_parameters(values: Iterable[float], length: float, precision: float) -> list[float]:
+    ordered = sorted(float(value) for value in values)
+    result = []
+    for value in ordered:
+        if not math.isfinite(value) or value < -precision / max(length, precision) or value > 1.0 + precision / max(length, precision):
+            raise ValueError("axis split parameter outside endpoints")
+        value = min(1.0, max(0.0, value))
+        if not result or abs(value - result[-1]) * length > precision:
+            result.append(value)
+    return result
+
+
+def build_axis_curve_inputs(
+    axes: list[dict],
+    contacts: list[dict],
+    precision: float,
+) -> tuple[list[tuple[int, int]], list[dict], list[str]]:
+    """Create property/contact-aware OCC curve pieces for all reconstructed axes."""
+
+    entities: list[tuple[int, int]] = []
+    curve_inputs: list[dict] = []
+    blockers: list[str] = []
+    contacts_by_axis: dict[int, list[dict]] = defaultdict(list)
+    for contact in contacts:
+        contacts_by_axis[int(contact["axis"])].append(contact)
+
+    for axis_index, axis in enumerate(axes):
+        length = axis_length(axis)
+        if not math.isfinite(length) or length <= precision:
+            blockers.append(f"degenerate_axis:{axis_index}")
+            continue
+
+        cuts = [0.0, 1.0]
+        for span in axis.get("property_spans", []):
+            cuts.extend((float(span["start_t"]), float(span["end_t"])))
+        for anchor in axis.get("anchors", []):
+            cuts.append(float(anchor["t"]))
+        for contact in contacts_by_axis.get(axis_index, []):
+            if contact["kind"] == "point":
+                cuts.append(float(contact["t"]))
+            elif contact["kind"] == "interval":
+                cuts.extend((float(contact["start_t"]), float(contact["end_t"])))
+
+        try:
+            cuts = unique_parameters(cuts, length, precision)
+        except ValueError:
+            blockers.append(f"invalid_axis_parameter:{axis_index}")
+            continue
+
+        point_tags = {
+            t: gmsh.model.occ.addPoint(*axis_point(axis, t))
+            for t in cuts
+        }
+        tolerance = precision / length
+        spans = axis.get("property_spans", [])
+        for start_t, end_t in zip(cuts, cuts[1:]):
+            if end_t - start_t <= tolerance:
+                continue
+            midpoint = 0.5 * (start_t + end_t)
+            active = [
+                span
+                for span in spans
+                if float(span["start_t"]) - tolerance <= midpoint <= float(span["end_t"]) + tolerance
+            ]
+            if not active:
+                blockers.append(
+                    f"axis_interval_without_property:axis={axis_index},start={start_t},end={end_t}"
+                )
+                continue
+            stiffnesses = {int(span["stiffness"]) for span in active}
+            if len(stiffnesses) != 1:
+                blockers.append(
+                    f"axis_interval_property_conflict:axis={axis_index},start={start_t},end={end_t}"
+                )
+                continue
+
+            tag = gmsh.model.occ.addLine(point_tags[start_t], point_tags[end_t])
+            source_elements = sorted(
+                {int(span["source_element"]) for span in active}
+            )
+            curve_inputs.append(
+                {
+                    "input_curve": len(curve_inputs),
+                    "axis": axis_index,
+                    "source_axis": int(axis["source_axis"]),
+                    "start_t": start_t,
+                    "end_t": end_t,
+                    "stiffness": next(iter(stiffnesses)),
+                    "source_elements": source_elements,
+                }
+            )
+            entities.append((1, tag))
+
+    return entities, curve_inputs, blockers
+
+
+def element_lines(curve_tag: int) -> list[tuple[int, int]]:
+    lines = []
+    types, _element_tags, node_tags = gmsh.model.mesh.getElements(1, curve_tag)
+    for element_type, nodes in zip(types, node_tags):
+        name, _dim, _order, nodes_per_element, _local, primary_nodes = (
+            gmsh.model.mesh.getElementProperties(element_type)
+        )
+        if not name.lower().startswith("line") or int(primary_nodes) < 2:
+            raise RuntimeError(
+                f"unsupported 1D element on curve {curve_tag}: {name}"
+            )
+        nodes_per_element = int(nodes_per_element)
+        for i in range(0, len(nodes), nodes_per_element):
+            lines.append(tuple(int(x) for x in nodes[i : i + 2]))
+    return lines
+
+
 def element_triangles(surface_tag: int) -> list[tuple[int, int, int]]:
     triangles = []
     types, _element_tags, node_tags = gmsh.model.mesh.getElements(2, surface_tag)
