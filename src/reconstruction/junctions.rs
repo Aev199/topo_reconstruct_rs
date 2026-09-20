@@ -867,7 +867,13 @@ mod tests {
             model.add_plane(PlaneFrame::new([0., 0., 0.], [0., 0., 1.]).unwrap());
         let slab_ring = add_ring(
             &mut model,
-            &[[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]],
+            &[
+                [0., 0., 0.],
+                [0.5, 0., 0.],
+                [1., 0., 0.],
+                [1., 1., 0.],
+                [0., 1., 0.],
+            ],
         );
         model.add_surface(slab_plane, vec![slab_ring], vec![1]).unwrap();
 
@@ -877,7 +883,13 @@ mod tests {
         // physical points instead of reusing the slab boundary IDs.
         let wall_ring = add_ring(
             &mut model,
-            &[[0., 0., 0.], [1., 0., 0.], [1., 0., 1.], [0., 0., 1.]],
+            &[
+                [0., 0., 0.],
+                [0.5, 0., 0.],
+                [1., 0., 0.],
+                [1., 0., 1.],
+                [0., 0., 1.],
+            ],
         );
         model.add_surface(wall_plane, vec![wall_ring], vec![2]).unwrap();
 
@@ -885,7 +897,7 @@ mod tests {
         assert_eq!(report.detected_segments, 1);
         assert_eq!(report.segments[0].kind, Kind::BoundaryJunction);
         assert_eq!(report.generated_vertices, 0);
-        assert_eq!(report.vertex_replacements.len(), 2);
+        assert_eq!(report.vertex_replacements.len(), 3);
         let common: BTreeSet<_> = model.surfaces[0]
             .boundaries
             .iter()
@@ -902,7 +914,8 @@ mod tests {
             )
             .copied()
             .collect();
-        assert!(!common.is_empty());
+        assert_eq!(common.len(), 2);
+        assert_eq!(report.shared_constraint_edges, 2);
     }
 
     #[test]
