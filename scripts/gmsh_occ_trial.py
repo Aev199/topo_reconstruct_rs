@@ -274,10 +274,9 @@ def heal_micro_edges(
     unresolved = 0
 
     for nodes in sorted(components.values(), key=lambda x: (min(x), len(x))):
-        candidates = sorted(
-            (node for node in nodes if len(owners.get(node, set())) >= 2),
-            key=lambda node: (-len(owners[node]), node),
-        )
+        candidates = [
+            node for node in nodes if len(owners.get(node, set())) >= 2
+        ]
         if not candidates:
             diagnostics.append(
                 {
@@ -287,8 +286,24 @@ def heal_micro_edges(
             )
             unresolved += 1
             continue
+        maximum_owner_count = max(len(owners[node]) for node in candidates)
+        representatives = sorted(
+            node for node in candidates if len(owners[node]) == maximum_owner_count
+        )
+        # Two distinct already-shared junction nodes are structural evidence,
+        # not numerical noise. Never choose between them by an arbitrary tag.
+        if len(representatives) != 1:
+            diagnostics.append(
+                {
+                    "nodes": sorted(nodes),
+                    "candidate_representatives": representatives,
+                    "status": "unresolved_multiple_shared_junction_nodes",
+                }
+            )
+            unresolved += 1
+            continue
 
-        representative = candidates[0]
+        representative = representatives[0]
         movements = {node: distance(coords[node], coords[representative]) for node in nodes}
         component_max = max(movements.values(), default=0.0)
         # A transitive chain of individually short edges can span much farther
@@ -654,12 +669,13 @@ def self_test() -> dict:
         4: (1.0, 0.0, 0.0),
         5: (0.0, 1.0, 0.0),
         6: (0.0, 0.0, 1.0),
+        7: (0.0, 1.0, 1.0),
     }
     triangles = [
         {"nodes": (1, 2, 4), "source_surface": 0, "output_surface": 1, "stiffness": 10},
-        {"nodes": (1, 5, 3), "source_surface": 0, "output_surface": 1, "stiffness": 10},
+        {"nodes": (1, 4, 5), "source_surface": 0, "output_surface": 1, "stiffness": 10},
         {"nodes": (1, 3, 6), "source_surface": 1, "output_surface": 2, "stiffness": 20},
-        {"nodes": (1, 6, 2), "source_surface": 1, "output_surface": 2, "stiffness": 20},
+        {"nodes": (1, 6, 7), "source_surface": 1, "output_surface": 2, "stiffness": 20},
     ]
     healed, report = heal_micro_edges(coords, triangles, 0.001, 1e-8)
     assert report["collapsed_component_count"] == 1
