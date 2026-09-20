@@ -31,6 +31,7 @@ import gmsh
 
 INPUT_FORMAT = "topo-reconstruct-gmsh-v1"
 RESULT_FORMAT = "topo-reconstruct-gmsh-result-v1"
+SOLVER_MESH_FORMAT = "topo-reconstruct-solver-mesh-v1"
 
 
 def distance(a: Iterable[float], b: Iterable[float]) -> float:
@@ -1327,6 +1328,182 @@ def physical_groups(
     return result
 
 
+def build_solver_mesh_package(
+    data: dict,
+    fragmentation: Fragmentation,
+    vertices: list[tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    precision: float,
+) -> tuple[dict, dict]:
+    """Build and audit the backend-neutral mesh consumed by solver adapters."""
+
+    surface_regions = [
+        {
+            "region": int(surface["source_surface"]),
+            "source_patch": int(surface["source_patch"]),
+            "stiffness": int(surface["stiffness"]),
+            "source_elements": sorted({int(x) for x in surface["source_elements"]}),
+        }
+        for surface in data["surfaces"]
+    ]
+    bar_regions = [
+        {
+            "region": int(item["input_curve"]),
+            "axis": int(item["axis"]),
+            "source_axis": int(item["source_axis"]),
+            "stiffness": int(item["stiffness"]),
+            "source_elements": sorted({int(x) for x in item["source_elements"]}),
+            "start_t": float(item["start_t"]),
+            "end_t": float(item["end_t"]),
+        }
+        for item in fragmentation.curve_inputs
+    ]
+
+    shell_elements = [
+        {
+            "vertices": [int(x) for x in triangle["vertices"]],
+            "region": int(triangle["source_surface"]),
+        }
+        for triangle in triangles
+    ]
+    bar_elements = [
+        {
+            "vertices": [int(x) for x in bar["vertices"]],
+            "region": int(bar["input_curve"]),
+        }
+        for bar in bars
+    ]
+
+    surface_region_by_id = {item["region"]: item for item in surface_regions}
+    bar_region_by_id = {item["region"]: item for item in bar_regions}
+    vertex_count = len(vertices)
+
+    invalid_shell_indices = []
+    degenerate_shell_elements = []
+    shell_stiffness_mismatches = []
+    represented_surface_regions = set()
+    for index, (source, element) in enumerate(zip(triangles, shell_elements)):
+        ids = element["vertices"]
+        if len(ids) != 3 or any(node < 0 or node >= vertex_count for node in ids):
+            invalid_shell_indices.append(index)
+            continue
+        if len(set(ids)) != 3 or triangle_area(*(vertices[node] for node in ids)) <= precision * precision:
+            degenerate_shell_elements.append(index)
+        region = element["region"]
+        represented_surface_regions.add(region)
+        expected = surface_region_by_id.get(region)
+        if expected is None or int(source["stiffness"]) != expected["stiffness"]:
+            shell_stiffness_mismatches.append(index)
+
+    invalid_bar_indices = []
+    degenerate_bar_elements = []
+    bar_stiffness_mismatches = []
+    represented_bar_regions = set()
+    for index, (source, element) in enumerate(zip(bars, bar_elements)):
+        ids = element["vertices"]
+        if len(ids) != 2 or any(node < 0 or node >= vertex_count for node in ids):
+            invalid_bar_indices.append(index)
+            continue
+        if len(set(ids)) != 2 or distance(vertices[ids[0]], vertices[ids[1]]) <= precision:
+            degenerate_bar_elements.append(index)
+        region = element["region"]
+        represented_bar_regions.add(region)
+        expected = bar_region_by_id.get(region)
+        if expected is None or int(source["stiffness"]) != expected["stiffness"]:
+            bar_stiffness_mismatches.append(index)
+
+    expected_surface_regions = set(surface_region_by_id)
+    expected_bar_regions = set(bar_region_by_id)
+    missing_surface_regions = sorted(expected_surface_regions - represented_surface_regions)
+    unexpected_surface_regions = sorted(represented_surface_regions - expected_surface_regions)
+    missing_bar_regions = sorted(expected_bar_regions - represented_bar_regions)
+    unexpected_bar_regions = sorted(represented_bar_regions - expected_bar_regions)
+
+    expected_surface_elements = {
+        source_element
+        for region in surface_regions
+        for source_element in region["source_elements"]
+    }
+    represented_surface_elements = {
+        source_element
+        for region_id in represented_surface_regions
+        if region_id in surface_region_by_id
+        for source_element in surface_region_by_id[region_id]["source_elements"]
+    }
+    expected_bar_elements = {
+        source_element
+        for region in bar_regions
+        for source_element in region["source_elements"]
+    }
+    represented_bar_elements = {
+        source_element
+        for region_id in represented_bar_regions
+        if region_id in bar_region_by_id
+        for source_element in bar_region_by_id[region_id]["source_elements"]
+    }
+
+    audit = {
+        "surface_region_count": len(surface_regions),
+        "represented_surface_region_count": len(represented_surface_regions),
+        "bar_region_count": len(bar_regions),
+        "represented_bar_region_count": len(represented_bar_regions),
+        "expected_surface_source_element_count": len(expected_surface_elements),
+        "represented_surface_source_element_count": len(represented_surface_elements),
+        "expected_bar_source_element_count": len(expected_bar_elements),
+        "represented_bar_source_element_count": len(represented_bar_elements),
+        "missing_surface_regions": missing_surface_regions,
+        "unexpected_surface_regions": unexpected_surface_regions,
+        "missing_bar_regions": missing_bar_regions,
+        "unexpected_bar_regions": unexpected_bar_regions,
+        "missing_surface_source_elements": sorted(
+            expected_surface_elements - represented_surface_elements
+        ),
+        "unexpected_surface_source_elements": sorted(
+            represented_surface_elements - expected_surface_elements
+        ),
+        "missing_bar_source_elements": sorted(
+            expected_bar_elements - represented_bar_elements
+        ),
+        "unexpected_bar_source_elements": sorted(
+            represented_bar_elements - expected_bar_elements
+        ),
+        "invalid_shell_element_indices": invalid_shell_indices,
+        "invalid_bar_element_indices": invalid_bar_indices,
+        "degenerate_shell_element_indices": degenerate_shell_elements,
+        "degenerate_bar_element_indices": degenerate_bar_elements,
+        "shell_stiffness_mismatch_indices": shell_stiffness_mismatches,
+        "bar_stiffness_mismatch_indices": bar_stiffness_mismatches,
+    }
+    audit["clean"] = not any(
+        value
+        for key, value in audit.items()
+        if key not in {
+            "clean",
+            "surface_region_count",
+            "represented_surface_region_count",
+            "bar_region_count",
+            "represented_bar_region_count",
+            "expected_surface_source_element_count",
+            "represented_surface_source_element_count",
+            "expected_bar_source_element_count",
+            "represented_bar_source_element_count",
+        }
+    )
+
+    package = {
+        "format": SOLVER_MESH_FORMAT,
+        "length_unit": data.get("length_unit", "model_unit"),
+        "index_base": 0,
+        "vertices": vertices,
+        "surface_regions": surface_regions,
+        "bar_regions": bar_regions,
+        "shell_elements": shell_elements,
+        "bar_elements": bar_elements,
+    }
+    return package, audit
+
+
 def run_backend(
     data: dict,
     mesh_size_override: float | None = None,
@@ -1527,6 +1704,15 @@ def run_backend(
         for bar in healed_bars
     ]
 
+    solver_mesh, solver_mesh_audit = build_solver_mesh_package(
+        data,
+        fragmentation,
+        compact_vertices,
+        compact_triangles,
+        compact_bars,
+        precision,
+    )
+
     blockers = list(data.get("blockers", []))
     blockers.extend(fragmentation.axis_build_blockers)
     blockers.extend(contact_embedding["blockers"])
@@ -1548,6 +1734,8 @@ def run_backend(
         blockers.append("nonconforming_bar_surface_contact")
     if semantic_node_audit["unintended_shared_node_count"]:
         blockers.append("unintended_shared_mesh_node")
+    if not solver_mesh_audit["clean"]:
+        blockers.append("solver_mesh_coverage_failure")
 
     if write_msh:
         gmsh.write(str(write_msh))
@@ -1591,6 +1779,8 @@ def run_backend(
         },
         "healing": healing,
         "bar_surface_contacts": contact_audit,
+        "solver_mesh_audit": solver_mesh_audit,
+        "solver_mesh": solver_mesh,
         "mesh": {
             **healed_quality,
             "bar_count": len(compact_bars),
@@ -1698,6 +1888,12 @@ def self_test() -> dict:
     assert result["bar_surface_contacts"]["contact_count"] == 2
     assert result["bar_surface_contacts"]["failed_contact_count"] == 0
     assert result["semantic_shared_nodes_before_healing"]["unintended_shared_node_count"] == 0
+    assert result["solver_mesh"]["format"] == SOLVER_MESH_FORMAT
+    assert result["solver_mesh_audit"]["clean"], result["solver_mesh_audit"]
+    assert len(result["solver_mesh"]["surface_regions"]) == 2
+    assert len(result["solver_mesh"]["bar_regions"]) >= 1
+    assert len(result["solver_mesh"]["shell_elements"]) == result["mesh"]["triangle_count"]
+    assert len(result["solver_mesh"]["bar_elements"]) == result["mesh"]["bar_count"]
     assert not result["surface_ownership_conflicts"]
     assert not result["curve_ownership_conflicts"]
     assert any(
