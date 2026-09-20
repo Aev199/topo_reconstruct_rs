@@ -35,10 +35,12 @@ jobs:
       - name: Run OCC fragmentation self-test
         run: python scripts/gmsh_occ_trial.py --self-test --mesh-size 0.5
 
-      - name: Upload Gmsh wheel for local private-model trial
+      - name: Upload Gmsh runtime for local private-model trial
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: gmsh-linux-wheel
-          path: gmsh-wheel/*.whl
+          name: gmsh-linux-runtime
+          path: |
+            gmsh-wheel/*.whl
+            scripts/gmsh_occ_trial.py
           retention-days: 1
