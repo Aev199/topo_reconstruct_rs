@@ -1770,6 +1770,82 @@ def physical_groups(
     return result
 
 
+def audit_surface_planarity(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    precision: float,
+) -> dict:
+    """Verify that every final shell node stays on its reconstructed plane."""
+    surface_planes = []
+    invalid_surface_planes = []
+    for surface_index, surface in enumerate(data.get("surfaces", [])):
+        points = [
+            tuple(float(x) for x in point)
+            for ring in surface.get("rings", [])
+            for point in ring
+        ]
+        plane = None
+        if len(points) >= 3:
+            origin = points[0]
+            for i in range(1, len(points) - 1):
+                u = tuple(points[i][k] - origin[k] for k in range(3))
+                for j in range(i + 1, len(points)):
+                    v = tuple(points[j][k] - origin[k] for k in range(3))
+                    normal = (
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    )
+                    norm = math.sqrt(sum(x * x for x in normal))
+                    if norm > precision:
+                        plane = (origin, tuple(x / norm for x in normal))
+                        break
+                if plane is not None:
+                    break
+        if plane is None:
+            invalid_surface_planes.append(surface_index)
+        surface_planes.append(plane)
+
+    maximum_error = 0.0
+    worst = None
+    checked_nodes = 0
+    seen = set()
+    for triangle_index, triangle in enumerate(triangles):
+        surface = int(triangle["source_surface"])
+        plane = surface_planes[surface] if surface < len(surface_planes) else None
+        if plane is None:
+            continue
+        origin, normal = plane
+        for node in triangle["nodes"]:
+            key = (surface, node)
+            if key in seen:
+                continue
+            seen.add(key)
+            checked_nodes += 1
+            point = coords[node]
+            error = abs(sum((point[k] - origin[k]) * normal[k] for k in range(3)))
+            if error > maximum_error:
+                maximum_error = error
+                worst = {
+                    "surface": surface,
+                    "node": node,
+                    "coordinate": point,
+                    "error": error,
+                    "triangle": triangle_index,
+                }
+
+    tolerance = max(precision * 10.0, 1e-9)
+    return {
+        "checked_surface_node_count": checked_nodes,
+        "invalid_surface_planes": invalid_surface_planes,
+        "tolerance": tolerance,
+        "maximum_planarity_error": maximum_error,
+        "worst": worst,
+        "clean": not invalid_surface_planes and maximum_error <= tolerance,
+    }
+
+
 def build_solver_mesh_package(
     data: dict,
     fragmentation: Fragmentation,
@@ -1885,6 +1961,24 @@ def build_solver_mesh_package(
         for source_element in bar_region_by_id[region_id]["source_elements"]
     }
 
+    duplicate_shell_element_indices = []
+    seen_shells = {}
+    for index, element in enumerate(shell_elements):
+        key = (element["region"], tuple(sorted(element["vertices"])))
+        if key in seen_shells:
+            duplicate_shell_element_indices.append(index)
+        else:
+            seen_shells[key] = index
+
+    duplicate_bar_element_indices = []
+    seen_bars = {}
+    for index, element in enumerate(bar_elements):
+        key = (element["region"], tuple(sorted(element["vertices"])))
+        if key in seen_bars:
+            duplicate_bar_element_indices.append(index)
+        else:
+            seen_bars[key] = index
+
     audit = {
         "surface_region_count": len(surface_regions),
         "represented_surface_region_count": len(represented_surface_regions),
@@ -1916,6 +2010,8 @@ def build_solver_mesh_package(
         "degenerate_bar_element_indices": degenerate_bar_elements,
         "shell_stiffness_mismatch_indices": shell_stiffness_mismatches,
         "bar_stiffness_mismatch_indices": bar_stiffness_mismatches,
+        "duplicate_shell_element_indices": duplicate_shell_element_indices,
+        "duplicate_bar_element_indices": duplicate_bar_element_indices,
     }
     audit["clean"] = not any(
         value
@@ -2191,6 +2287,22 @@ def run_backend(
         for bar in final_bars
     ]
 
+    raw_surface_pairs = set(raw_shared)
+    final_surface_pairs = set(final_shared)
+    surface_pair_audit = {
+        "raw_pair_count": len(raw_surface_pairs),
+        "final_pair_count": len(final_surface_pairs),
+        "lost_pairs": [list(pair) for pair in sorted(raw_surface_pairs - final_surface_pairs)],
+        "new_pairs": [list(pair) for pair in sorted(final_surface_pairs - raw_surface_pairs)],
+    }
+    surface_pair_audit["clean"] = (
+        not surface_pair_audit["lost_pairs"] and not surface_pair_audit["new_pairs"]
+    )
+
+    planarity_audit = audit_surface_planarity(
+        data, final_coords, final_triangles, precision
+    )
+
     solver_mesh, solver_mesh_audit = build_solver_mesh_package(
         data,
         fragmentation,
@@ -2221,6 +2333,10 @@ def run_backend(
         blockers.append("nonconforming_bar_surface_contact")
     if final_semantic_node_audit["unintended_shared_node_count"]:
         blockers.append("unintended_shared_mesh_node")
+    if not surface_pair_audit["clean"]:
+        blockers.append("surface_pair_topology_changed_by_repair")
+    if not planarity_audit["clean"]:
+        blockers.append("surface_planarity_failure")
     if not solver_mesh_audit["clean"]:
         blockers.append("solver_mesh_coverage_failure")
 
@@ -2270,6 +2386,8 @@ def run_backend(
         },
         "healing": healing,
         "bar_surface_contacts": contact_audit,
+        "surface_pair_audit": surface_pair_audit,
+        "surface_planarity_audit": planarity_audit,
         "solver_mesh_audit": solver_mesh_audit,
         "solver_mesh": solver_mesh,
         "mesh": {
