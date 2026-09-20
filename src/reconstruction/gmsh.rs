@@ -171,19 +171,17 @@ pub fn from_assembly(
     }
 
     let mut axes = Vec::with_capacity(source.axis_assembly.axes.len());
-    for (axis_index, axis) in source.axis_assembly.axes.iter().enumerate() {
-        if axis.source_axis != axis_index {
-            // source_axis is a semantic provenance ID and need not be dense,
-            // so this is deliberately not an error. Keep the explicit ID.
-        }
-        let endpoints = axis
-            .endpoints
-            .map(|vertex| *model.vertices.get(vertex).ok_or("invalid axis endpoint vertex"))
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        let endpoints: [[f64; 3]; 2] = endpoints
-            .try_into()
-            .map_err(|_| "invalid axis endpoint count")?;
+    for axis in &source.axis_assembly.axes {
+        let endpoints = [
+            *model
+                .vertices
+                .get(axis.endpoints[0])
+                .ok_or("invalid axis endpoint vertex")?,
+            *model
+                .vertices
+                .get(axis.endpoints[1])
+                .ok_or("invalid axis endpoint vertex")?,
+        ];
         if DVec3::from_array(endpoints[0]).distance(DVec3::from_array(endpoints[1]))
             <= source.policy.precision
         {
