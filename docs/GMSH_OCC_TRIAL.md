@@ -1,165 +1,184 @@
 # Gmsh / OpenCASCADE topology backend trial
 
-Status: successful architecture experiment on 2026-09-20.
+Status: successful surface and mixed-dimensional architecture experiment on
+2026-09-20.
 
-This document contains only aggregate metrics. The private full-model fixture is
+This document contains aggregate metrics only. The private full-model fixture is
 not committed.
 
-## Question
+## Architecture tested
 
-Can the low-level problem of intersecting reconstructed structural surfaces,
-splitting them into conformal fragments, and producing one shared mesh topology
-be delegated to an established CAD/meshing kernel instead of implementing a
-custom surface-junction kernel in Rust?
+The versioned Rust interchange contains explicit 3D surface rings, rod axes,
+property spans, source-element provenance and declared rod/surface contacts.
 
-## Prototype
+The external backend then:
 
-The trial in `scripts/gmsh_occ_trial.py` converts the already reconstructed
-planar surfaces to OpenCASCADE plane surfaces and calls Gmsh
-`model.occ.fragment()` (OpenCASCADE General Fuse / BooleanFragments).
+1. builds OpenCASCADE faces and property/contact-aware rod curve pieces;
+2. runs exact Gmsh `model.occ.fragment()` / OpenCASCADE General Fuse;
+3. preserves source/property ownership through the Boolean output map;
+4. explicitly mesh-embeds only rod/surface contacts already declared by Rust;
+5. creates one conforming mixed 2D/1D mesh;
+6. collapses only connected sub-resolution micro-edge components with an
+   existing proven shared-junction representative;
+7. audits the result independently.
 
-Responsibilities remain separated:
+No model-specific source IDs or coordinates are used as repair rules.
 
-- Rust: FE recognition, engineering interpretation, plane/axis restoration,
-  contours/openings, properties and provenance.
-- OpenCASCADE: exact surface-surface fragmentation and conformal CAD topology.
-- Gmsh: 2D meshing of the fragmented topology.
-- A small explicit post-process may remove sub-resolution mesh micro-edges; it
-  must never weld unrelated geometry by proximity.
+## Surface-only evidence
 
-The experiment does not use source element IDs or coordinates in any rule.
+Input private-model reconstruction:
 
-## Full private-model result
-
-Input reconstruction used the existing v2 preview of the private `скала1`
-fixture.
-
-Independent pre-Gmsh surface audit:
-
-- 387 reconstructed surfaces;
+- 387 surfaces;
 - 1,258 finite surface-contact segments;
-- 524 unrepresented intersection segments in the reconstructed topology;
-- 503 T-junction segments among those defects;
-- 19 interior-crossing segments among those defects;
-- 2 boundary-junction segments among those defects;
-- 0 invalid surfaces;
-- maximum surface planarity error about 4.82e-15 model units.
+- 524 unrepresented intersection segments;
+- 503 T-junction segments;
+- 19 interior crossings;
+- 2 boundary-junction segments;
+- 0 invalid surfaces.
 
-After exact OpenCASCADE General Fuse:
+Exact General Fuse fixed **524 / 524** previously unrepresented segments and
+introduced no regression among previously conforming contacts.
 
-- 444 output CAD surfaces;
-- 22 input surfaces were split into more than one output face;
-- maximum fragments for one input surface: 9;
-- every output face retained one input-surface owner through the Gmsh
-  BooleanFragments output map.
+A surface-only 0.75 m mesh after conservative micro-edge repair had about
+20,108 triangles, maximum area 0.372 m², minimum angle 8.13° and 8 triangles
+below 20°.
 
-A strict independent check then compared every original finite contact segment
-against global mesh-edge identity on both owning surfaces:
+## Why fuzzy Boolean tolerance was rejected
 
-- previously unrepresented: 524;
-- fixed: **524 / 524**;
-- still unrepresented: **0**;
-- previously conforming contacts regressed: **0**;
-- total unrepresented across all 1,258 checked contacts: **0**.
-
-This includes all tested T-junctions and interior crossings.
-
-## Mesh-quality finding
-
-A naive `fragment -> mesh` run initially had a misleadingly bad minimum angle:
-about 0.004 degrees. The bulk mesh was already good; only three triangles were
-below 5 degrees.
-
-The cause was isolated and deterministic: General Fuse produced one CAD edge of
-about 3.57e-5 m (0.036 mm), with a neighboring mesh edge of about 0.084 mm.
-These lengths are far below the reconstruction's engineering resolution. Global
-Boolean fuzzy tolerances are **not** suitable for removing them: even a 0.1 mm
-Boolean tolerance changed the fragmentation drastically and lost expected
+The exact operation produced one pathological CAD micro-edge about 0.036 mm
+long. Raising the global OpenCASCADE Boolean tolerance is not a safe repair:
+even 0.1 mm changed the full-model fragmentation drastically and lost expected
 junction representation.
 
-The safe repair is local and topological:
+The accepted policy is exact General Fuse followed by an explicit local
+post-mesh cleanup. General nearest-neighbor welding is forbidden.
 
-1. detect mesh edges below the explicit minimum-edge policy;
-2. form only connected micro-edge components;
-3. when a component contains an existing multi-surface junction node, keep that
-   junction node fixed as the representative;
-4. map the parasitic neighboring nodes to that representative;
-5. discard only triangles made degenerate by that exact collapse;
-6. rerun the independent contact-coverage audit.
+## Rod integration
 
-On the full model this affected one micro-edge component:
+The current private v2 preview contains 564 assembled rod axes. Axes are split
+before OCC at:
 
-- two parasitic nodes merged;
-- maximum movement: about **0.084 mm**;
-- three degenerate sliver triangles removed;
-- **0** surface-contact regressions after healing.
+- property-span boundaries;
+- reconstructed anchors;
+- point-contact parameters;
+- interval-contact endpoints.
 
-No general nearest-neighbor weld is allowed.
+The full mixed-dimensional General Fuse produced:
 
-## Selected mesh scale
+- 536 output surface faces from 387 input surfaces;
+- 2,601 input rod curve pieces;
+- 2,601 mapped output rod curve pieces;
+- 0 surface ownership conflicts;
+- 0 curve ownership conflicts;
+- 0 unmapped output surfaces.
 
-With the explicit uniform size sources configured as recommended by Gmsh
-(`MeshSizeFromPoints=0`, `MeshSizeFromCurvature=0`,
-`MeshSizeExtendFromBoundary=0`), 10 smoothing passes and `Relocate2D`, the
-following full-model results were measured after the local micro-edge repair:
+### Coplanar rods
 
-| target size, m | triangles | max area, m² | min angle | triangles < 20° | contact defects |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 0.50 | 36,335 | 0.160 | 8.13° | 4 | 0 |
-| 0.65 | 22,666 | 0.273 | 8.13° | 10 | 0 |
-| **0.75** | **20,108** | **0.372** | **8.13°** | **8** | **0** |
-| 0.90 | 16,988 | 0.515 | 8.13° | 8 | 0 |
-| 1.00 | 15,458 | 0.689 | 8.13° | 8 | 0 |
+General Fuse preserves coplanar rod curves as 1D OCC entities, but does not
+guarantee that every such interior curve constrains the triangulation of the
+owning face.
 
-For comparison, the previously verified custom Rust mesh had approximately:
+The correct repair is **not** geometric proximity inference. For each contact
+already established by Rust, the backend explicitly calls Gmsh mesh embedding
+only into fragments of that declared source surface.
 
-- 22,170 shell triangles;
-- maximum triangle area about 0.400 m²;
-- minimum triangle angle about 2.39°;
-- 163 triangles below 20°.
+On the private model this required:
 
-The 0.75 m Gmsh trial therefore has a comparable element count and maximum
-area, substantially better worst-angle behavior, and fully conforming tested
-surface junctions.
+- 66 embedded curve/face pairs;
+- 5 embedded point/face pairs;
+- 3,106 point contacts already covered by declared interval contacts.
+
+## Rod/surface contact audit
+
+There are 4,354 declared rod/surface contacts.
+
+Before micro-edge cleanup the strict audit found:
+
+- conforming: **4,354 / 4,354**;
+- failed: **0**.
+
+After cleanup, strict coordinate matching alone gives 4,352 / 4,354. Both
+failures are the same physical point shifted by the one allowed micro-edge
+collapse.
+
+The production audit therefore remains strict in two stages. A post-healing
+point is accepted only when it was strictly conforming before cleanup, remains
+topologically shared afterwards, and the exact logged node move links the
+original expected point to the current representative with movement below
+`minimum_edge`.
+
+For the private model the two accepted contacts both follow the logged move
+`1037 -> 1038`, movement about **0.03568 mm**. No global geometric tolerance is
+expanded.
+
+Final result:
+
+- conforming: **4,354 / 4,354**;
+- accepted specifically through healing provenance: 2;
+- unresolved: **0**;
+- backend blockers: **0**;
+- `backend_ready=true`.
+
+## Mixed mesh metrics
+
+With target size 0.75 model units:
+
+| metric | mixed Gmsh backend |
+| --- | ---: |
+| shell triangles | 22,220 |
+| bar segments | 3,189 |
+| maximum triangle area | 0.372234 m² |
+| minimum triangle angle | 0.80084° |
+| triangles below 20° | 34 |
+| triangles below 5° | 8 |
+
+The additional rod constraints create several local low-angle shell triangles.
+This is not currently treated as a reason for global remeshing; target-program
+import should first identify whether any of these elements are actually
+unacceptable.
+
+## Micro-edge cleanup result
+
+The full mixed model contained two sub-resolution mesh edges in one connected
+component.
+
+The cleanup:
+
+- keeps the already shared multi-surface junction node fixed;
+- merges two parasitic nodes;
+- moves no node more than about **0.08365 mm**;
+- removes three shell triangles made exactly degenerate;
+- removes zero bar elements;
+- leaves zero unresolved micro-edge components;
+- records every `from -> to` node move and coordinate displacement.
 
 ## Architecture conclusion
 
-The custom Rust surface-junction implementation should not be the primary path.
-
-Preferred architecture:
+The primary route is now:
 
 ```text
 FE mesh
-  -> Rust engineering recognition/restoration
-  -> valid planar surfaces + openings + semantic provenance
-  -> OpenCASCADE General Fuse (Gmsh occ.fragment)
-  -> conformal fragmented CAD topology
-  -> Gmsh surface mesh
-  -> explicit sub-resolution micro-edge cleanup
-  -> MIDAS adapter
-
-For PLAXIS:
-  ... -> conformal/healed CAD geometry -> PLAXIS remeshing
+  -> Rust engineering reconstruction
+  -> topo-reconstruct-gmsh-v1
+  -> exact OpenCASCADE General Fuse
+  -> explicit embedding of Rust-declared mixed-dimensional contacts
+  -> Gmsh 2D/1D mesh
+  -> provenance-preserving micro-edge cleanup
+  -> independent audits
+  -> solver adapter
 ```
 
-The independent Rust/Python audits remain valuable and should stay separate from
-Gmsh: Gmsh produces geometry/mesh; our code decides whether the result satisfies
-the geotechnical geometry contract.
+For PLAXIS the pipeline can stop earlier and hand off conformal/healed CAD
+geometry for remeshing.
 
-## What remains before replacing the existing path
+The custom Rust surface Boolean/junction implementation should remain a
+fallback/reference, not the primary path.
 
-- Implement the micro-edge cleanup as a production transformation with
-  provenance and movement diagnostics, not only as a trial script.
-- Transfer source stiffness/property ownership through the
-  `occ.fragment()` input-to-output map.
-- Integrate rods/axes and their intersections with the fragmented surface
-  topology.
-- Export a MIDAS-consumable mesh while preserving properties and loads.
-- Export or hand off CAD surfaces suitable for PLAXIS.
-- Add independent regression fixtures for the Gmsh adapter.
-- Verify isolated point contacts and bar-bar intersections, which are outside
-  the current full-model surface audit.
+## Remaining validation
 
-The temporary Gmsh GitHub Actions probe is only for obtaining/verifying the
-runtime in the current development environment. It is not intended to become a
-normal per-commit CI job.
+The next geometry-class gap is bar/bar intersections. After that, freeze the
+compact solver-mesh schema and validate an actual MIDAS import. PLAXIS geometry
+import and analysis semantics such as loads/materials/stages remain later work.
+
+The Gmsh GitHub Actions probe is manual-only. Private full-model data is never
+put in Actions.
