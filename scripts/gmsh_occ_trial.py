@@ -185,9 +185,17 @@ def fragment_and_mesh(data: dict, mesh_size: float | None = None, write_msh: Pat
             raise ValueError("mesh size must be finite and positive")
         gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_size)
         gmsh.option.setNumber("Mesh.MeshSizeMax", mesh_size)
+        # A complete target size is supplied explicitly. Do not let tiny OCC
+        # boundary entities propagate accidental local refinement.
+        gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+        gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+        gmsh.option.setNumber("Mesh.Smoothing", 10)
 
     gmsh.model.mesh.generate(2)
+    # This improves the normal population of triangles. It intentionally does
+    # not hide CAD micro-edges: those are reported/healed separately.
+    gmsh.model.mesh.optimize("Relocate2D", force=True, niter=10)
 
     source_mesh_edges: list[set[tuple[int, int]]] = []
     per_source_triangles = []
@@ -295,7 +303,7 @@ def main() -> int:
     parser.add_argument("input", nargs="?", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--msh", type=Path)
-    parser.add_argument("--mesh-size", type=float, default=0.5)
+    parser.add_argument("--mesh-size", type=float, default=0.75)
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
 
