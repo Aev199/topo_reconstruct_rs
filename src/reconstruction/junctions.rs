@@ -6,7 +6,8 @@
 //! their endpoints once, splits existing boundary edges when necessary and
 //! registers the same model edge as a junction constraint on every owner.
 //! Numerical coincidence alone is never used as an engineering weld: only a
-//! verified finite surface-surface intersection creates topology.
+//! verified finite surface-surface intersection creates topology. Re-running the
+//! pass is idempotent: already materialized junction vertices and edges are reused.
 
 use super::{EdgeUse, Model, PlaneFrame, Surface};
 use glam::DVec3;
