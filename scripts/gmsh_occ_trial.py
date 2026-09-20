@@ -1990,6 +1990,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", nargs="?", type=Path)
     parser.add_argument("--output", type=Path, help="summary/full backend JSON")
+    parser.add_argument(
+        "--solver-mesh-output",
+        type=Path,
+        help="write only the backend-neutral topo-reconstruct-solver-mesh-v1 package",
+    )
     parser.add_argument("--msh", type=Path)
     parser.add_argument("--mesh-size", type=float)
     parser.add_argument("--self-test", action="store_true")
@@ -2010,6 +2015,18 @@ def main() -> int:
         text = json.dumps(result, indent=2)
         if args.output:
             args.output.write_text(text)
+        if args.solver_mesh_output:
+            solver_mesh = result.get("solver_mesh")
+            audit = result.get("solver_mesh_audit", {})
+            if solver_mesh is None:
+                raise RuntimeError("backend result does not contain solver_mesh")
+            if not audit.get("clean", False):
+                raise RuntimeError(
+                    "refusing to write solver mesh because solver_mesh_audit is not clean"
+                )
+            args.solver_mesh_output.write_text(
+                json.dumps(solver_mesh, indent=2)
+            )
         print(text)
         return 0
     finally:
