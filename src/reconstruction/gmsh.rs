@@ -17,6 +17,10 @@ pub struct Policy {
     /// Explicit engineering lower bound used by deterministic post-mesh
     /// micro-edge cleanup. This is not a Boolean fuzzy tolerance.
     pub minimum_edge: f64,
+    /// Maximum movement allowed when a proven surface junction creates a
+    /// near-vertex sliver. This comes from the reconstruction engineering
+    /// policy; it is never passed to OCC as a fuzzy Boolean tolerance.
+    pub junction_movement_limit: f64,
     /// Target Gmsh surface-mesh size in model length units.
     pub target_mesh_size: f64,
 }
@@ -27,6 +31,8 @@ impl Policy {
             || self.precision <= 0.0
             || !self.minimum_edge.is_finite()
             || self.minimum_edge <= self.precision
+            || !self.junction_movement_limit.is_finite()
+            || self.junction_movement_limit < self.minimum_edge
             || !self.target_mesh_size.is_finite()
             || self.target_mesh_size < self.minimum_edge
         {
@@ -141,6 +147,7 @@ pub fn from_assembly(
     let policy = Policy {
         precision: source.policy.precision,
         minimum_edge: source.policy.minimum_edge,
+        junction_movement_limit: source.policy.junction_movement_limit,
         target_mesh_size,
     };
     policy.validate()?;
