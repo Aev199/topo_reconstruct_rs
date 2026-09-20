@@ -779,6 +779,181 @@ def fragment(
     )
 
 
+def entity_point(tag: int) -> tuple[float, float, float]:
+    value = gmsh.model.getValue(0, tag, [])
+    return (float(value[0]), float(value[1]), float(value[2]))
+
+
+def curve_midpoint(tag: int) -> tuple[float, float, float]:
+    low_x, low_y, low_z, high_x, high_y, high_z = gmsh.model.getBoundingBox(1, tag)
+    return (
+        0.5 * (low_x + high_x),
+        0.5 * (low_y + high_y),
+        0.5 * (low_z + high_z),
+    )
+
+
+def embed_declared_contacts(
+    fragmentation: Fragmentation,
+    data: dict,
+    precision: float,
+) -> dict:
+    """Mesh-embed only contacts already established by Rust semantics."""
+    tolerance = precision * 10.0
+    curve_inputs_by_axis: dict[int, list[int]] = defaultdict(list)
+    for index, item in enumerate(fragmentation.curve_inputs):
+        curve_inputs_by_axis[int(item["axis"])].append(index)
+
+    # Point contacts already lying inside a declared interval contact need no
+    # separate 0D embed: embedding the interval curve makes every split point
+    # on that curve a surface mesh node by identity.
+    interval_coverage: dict[tuple[int, int], list[tuple[float, float]]] = defaultdict(list)
+    for contact in data.get("contacts", []):
+        if contact["kind"] == "interval":
+            interval_coverage[(int(contact["axis"]), int(contact["surface"]))].append(
+                (float(contact["start_t"]), float(contact["end_t"]))
+            )
+
+    embedded_curves: set[tuple[int, int]] = set()
+    embedded_points: set[tuple[int, int]] = set()
+    existing_boundary_curves = 0
+    existing_boundary_points = 0
+    covered_point_contacts = 0
+    blockers: list[str] = []
+
+    boundary_curves: dict[int, set[int]] = {}
+    boundary_points: dict[int, set[int]] = {}
+    for source_faces in fragmentation.surface_to_output:
+        for face in source_faces:
+            if face in boundary_curves:
+                continue
+            boundary_curves[face] = {
+                int(tag)
+                for dim, tag in gmsh.model.getBoundary(
+                    [(2, face)], combined=False, oriented=False, recursive=False
+                )
+                if dim == 1
+            }
+            points = set()
+            for curve in boundary_curves[face]:
+                points.update(
+                    int(tag)
+                    for dim, tag in gmsh.model.getBoundary(
+                        [(1, curve)], combined=False, oriented=False, recursive=False
+                    )
+                    if dim == 0
+                )
+            boundary_points[face] = points
+
+    # Interval contacts first. The curve pieces are already split at property,
+    # anchor and contact parameters; General Fuse may split them further at
+    # surface intersections, so each output curve can be assigned by midpoint.
+    for contact_index, contact in enumerate(data.get("contacts", [])):
+        if contact["kind"] != "interval":
+            continue
+        axis = int(contact["axis"])
+        surface = int(contact["surface"])
+        faces = fragmentation.surface_to_output[surface]
+        axis_length_value = axis_length(data["axes"][axis])
+        param_tol = tolerance / max(axis_length_value, tolerance)
+        start_t = float(contact["start_t"])
+        end_t = float(contact["end_t"])
+        selected = []
+        for input_curve in curve_inputs_by_axis.get(axis, []):
+            item = fragmentation.curve_inputs[input_curve]
+            if (
+                float(item["start_t"]) >= start_t - param_tol
+                and float(item["end_t"]) <= end_t + param_tol
+            ):
+                selected.extend(fragmentation.curve_to_output[input_curve])
+        if not selected:
+            blockers.append(f"interval_contact_without_curve:{contact_index}")
+            continue
+
+        for curve in sorted(set(selected)):
+            midpoint = curve_midpoint(curve)
+            owners = []
+            for face in faces:
+                if curve in boundary_curves[face]:
+                    existing_boundary_curves += 1
+                    owners.append(face)
+                    continue
+                # Rust already established this curve/surface contact. isInside
+                # selects only the OCC fragment containing this exact piece; no
+                # nearest-surface or fuzzy geometric inference is performed.
+                if gmsh.model.isInside(2, face, midpoint) > 0:
+                    gmsh.model.mesh.embed(1, [curve], 2, face)
+                    embedded_curves.add((curve, face))
+                    owners.append(face)
+            if not owners:
+                blockers.append(
+                    f"interval_curve_not_on_contact_surface:contact={contact_index},curve={curve}"
+                )
+
+    # Point-only contacts. Use the actual OCC endpoint created by the split
+    # axis curve and embed it only in the Rust-declared source surface.
+    for contact_index, contact in enumerate(data.get("contacts", [])):
+        if contact["kind"] != "point":
+            continue
+        axis = int(contact["axis"])
+        surface = int(contact["surface"])
+        t = float(contact["t"])
+        axis_length_value = axis_length(data["axes"][axis])
+        param_tol = tolerance / max(axis_length_value, tolerance)
+        if any(
+            start - param_tol <= t <= end + param_tol
+            for start, end in interval_coverage.get((axis, surface), [])
+        ):
+            covered_point_contacts += 1
+            continue
+
+        faces = fragmentation.surface_to_output[surface]
+        expected = tuple(float(x) for x in contact["point"])
+        candidates = set()
+        for input_curve in curve_inputs_by_axis.get(axis, []):
+            item = fragmentation.curve_inputs[input_curve]
+            if (
+                abs(float(item["start_t"]) - t) > param_tol
+                and abs(float(item["end_t"]) - t) > param_tol
+            ):
+                continue
+            for curve in fragmentation.curve_to_output[input_curve]:
+                candidates.update(
+                    int(tag)
+                    for dim, tag in gmsh.model.getBoundary(
+                        [(1, curve)], combined=False, oriented=False, recursive=False
+                    )
+                    if dim == 0 and distance(entity_point(int(tag)), expected) <= tolerance
+                )
+        if not candidates:
+            blockers.append(f"point_contact_without_axis_point:{contact_index}")
+            continue
+
+        placed = False
+        for point in sorted(candidates):
+            xyz = entity_point(point)
+            for face in faces:
+                if point in boundary_points[face]:
+                    existing_boundary_points += 1
+                    placed = True
+                    continue
+                if gmsh.model.isInside(2, face, xyz) > 0:
+                    gmsh.model.mesh.embed(0, [point], 2, face)
+                    embedded_points.add((point, face))
+                    placed = True
+        if not placed:
+            blockers.append(f"point_contact_not_on_contact_surface:{contact_index}")
+
+    return {
+        "embedded_curve_count": len(embedded_curves),
+        "embedded_point_count": len(embedded_points),
+        "covered_point_contact_count": covered_point_contacts,
+        "existing_boundary_curve_count": existing_boundary_curves,
+        "existing_boundary_point_count": existing_boundary_points,
+        "blockers": blockers,
+    }
+
+
 def physical_groups(
     fragmentation: Fragmentation,
     surfaces: list[dict],
@@ -912,6 +1087,7 @@ def run_backend(
             }
         )
 
+    contact_embedding = embed_declared_contacts(fragmentation, data, precision)
     groups = physical_groups(fragmentation, surfaces)
 
     gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_size)
@@ -1020,6 +1196,7 @@ def run_backend(
 
     blockers = list(data.get("blockers", []))
     blockers.extend(fragmentation.axis_build_blockers)
+    blockers.extend(contact_embedding["blockers"])
     if surface_ownership_conflicts:
         blockers.append("ambiguous_surface_fragment_ownership")
     if curve_ownership_conflicts:
@@ -1066,6 +1243,7 @@ def run_backend(
         "curve_ownership_conflicts": curve_ownership_conflicts,
         "unmapped_output_surfaces": unmapped_output_surfaces,
         "physical_groups": groups,
+        "contact_embedding": contact_embedding,
         "raw_mesh": {
             **raw_quality,
             "shared_surface_pair_count": len(raw_shared),
