@@ -30,6 +30,12 @@ pub struct Segment {
     pub length: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct VertexReplacement {
+    pub from: usize,
+    pub to: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct Report {
     pub candidate_pairs: usize,
@@ -37,7 +43,14 @@ pub struct Report {
     pub generated_vertices: usize,
     pub split_boundary_edges: usize,
     pub shared_constraint_edges: usize,
+    pub vertex_replacements: Vec<VertexReplacement>,
     pub segments: Vec<Segment>,
+}
+
+#[derive(Debug, Clone)]
+struct JunctionPoint {
+    point: DVec3,
+    owners: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -259,9 +272,17 @@ fn segment_intersection_on_plane(
     Some(a0.lerp(a1, t.clamp(0.0, 1.0)))
 }
 
-fn push_unique_point(points: &mut Vec<DVec3>, point: DVec3, eps: f64) {
-    if !points.iter().any(|p| p.distance(point) <= eps) {
-        points.push(point);
+fn push_unique_point(points: &mut Vec<JunctionPoint>, point: DVec3, owners: &[usize], eps: f64) {
+    if let Some(existing) = points
+        .iter_mut()
+        .find(|candidate| candidate.point.distance(point) <= eps)
+    {
+        existing.owners.extend(owners.iter().copied());
+    } else {
+        points.push(JunctionPoint {
+            point,
+            owners: owners.iter().copied().collect(),
+        });
     }
 }
 
@@ -373,30 +394,57 @@ fn intern_edge(
     }))
 }
 
-fn vertex_for_point(model: &mut Model, point: DVec3, tolerance: f64) -> (usize, bool) {
-    if let Some((index, _)) = model
-        .vertices
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| {
-            let distance = DVec3::from_array(*p).distance(point);
+fn owner_vertices(model: &Model, owners: &BTreeSet<usize>) -> Result<BTreeSet<usize>, &'static str> {
+    let mut result = BTreeSet::new();
+    for &surface in owners {
+        let item = model
+            .surfaces
+            .get(surface)
+            .ok_or("invalid junction surface")?;
+        for edge_id in item
+            .boundaries
+            .iter()
+            .flatten()
+            .map(|edge| edge.edge)
+            .chain(item.junctions.iter().copied())
+        {
+            let edge = model
+                .edges
+                .get(edge_id)
+                .ok_or("invalid junction edge")?;
+            result.extend(edge);
+        }
+    }
+    Ok(result)
+}
+
+fn vertex_for_point(
+    model: &mut Model,
+    point: &JunctionPoint,
+    tolerance: f64,
+) -> Result<(usize, bool), &'static str> {
+    let candidates = owner_vertices(model, &point.owners)?;
+    if let Some((index, _)) = candidates
+        .into_iter()
+        .filter_map(|i| {
+            let distance = DVec3::from_array(model.vertices[i]).distance(point.point);
             (distance <= tolerance).then_some((i, distance))
         })
-        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
     {
-        return (index, false);
+        return Ok((index, false));
     }
     let index = model
-        .add_vertex(point.to_array())
+        .add_vertex(point.point.to_array())
         .expect("finite junction intersection");
-    (index, true)
+    Ok((index, true))
 }
 
 fn rebuild_boundaries(
     model: &mut Model,
-    split_vertices: &[usize],
+    split: &[(JunctionPoint, usize)],
     eps: f64,
-) -> Result<usize, &'static str> {
+) -> Result<(usize, Vec<VertexReplacement>), &'static str> {
     let old_edges = model.edges.clone();
     let original_edge_count: usize = model
         .surfaces
@@ -415,27 +463,50 @@ fn rebuild_boundaries(
         })
         .collect::<Result<_, _>>()?;
 
+    let mut replacements = BTreeMap::<usize, usize>::new();
     let mut expanded = Vec::with_capacity(old_rings.len());
-    for rings in old_rings {
+    for (surface_index, rings) in old_rings.into_iter().enumerate() {
+        let canonical = |vertex: usize| {
+            let p = DVec3::from_array(model.vertices[vertex]);
+            split
+                .iter()
+                .filter(|(point, _)| point.owners.contains(&surface_index))
+                .filter_map(|(point, canonical)| {
+                    let distance = p.distance(point.point);
+                    (distance <= eps).then_some((*canonical, distance))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+                .map(|item| item.0)
+                .unwrap_or(vertex)
+        };
         let mut surface_rings = Vec::with_capacity(rings.len());
         for ring in rings {
             let mut output = Vec::new();
             for i in 0..ring.len() {
-                let a = ring[i];
-                let b = ring[(i + 1) % ring.len()];
+                let source_a = ring[i];
+                let source_b = ring[(i + 1) % ring.len()];
+                let a = canonical(source_a);
+                let b = canonical(source_b);
+                for (source, target) in [(source_a, a), (source_b, b)] {
+                    if source != target {
+                        if replacements.insert(source, target).is_some_and(|old| old != target) {
+                            return Err("conflicting junction vertex replacement");
+                        }
+                    }
+                }
                 let pa = DVec3::from_array(model.vertices[a]);
                 let pb = DVec3::from_array(model.vertices[b]);
                 let mut interior = Vec::new();
-                for &vertex in split_vertices {
-                    if vertex == a || vertex == b {
+                for (point, vertex) in split {
+                    if !point.owners.contains(&surface_index) || *vertex == a || *vertex == b {
                         continue;
                     }
-                    let p = DVec3::from_array(model.vertices[vertex]);
+                    let p = DVec3::from_array(model.vertices[*vertex]);
                     if let Some(t) = segment_parameter(p, pa, pb, eps) {
                         let distance_a = pa.distance(p);
                         let distance_b = pb.distance(p);
                         if distance_a >= model.minimum_edge && distance_b >= model.minimum_edge {
-                            interior.push((t, vertex));
+                            interior.push((t, *vertex));
                         }
                     }
                 }
@@ -483,7 +554,13 @@ fn rebuild_boundaries(
         .iter()
         .map(|surface| surface.boundaries.iter().map(Vec::len).sum::<usize>())
         .sum();
-    Ok(new_edge_count.saturating_sub(original_edge_count))
+    Ok((
+        new_edge_count.saturating_sub(original_edge_count),
+        replacements
+            .into_iter()
+            .map(|(from, to)| VertexReplacement { from, to })
+            .collect(),
+    ))
 }
 
 /// Materialize all finite non-parallel surface intersections as shared topology.
@@ -504,8 +581,8 @@ pub fn conform(model: &mut Model, precision: f64) -> Result<Report, &'static str
 
     let mut split_points = Vec::new();
     for segment in &raw {
-        push_unique_point(&mut split_points, segment.start, precision);
-        push_unique_point(&mut split_points, segment.end, precision);
+        push_unique_point(&mut split_points, segment.start, &segment.surfaces, precision);
+        push_unique_point(&mut split_points, segment.end, &segment.surfaces, precision);
     }
     // Triple/multi-surface junctions can cross in the interior of both pairwise
     // segments. Materialize that shared point before any constraint is added.
@@ -528,48 +605,48 @@ pub fn conform(model: &mut Model, precision: f64) -> Result<Report, &'static str
                 plane,
                 precision,
             ) {
-                push_unique_point(&mut split_points, point, precision);
+                let owners = raw[i]
+                    .surfaces
+                    .into_iter()
+                    .chain(raw[j].surfaces)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                push_unique_point(&mut split_points, point, &owners, precision);
             }
         }
     }
 
     let old_vertex_count = model.vertices.len();
-    let reuse_tolerance = precision.max(model.minimum_edge);
-    let mut split_vertices = Vec::with_capacity(split_points.len());
+    // Reuse only an explicitly owning surface vertex within numerical
+    // precision. A wider proximity weld can connect nearby but distinct
+    // constructions and is therefore forbidden here.
+    let reuse_tolerance = precision;
+    let mut split = Vec::with_capacity(split_points.len());
     for point in split_points {
-        let (vertex, _) = vertex_for_point(model, point, reuse_tolerance);
-        if !split_vertices.contains(&vertex) {
-            split_vertices.push(vertex);
-        }
+        let (vertex, _) = vertex_for_point(model, &point, reuse_tolerance)?;
+        split.push((point, vertex));
     }
 
-    let split_boundary_edges = rebuild_boundaries(model, &split_vertices, precision)?;
+    let (split_boundary_edges, vertex_replacements) =
+        rebuild_boundaries(model, &split, precision)?;
 
     let mut shared_edges = BTreeSet::new();
     let mut segments = Vec::new();
     for item in raw {
-        let start = split_vertices
-            .iter()
-            .copied()
-            .filter_map(|vertex| {
-                let p = DVec3::from_array(model.vertices[vertex]);
-                let distance = p.distance(item.start);
-                (distance <= reuse_tolerance).then_some((vertex, distance))
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|x| x.0)
-            .ok_or("missing junction start vertex")?;
-        let end = split_vertices
-            .iter()
-            .copied()
-            .filter_map(|vertex| {
-                let p = DVec3::from_array(model.vertices[vertex]);
-                let distance = p.distance(item.end);
-                (distance <= reuse_tolerance).then_some((vertex, distance))
-            })
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|x| x.0)
-            .ok_or("missing junction end vertex")?;
+        let endpoint = |target: DVec3| {
+            split
+                .iter()
+                .filter(|(point, _)| item.surfaces.iter().all(|s| point.owners.contains(s)))
+                .filter_map(|(point, vertex)| {
+                    let distance = point.point.distance(target);
+                    (distance <= reuse_tolerance).then_some((*vertex, distance))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
+                .map(|item| item.0)
+        };
+        let start = endpoint(item.start).ok_or("missing junction start vertex")?;
+        let end = endpoint(item.end).ok_or("missing junction end vertex")?;
         let pa = DVec3::from_array(model.vertices[start]);
         let pb = DVec3::from_array(model.vertices[end]);
         if pa.distance(pb) <= model.minimum_edge {
@@ -577,10 +654,13 @@ pub fn conform(model: &mut Model, precision: f64) -> Result<Report, &'static str
         }
 
         let mut chain = Vec::new();
-        for &vertex in &split_vertices {
-            let point = DVec3::from_array(model.vertices[vertex]);
-            if let Some(t) = segment_parameter(point, pa, pb, precision) {
-                chain.push((t, vertex));
+        for (point, vertex) in &split {
+            if !item.surfaces.iter().all(|s| point.owners.contains(s)) {
+                continue;
+            }
+            let position = DVec3::from_array(model.vertices[*vertex]);
+            if let Some(t) = segment_parameter(position, pa, pb, precision) {
+                chain.push((t, *vertex));
             }
         }
         chain.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -618,6 +698,7 @@ pub fn conform(model: &mut Model, precision: f64) -> Result<Report, &'static str
         generated_vertices: model.vertices.len() - old_vertex_count,
         split_boundary_edges,
         shared_constraint_edges: shared_edges.len(),
+        vertex_replacements,
         segments,
     })
 }
