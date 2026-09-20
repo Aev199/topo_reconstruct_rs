@@ -506,9 +506,19 @@ def heal_micro_edges(
             unresolved += 1
             continue
 
+        moves = []
         for node in nodes:
             if node != representative:
                 mapping[node] = representative
+                moves.append(
+                    {
+                        "from": node,
+                        "to": representative,
+                        "from_coordinate": coords[node],
+                        "to_coordinate": coords[representative],
+                        "movement": movements[node],
+                    }
+                )
         maximum_movement = max(maximum_movement, component_max)
         diagnostics.append(
             {
@@ -517,6 +527,7 @@ def heal_micro_edges(
                 "representative_source_owner_count": len(owners[representative]),
                 "status": "collapsed",
                 "maximum_movement": component_max,
+                "moves": moves,
             }
         )
 
@@ -615,8 +626,10 @@ def audit_contacts(
     surface_edges = surface_edges_by_source(triangles)
     surface_nodes = surface_nodes_by_source(triangles)
     axis_nodes: dict[int, set[int]] = defaultdict(set)
+    bars_by_axis: dict[int, list[dict]] = defaultdict(list)
     for bar in bars:
         axis_nodes[bar["axis"]].update(bar["nodes"])
+        bars_by_axis[int(bar["axis"])].append(bar)
 
     details = []
     failed = 0
@@ -642,7 +655,8 @@ def audit_contacts(
                     "axis": axis_index,
                     "surface": surface,
                     "mesh_conforming": conforming,
-                    "shared_node": nearest[1] if conforming else None,
+                    "topologically_shared": nearest is not None,
+                    "shared_node": nearest[1] if nearest else None,
                     "distance": nearest[0] if nearest else None,
                 }
             )
@@ -654,9 +668,7 @@ def audit_contacts(
         axis_tol = tolerance / max(axis_length(axis), tolerance)
         total = 0.0
         shared_total = 0.0
-        for bar in bars:
-            if int(bar["axis"]) != axis_index:
-                continue
+        for bar in bars_by_axis.get(axis_index, []):
             p0 = coords[bar["nodes"][0]]
             p1 = coords[bar["nodes"][1]]
             midpoint = tuple((p0[i] + p1[i]) * 0.5 for i in range(3))
@@ -694,6 +706,89 @@ def audit_contacts(
         "conforming_contact_count": len(details) - failed,
         "failed_contact_count": failed,
         "details": details,
+    }
+
+
+def summarize_contact_audit(report: dict) -> dict:
+    return {
+        "contact_count": report["contact_count"],
+        "conforming_contact_count": report["conforming_contact_count"],
+        "failed_contact_count": report["failed_contact_count"],
+    }
+
+
+def reconcile_healed_contact_audit(
+    data: dict,
+    raw: dict,
+    strict_healed: dict,
+    healing: dict,
+    precision: float,
+    minimum_edge: float,
+) -> dict:
+    """Accept a moved point contact only through an explicit healing move.
+
+    The contact must have been strictly conforming before healing, must remain
+    topologically shared afterwards, and its expected point must coincide with
+    the `from` node of the exact logged move whose `to` node is now shared.
+    No global tolerance is relaxed.
+    """
+    tolerance = precision * 10.0
+    moves = [
+        move
+        for component in healing.get("components", [])
+        if component.get("status") == "collapsed"
+        for move in component.get("moves", [])
+    ]
+    result = []
+    failed = 0
+    accepted_by_healing = 0
+    if len(raw["details"]) != len(strict_healed["details"]):
+        raise RuntimeError("contact audit length changed across healing")
+
+    for raw_item, healed_item in zip(raw["details"], strict_healed["details"]):
+        item = dict(healed_item)
+        if healed_item["mesh_conforming"]:
+            item["conformity"] = "strict"
+            result.append(item)
+            continue
+
+        accepted = False
+        if (
+            healed_item["kind"] == "point"
+            and raw_item["mesh_conforming"]
+            and healed_item.get("topologically_shared")
+            and healed_item.get("shared_node") is not None
+        ):
+            contact = data["contacts"][healed_item["contact"]]
+            expected = tuple(float(x) for x in contact["point"])
+            for move in moves:
+                if int(move["to"]) != int(healed_item["shared_node"]):
+                    continue
+                if distance(move["from_coordinate"], expected) > tolerance:
+                    continue
+                movement = float(move["movement"])
+                if movement >= minimum_edge:
+                    continue
+                accepted = True
+                item["mesh_conforming"] = True
+                item["conformity"] = "healed_shared_node"
+                item["healing_movement"] = movement
+                item["healing_from_node"] = int(move["from"])
+                item["healing_to_node"] = int(move["to"])
+                accepted_by_healing += 1
+                break
+
+        if not accepted:
+            item["conformity"] = "failed"
+            failed += 1
+        result.append(item)
+
+    return {
+        "contact_count": len(result),
+        "conforming_contact_count": len(result) - failed,
+        "failed_contact_count": failed,
+        "accepted_by_healing_count": accepted_by_healing,
+        "details": result,
     }
 
 
@@ -1146,6 +1241,7 @@ def run_backend(
 
     raw_quality = quality(coords, triangles)
     raw_shared = shared_mesh_edges_by_source(triangles)
+    raw_contact_audit = audit_contacts(data, coords, triangles, bars, precision)
     healed_triangles, node_mapping, healing = heal_micro_edges(
         coords, triangles, minimum_edge, precision
     )
@@ -1162,8 +1258,16 @@ def run_backend(
 
     healed_quality = quality(coords, healed_triangles)
     healed_shared = shared_mesh_edges_by_source(healed_triangles)
-    contact_audit = audit_contacts(
+    strict_healed_contact_audit = audit_contacts(
         data, coords, healed_triangles, healed_bars, precision
+    )
+    contact_audit = reconcile_healed_contact_audit(
+        data,
+        raw_contact_audit,
+        strict_healed_contact_audit,
+        healing,
+        precision,
+        minimum_edge,
     )
 
     used_nodes = sorted(
@@ -1244,6 +1348,10 @@ def run_backend(
         "unmapped_output_surfaces": unmapped_output_surfaces,
         "physical_groups": groups,
         "contact_embedding": contact_embedding,
+        "bar_surface_contacts_before_healing": summarize_contact_audit(raw_contact_audit),
+        "bar_surface_contacts_strict_after_healing": summarize_contact_audit(
+            strict_healed_contact_audit
+        ),
         "raw_mesh": {
             **raw_quality,
             "shared_surface_pair_count": len(raw_shared),
@@ -1386,6 +1494,38 @@ def self_test() -> dict:
     assert report["maximum_node_movement"] < 0.001
     assert mapping == {2: 1, 3: 1}
     assert all(1 in triangle["nodes"] for triangle in healed)
+
+    fake_data = {"contacts": [{"kind": "point", "point": list(coords[2])}]}
+    raw_audit = {
+        "details": [
+            {
+                "contact": 0,
+                "kind": "point",
+                "mesh_conforming": True,
+                "topologically_shared": True,
+                "shared_node": 2,
+                "distance": 0.0,
+            }
+        ]
+    }
+    strict_audit = {
+        "details": [
+            {
+                "contact": 0,
+                "kind": "point",
+                "mesh_conforming": False,
+                "topologically_shared": True,
+                "shared_node": 1,
+                "distance": distance(coords[1], coords[2]),
+            }
+        ]
+    }
+    reconciled = reconcile_healed_contact_audit(
+        fake_data, raw_audit, strict_audit, report, 1e-8, 0.001
+    )
+    assert reconciled["failed_contact_count"] == 0
+    assert reconciled["accepted_by_healing_count"] == 1
+    assert reconciled["details"][0]["conformity"] == "healed_shared_node"
     return result
 
 
