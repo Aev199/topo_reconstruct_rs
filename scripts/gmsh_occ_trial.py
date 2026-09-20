@@ -792,19 +792,24 @@ def run_backend(
     # aggressively.
     gmsh.option.setNumber("Geometry.ToleranceBoolean", 0.0)
 
-    fragmentation = fragment(surfaces)
+    fragmentation = fragment(
+        surfaces,
+        data.get("axes", []),
+        data.get("contacts", []),
+        precision,
+    )
 
-    ownership_conflicts = []
+    surface_ownership_conflicts = []
     fragmented_surfaces = []
     unmapped_output_surfaces = []
     for tag in fragmentation.output_surfaces:
-        owners = fragmentation.output_owners.get(tag, [])
+        owners = fragmentation.surface_output_owners.get(tag, [])
         if not owners:
             unmapped_output_surfaces.append(tag)
             continue
         if len(owners) > 1:
             stiffnesses = sorted({int(surfaces[owner]["stiffness"]) for owner in owners})
-            ownership_conflicts.append(
+            surface_ownership_conflicts.append(
                 {
                     "output_surface": tag,
                     "source_surfaces": owners,
@@ -824,6 +829,28 @@ def run_backend(
             }
         )
 
+    curve_ownership_conflicts = []
+    fragmented_curves = []
+    for tag in fragmentation.output_curves:
+        owners = fragmentation.curve_output_owners.get(tag, [])
+        if len(owners) != 1:
+            curve_ownership_conflicts.append(
+                {
+                    "output_curve": tag,
+                    "input_curves": owners,
+                    "reason": "unmapped" if not owners else "multiple_input_curves",
+                }
+            )
+            continue
+        source = owners[0]
+        item = fragmentation.curve_inputs[source]
+        fragmented_curves.append(
+            {
+                "output_curve": tag,
+                **item,
+            }
+        )
+
     groups = physical_groups(fragmentation, surfaces)
 
     gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_size)
@@ -838,7 +865,9 @@ def run_backend(
 
     coords = all_node_coordinates()
     triangles = []
+    bars = []
     non_triangle_blockers = []
+    non_line_blockers = []
     for item in fragmented_surfaces:
         tag = item["output_surface"]
         try:
@@ -856,15 +885,54 @@ def run_backend(
                 }
             )
 
+    for item in fragmented_curves:
+        tag = item["output_curve"]
+        try:
+            local = element_lines(tag)
+        except RuntimeError as error:
+            non_line_blockers.append(str(error))
+            continue
+        for nodes in local:
+            bars.append(
+                {
+                    "nodes": nodes,
+                    "output_curve": tag,
+                    "input_curve": item["input_curve"],
+                    "axis": item["axis"],
+                    "source_axis": item["source_axis"],
+                    "start_t": item["start_t"],
+                    "end_t": item["end_t"],
+                    "stiffness": item["stiffness"],
+                    "source_elements": item["source_elements"],
+                }
+            )
+
     raw_quality = quality(coords, triangles)
     raw_shared = shared_mesh_edges_by_source(triangles)
     healed_triangles, node_mapping, healing = heal_micro_edges(
         coords, triangles, minimum_edge, precision
     )
+
+    healed_bars = []
+    removed_degenerate_bars = 0
+    for bar in bars:
+        nodes = tuple(node_mapping.get(node, node) for node in bar["nodes"])
+        if nodes[0] == nodes[1]:
+            removed_degenerate_bars += 1
+            continue
+        healed_bars.append({**bar, "nodes": nodes})
+    healing["removed_degenerate_bars"] = removed_degenerate_bars
+
     healed_quality = quality(coords, healed_triangles)
     healed_shared = shared_mesh_edges_by_source(healed_triangles)
+    contact_audit = audit_contacts(
+        data, coords, healed_triangles, healed_bars, precision
+    )
 
-    used_nodes = sorted({node for triangle in healed_triangles for node in triangle["nodes"]})
+    used_nodes = sorted(
+        {node for triangle in healed_triangles for node in triangle["nodes"]}
+        | {node for bar in healed_bars for node in bar["nodes"]}
+    )
     compact_index = {tag: index for index, tag in enumerate(used_nodes)}
     compact_vertices = [coords[tag] for tag in used_nodes]
     compact_triangles = [
@@ -876,18 +944,37 @@ def run_backend(
         }
         for triangle in healed_triangles
     ]
+    compact_bars = [
+        {
+            "vertices": [compact_index[node] for node in bar["nodes"]],
+            "output_curve": bar["output_curve"],
+            "input_curve": bar["input_curve"],
+            "axis": bar["axis"],
+            "source_axis": bar["source_axis"],
+            "stiffness": bar["stiffness"],
+            "source_elements": bar["source_elements"],
+        }
+        for bar in healed_bars
+    ]
 
     blockers = list(data.get("blockers", []))
-    if ownership_conflicts:
-        blockers.append("ambiguous_fragment_ownership")
+    blockers.extend(fragmentation.axis_build_blockers)
+    if surface_ownership_conflicts:
+        blockers.append("ambiguous_surface_fragment_ownership")
+    if curve_ownership_conflicts:
+        blockers.append("ambiguous_curve_fragment_ownership")
     if unmapped_output_surfaces:
         blockers.append("unmapped_fragment_surface")
     if non_triangle_blockers:
         blockers.append("unsupported_2d_elements")
+    if non_line_blockers:
+        blockers.append("unsupported_1d_elements")
     if healing["unresolved_component_count"]:
         blockers.append("unresolved_micro_edge_component")
     if healing["near_degenerate_triangles_after"]:
         blockers.append("near_degenerate_triangle_after_healing")
+    if contact_audit["failed_contact_count"]:
+        blockers.append("nonconforming_bar_surface_contact")
 
     if write_msh:
         gmsh.write(str(write_msh))
@@ -904,10 +991,18 @@ def run_backend(
         "input_surface_count": len(surfaces),
         "output_surface_count": len(fragmentation.output_surfaces),
         "source_to_output_surface_count": [
-            len(tags) for tags in fragmentation.source_to_output
+            len(tags) for tags in fragmentation.surface_to_output
+        ],
+        "input_axis_count": len(data.get("axes", [])),
+        "input_curve_piece_count": len(fragmentation.curve_inputs),
+        "output_curve_piece_count": len(fragmentation.output_curves),
+        "source_to_output_curve_count": [
+            len(tags) for tags in fragmentation.curve_to_output
         ],
         "fragmented_surfaces": fragmented_surfaces,
-        "ownership_conflicts": ownership_conflicts,
+        "fragmented_curves": fragmented_curves,
+        "surface_ownership_conflicts": surface_ownership_conflicts,
+        "curve_ownership_conflicts": curve_ownership_conflicts,
         "unmapped_output_surfaces": unmapped_output_surfaces,
         "physical_groups": groups,
         "raw_mesh": {
@@ -916,15 +1011,16 @@ def run_backend(
             "shared_mesh_edge_count": sum(raw_shared.values()),
         },
         "healing": healing,
+        "bar_surface_contacts": contact_audit,
         "mesh": {
             **healed_quality,
+            "bar_count": len(compact_bars),
             "shared_surface_pair_count": len(healed_shared),
             "shared_mesh_edge_count": sum(healed_shared.values()),
             "vertices": compact_vertices,
             "triangles": compact_triangles,
+            "bars": compact_bars,
         },
-        # Carry reconstructed line semantics forward unchanged. The next backend
-        # stage will embed/synchronize them against the fragmented surfaces.
         "axes": data.get("axes", []),
         "contacts": data.get("contacts", []),
     }
