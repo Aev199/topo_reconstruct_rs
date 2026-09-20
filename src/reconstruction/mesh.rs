@@ -510,7 +510,15 @@ fn build_impl(
             let h = cdt
                 .insert(Point2::new(uv[0], uv[1]))
                 .map_err(|_| "invalid CDT vertex")?;
-            if global.insert(h.index(), n).is_some() {
+            if let Some(previous) = global.insert(h.index(), n) {
+                eprintln!(
+                    "implicit CDT merge: surface={s} previous={previous} current={n} \
+                     previous_xyz={:?} current_xyz={:?} distance={:.12e} projected={:?}",
+                    vertices[previous],
+                    vertices[n],
+                    point(&vertices[previous]).distance(point(&vertices[n])),
+                    uv,
+                );
                 return Err("implicit vertex merge in CDT");
             }
             handles.insert(n, h);
