@@ -1,0 +1,38 @@
+name: Gmsh backend probe
+
+on:
+  push:
+    branches:
+      - experiment/gmsh-occ-backend
+    paths:
+      - scripts/gmsh_occ_trial.py
+      - .github/workflows/gmsh-probe.yml
+  workflow_dispatch:
+
+jobs:
+  gmsh-probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download Gmsh wheel
+        run: python -m pip download --no-deps gmsh==4.15.2 -d gmsh-wheel
+
+      - name: Install Gmsh
+        run: python -m pip install --no-deps gmsh-wheel/*.whl
+
+      - name: Run OCC fragmentation self-test
+        run: python scripts/gmsh_occ_trial.py --self-test --mesh-size 0.5
+
+      - name: Upload Gmsh wheel for local private-model trial
+        uses: actions/upload-artifact@v4
+        with:
+          name: gmsh-linux-wheel
+          path: gmsh-wheel/*.whl
+          retention-days: 1
