@@ -193,7 +193,7 @@ def quality(coords: dict[int, tuple[float, float, float]], triangles: list[dict]
         below_20 += local_min < 20.0
         below_5 += local_min < 5.0
     return {
-        "triangles": len(triangles),
+        "triangle_count": len(triangles),
         "minimum_triangle_angle_degrees": minimum_angle if triangles else None,
         "maximum_triangle_area": maximum_area if triangles else None,
         "triangles_below_20_degrees": below_20,
@@ -654,7 +654,7 @@ def self_test() -> dict:
     result = run_backend(synthetic_report())
     assert result["input_surface_count"] == 2
     assert result["output_surface_count"] >= 3
-    assert result["mesh"]["triangles"] > 0
+    assert result["mesh"]["triangle_count"] > 0
     assert result["mesh"]["shared_surface_pair_count"] >= 1
     assert result["mesh"]["shared_mesh_edge_count"] >= 1
     assert not result["ownership_conflicts"]
