@@ -34,6 +34,7 @@ jobs:
         run: python scripts/gmsh_occ_trial.py --self-test --mesh-size 0.5
 
       - name: Upload Gmsh wheel for local private-model trial
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gmsh-linux-wheel
