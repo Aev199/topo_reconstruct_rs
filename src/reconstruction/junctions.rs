@@ -849,6 +849,51 @@ mod tests {
     }
 
     #[test]
+    fn duplicated_boundary_vertices_are_canonicalized_only_for_the_junction() {
+        let mut model = Model::new(1e-8, 1e-6).unwrap();
+        let slab_plane =
+            model.add_plane(PlaneFrame::new([0., 0., 0.], [0., 0., 1.]).unwrap());
+        let slab_ring = add_ring(
+            &mut model,
+            &[[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.]],
+        );
+        model.add_surface(slab_plane, vec![slab_ring], vec![1]).unwrap();
+
+        let wall_plane =
+            model.add_plane(PlaneFrame::new([0., 0., 0.], [0., -1., 0.]).unwrap());
+        // Deliberately add a second pair of source vertex IDs at the same
+        // physical points instead of reusing the slab boundary IDs.
+        let wall_ring = add_ring(
+            &mut model,
+            &[[0., 0., 0.], [1., 0., 0.], [1., 0., 1.], [0., 0., 1.]],
+        );
+        model.add_surface(wall_plane, vec![wall_ring], vec![2]).unwrap();
+
+        let report = conform(&mut model, 1e-8).unwrap();
+        assert_eq!(report.detected_segments, 1);
+        assert_eq!(report.segments[0].kind, Kind::BoundaryJunction);
+        assert_eq!(report.generated_vertices, 0);
+        assert_eq!(report.vertex_replacements.len(), 2);
+        let common: BTreeSet<_> = model.surfaces[0]
+            .boundaries
+            .iter()
+            .flatten()
+            .map(|edge| edge.edge)
+            .collect::<BTreeSet<_>>()
+            .intersection(
+                &model.surfaces[1]
+                    .boundaries
+                    .iter()
+                    .flatten()
+                    .map(|edge| edge.edge)
+                    .collect(),
+            )
+            .copied()
+            .collect();
+        assert!(!common.is_empty());
+    }
+
+    #[test]
     fn nearby_nonintersecting_surfaces_remain_separate() {
         let mut model = Model::new(1e-8, 1e-6).unwrap();
         let p0 = model.add_plane(PlaneFrame::new([0., 0., 0.], [0., 0., 1.]).unwrap());
