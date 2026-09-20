@@ -2340,7 +2340,7 @@ def self_test() -> dict:
     assert result["mesh"]["bar_count"] > 0
     assert result["bar_surface_contacts"]["contact_count"] == 2
     assert result["bar_surface_contacts"]["failed_contact_count"] == 0
-    assert result["semantic_shared_nodes_before_healing"]["unintended_shared_node_count"] == 0
+    assert result["semantic_shared_nodes_after_repairs"]["unintended_shared_node_count"] == 0
     assert result["solver_mesh"]["format"] == SOLVER_MESH_FORMAT
     assert result["solver_mesh_audit"]["clean"], result["solver_mesh_audit"]
     assert len(result["solver_mesh"]["surface_regions"]) == 2
@@ -2404,12 +2404,12 @@ def self_test() -> dict:
             }
         ]
     }
-    reconciled = reconcile_healed_contact_audit(
-        fake_data, raw_audit, strict_audit, report, 1e-8, 0.001
+    reconciled = reconcile_moved_contact_audit(
+        fake_data, raw_audit, strict_audit, [report], 1e-8
     )
     assert reconciled["failed_contact_count"] == 0
     assert reconciled["accepted_by_healing_count"] == 1
-    assert reconciled["details"][0]["conformity"] == "healed_shared_node"
+    assert reconciled["details"][0]["conformity"] == "micro_edge_healing"
 
     unsupported = audit_semantic_shared_nodes(
         {
