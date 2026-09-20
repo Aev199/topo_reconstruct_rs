@@ -58,6 +58,10 @@ pub struct Surface {
     pub source_elements: Vec<u32>,
     /// Exterior ring first, then holes, all in global 3D coordinates.
     pub rings: Vec<Vec<[f64; 3]>>,
+    /// Source-node identity for each ring vertex. This is deliberately kept
+    /// separate from coordinates so a backend can distinguish a true source
+    /// point joint from merely coincident/near-coincident geometry.
+    pub ring_source_nodes: Vec<Vec<u32>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,12 +158,31 @@ pub fn from_assembly(
             .planes
             .get(surface.plane)
             .ok_or("invalid surface plane reference")?;
+        if surface.contours.len() != surface.boundaries.len() {
+            return Err("surface contour/boundary count mismatch");
+        }
         let mut rings = Vec::with_capacity(surface.contours.len());
-        for contour in &surface.contours {
-            if contour.len() < 3 {
+        let mut ring_source_nodes = Vec::with_capacity(surface.contours.len());
+        for (contour, boundary) in surface.contours.iter().zip(&surface.boundaries) {
+            if contour.len() < 3 || contour.len() != boundary.len() {
                 return Err("invalid Gmsh surface ring");
             }
             rings.push(contour.iter().map(|&uv| plane.lift(uv)).collect());
+            let mut source_nodes = Vec::with_capacity(boundary.len());
+            for edge_use in boundary {
+                let edge = model
+                    .edges
+                    .get(edge_use.edge)
+                    .ok_or("invalid surface edge reference")?;
+                let vertex = if edge_use.reversed { edge[1] } else { edge[0] };
+                source_nodes.push(
+                    *source
+                        .vertex_source_nodes
+                        .get(vertex)
+                        .ok_or("missing surface source-node provenance")?,
+                );
+            }
+            ring_source_nodes.push(source_nodes);
         }
         surfaces.push(Surface {
             source_surface: index,
@@ -167,6 +190,7 @@ pub fn from_assembly(
             stiffness: source.surface_stiffness[index],
             source_elements: surface.source_elements.clone(),
             rings,
+            ring_source_nodes,
         });
     }
 
