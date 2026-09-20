@@ -97,6 +97,19 @@ def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
                         [lift(plane, uv) for uv in ring]
                         for ring in surface["contours"]
                     ],
+                    "ring_source_nodes": [
+                        [
+                            int(topology["vertex_source_nodes"][
+                                (
+                                    model["edges"][edge_use["edge"]][1]
+                                    if edge_use["reversed"]
+                                    else model["edges"][edge_use["edge"]][0]
+                                )
+                            ])
+                            for edge_use in boundary
+                        ]
+                        for boundary in surface["boundaries"]
+                    ],
                 }
             )
         axis_report = topology.get("axis_assembly", {})
@@ -184,6 +197,14 @@ def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
         policy["target_mesh_size"] = mesh_size_override
         normalized = dict(normalized)
         normalized["policy"] = policy
+
+    for surface in normalized.get("surfaces", []):
+        rings = surface.get("rings", [])
+        source_rings = surface.get("ring_source_nodes")
+        if source_rings is None or len(rings) != len(source_rings):
+            raise ValueError("missing surface source-node provenance")
+        if any(len(ring) != len(nodes) for ring, nodes in zip(rings, source_rings)):
+            raise ValueError("surface source-node provenance length mismatch")
 
     precision = float(policy["precision"])
     minimum_edge = float(policy["minimum_edge"])
@@ -792,6 +813,211 @@ def reconcile_healed_contact_audit(
     }
 
 
+def audit_semantic_shared_nodes(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    precision: float,
+) -> dict:
+    """Reject shared mesh nodes that have no reconstructed semantic path.
+
+    Surface/surface identity is justified by a finite shared mesh edge or a
+    common source boundary node. Axis/axis identity requires a common source
+    anchor node. Axis/surface identity requires an explicit Rust contact.
+    Transitive paths through those relations are valid; coordinate proximity
+    alone is never a relation.
+    """
+    tolerance = precision * 10.0
+    node_surfaces: dict[int, set[int]] = defaultdict(set)
+    node_axes: dict[int, set[int]] = defaultdict(set)
+    edge_surfaces: dict[tuple[int, int], set[int]] = defaultdict(set)
+
+    for triangle in triangles:
+        surface = int(triangle["source_surface"])
+        a, b, c = triangle["nodes"]
+        node_surfaces[a].add(surface)
+        node_surfaces[b].add(surface)
+        node_surfaces[c].add(surface)
+        for edge in (
+            tuple(sorted((a, b))),
+            tuple(sorted((b, c))),
+            tuple(sorted((c, a))),
+        ):
+            edge_surfaces[edge].add(surface)
+
+    for bar in bars:
+        axis = int(bar["axis"])
+        for node in bar["nodes"]:
+            node_axes[node].add(axis)
+
+    finite_surface_pairs_at_node: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    for edge, owners in edge_surfaces.items():
+        owners = sorted(owners)
+        for i in range(len(owners)):
+            for j in range(i + 1, len(owners)):
+                pair = (owners[i], owners[j])
+                finite_surface_pairs_at_node[edge[0]].add(pair)
+                finite_surface_pairs_at_node[edge[1]].add(pair)
+
+    surface_source_points: list[dict[int, list[tuple[float, float, float]]]] = []
+    for surface in data.get("surfaces", []):
+        mapping: dict[int, list[tuple[float, float, float]]] = defaultdict(list)
+        for ring, source_nodes in zip(
+            surface.get("rings", []), surface.get("ring_source_nodes", [])
+        ):
+            for point, source_node in zip(ring, source_nodes):
+                mapping[int(source_node)].append(tuple(float(x) for x in point))
+        surface_source_points.append(mapping)
+
+    axis_source_points: list[dict[int, tuple[float, float, float]]] = []
+    for axis in data.get("axes", []):
+        axis_source_points.append(
+            {
+                int(anchor["source_node"]): tuple(float(x) for x in anchor["point"])
+                for anchor in axis.get("anchors", [])
+            }
+        )
+
+    contacts_by_pair: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for contact in data.get("contacts", []):
+        contacts_by_pair[(int(contact["axis"]), int(contact["surface"]))].append(contact)
+
+    def relation(
+        node: int,
+        left: tuple[str, int],
+        right: tuple[str, int],
+    ) -> tuple[bool, str | None]:
+        point = coords[node]
+        if left[0] == "surface" and right[0] == "surface":
+            s1, s2 = left[1], right[1]
+            pair = tuple(sorted((s1, s2)))
+            if pair in finite_surface_pairs_at_node.get(node, set()):
+                return True, "shared_surface_edge"
+            common = set(surface_source_points[s1]) & set(surface_source_points[s2])
+            for source_node in common:
+                if any(
+                    distance(candidate, point) <= tolerance
+                    for candidate in surface_source_points[s1][source_node]
+                ) and any(
+                    distance(candidate, point) <= tolerance
+                    for candidate in surface_source_points[s2][source_node]
+                ):
+                    return True, f"shared_surface_source_node:{source_node}"
+            return False, None
+
+        if left[0] == "axis" and right[0] == "axis":
+            a1, a2 = left[1], right[1]
+            common = set(axis_source_points[a1]) & set(axis_source_points[a2])
+            for source_node in common:
+                if (
+                    distance(axis_source_points[a1][source_node], point) <= tolerance
+                    and distance(axis_source_points[a2][source_node], point) <= tolerance
+                ):
+                    return True, f"shared_axis_source_node:{source_node}"
+            return False, None
+
+        axis = left[1] if left[0] == "axis" else right[1]
+        surface = left[1] if left[0] == "surface" else right[1]
+        geometry = data["axes"][axis]
+        parameter, residual = axis_parameter(point, geometry)
+        parameter_tolerance = tolerance / max(axis_length(geometry), tolerance)
+        for contact in contacts_by_pair.get((axis, surface), []):
+            if contact["kind"] == "point":
+                if distance(contact["point"], point) <= tolerance:
+                    return True, "declared_point_contact"
+            elif (
+                residual <= tolerance
+                and float(contact["start_t"]) - parameter_tolerance
+                <= parameter
+                <= float(contact["end_t"]) + parameter_tolerance
+            ):
+                return True, "declared_interval_contact"
+        return False, None
+
+    shared_node_count = 0
+    unintended = []
+    direct_axis_axis = 0
+    mediated_axis_axis = 0
+    unsupported_axis_axis = 0
+    mediated_examples = []
+
+    for node in sorted(set(node_surfaces) | set(node_axes)):
+        owners = [
+            ("surface", surface) for surface in sorted(node_surfaces[node])
+        ] + [("axis", axis) for axis in sorted(node_axes[node])]
+        if len(owners) <= 1:
+            continue
+        shared_node_count += 1
+
+        adjacency = {owner: set() for owner in owners}
+        direct_relations: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+        for i, left in enumerate(owners):
+            for right in owners[i + 1 :]:
+                connected, reason = relation(node, left, right)
+                if connected:
+                    adjacency[left].add(right)
+                    adjacency[right].add(left)
+                    direct_relations[(left, right)] = reason or "semantic_relation"
+
+        components = []
+        owner_component = {}
+        seen = set()
+        for owner in owners:
+            if owner in seen:
+                continue
+            stack = [owner]
+            seen.add(owner)
+            component = []
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                for other in adjacency[current]:
+                    if other not in seen:
+                        seen.add(other)
+                        stack.append(other)
+            component_id = len(components)
+            for item in component:
+                owner_component[item] = component_id
+            components.append(component)
+
+        axes_here = sorted(node_axes[node])
+        for i, a1 in enumerate(axes_here):
+            for a2 in axes_here[i + 1 :]:
+                left = ("axis", a1)
+                right = ("axis", a2)
+                key = (left, right) if (left, right) in direct_relations else (right, left)
+                if key in direct_relations:
+                    direct_axis_axis += 1
+                elif owner_component[left] == owner_component[right]:
+                    mediated_axis_axis += 1
+                    if len(mediated_examples) < 20:
+                        mediated_examples.append(
+                            {"node": node, "axes": [a1, a2], "coordinate": coords[node]}
+                        )
+                else:
+                    unsupported_axis_axis += 1
+
+        if len(components) > 1:
+            unintended.append(
+                {
+                    "node": node,
+                    "coordinate": coords[node],
+                    "components": components,
+                }
+            )
+
+    return {
+        "shared_node_count": shared_node_count,
+        "unintended_shared_node_count": len(unintended),
+        "direct_axis_axis_shared_node_count": direct_axis_axis,
+        "surface_mediated_axis_axis_shared_node_count": mediated_axis_axis,
+        "unsupported_axis_axis_shared_node_count": unsupported_axis_axis,
+        "surface_mediated_axis_axis_examples": mediated_examples,
+        "unintended_shared_nodes": unintended,
+    }
+
+
 @dataclass
 class Fragmentation:
     surface_to_output: list[list[int]]
@@ -1242,6 +1468,9 @@ def run_backend(
     raw_quality = quality(coords, triangles)
     raw_shared = shared_mesh_edges_by_source(triangles)
     raw_contact_audit = audit_contacts(data, coords, triangles, bars, precision)
+    semantic_node_audit = audit_semantic_shared_nodes(
+        data, coords, triangles, bars, precision
+    )
     healed_triangles, node_mapping, healing = heal_micro_edges(
         coords, triangles, minimum_edge, precision
     )
@@ -1317,6 +1546,8 @@ def run_backend(
         blockers.append("near_degenerate_triangle_after_healing")
     if contact_audit["failed_contact_count"]:
         blockers.append("nonconforming_bar_surface_contact")
+    if semantic_node_audit["unintended_shared_node_count"]:
+        blockers.append("unintended_shared_mesh_node")
 
     if write_msh:
         gmsh.write(str(write_msh))
@@ -1349,6 +1580,7 @@ def run_backend(
         "physical_groups": groups,
         "contact_embedding": contact_embedding,
         "bar_surface_contacts_before_healing": summarize_contact_audit(raw_contact_audit),
+        "semantic_shared_nodes_before_healing": semantic_node_audit,
         "bar_surface_contacts_strict_after_healing": summarize_contact_audit(
             strict_healed_contact_audit
         ),
@@ -1386,6 +1618,7 @@ def synthetic_report() -> dict:
                 [2.0, 1.0, 0.0],
                 [-2.0, 1.0, 0.0],
             ]],
+            "ring_source_nodes": [[1, 2, 3, 4]],
         },
         {
             "source_surface": 1,
@@ -1398,6 +1631,7 @@ def synthetic_report() -> dict:
                 [0.0, 2.0, 1.0],
                 [0.0, -2.0, 1.0],
             ]],
+            "ring_source_nodes": [[5, 6, 7, 8]],
         },
     ]
     axes = [
@@ -1463,6 +1697,7 @@ def self_test() -> dict:
     assert result["mesh"]["bar_count"] > 0
     assert result["bar_surface_contacts"]["contact_count"] == 2
     assert result["bar_surface_contacts"]["failed_contact_count"] == 0
+    assert result["semantic_shared_nodes_before_healing"]["unintended_shared_node_count"] == 0
     assert not result["surface_ownership_conflicts"]
     assert not result["curve_ownership_conflicts"]
     assert any(
@@ -1526,6 +1761,32 @@ def self_test() -> dict:
     assert reconciled["failed_contact_count"] == 0
     assert reconciled["accepted_by_healing_count"] == 1
     assert reconciled["details"][0]["conformity"] == "healed_shared_node"
+
+    unsupported = audit_semantic_shared_nodes(
+        {
+            "surfaces": [],
+            "axes": [
+                {
+                    "endpoints": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                    "anchors": [{"source_node": 1, "point": [0.0, 0.0, 0.0]}],
+                },
+                {
+                    "endpoints": [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    "anchors": [{"source_node": 2, "point": [0.0, 0.0, 0.0]}],
+                },
+            ],
+            "contacts": [],
+        },
+        {1: (0.0, 0.0, 0.0), 2: (1.0, 0.0, 0.0), 3: (0.0, 1.0, 0.0)},
+        [],
+        [
+            {"nodes": (1, 2), "axis": 0},
+            {"nodes": (1, 3), "axis": 1},
+        ],
+        1e-8,
+    )
+    assert unsupported["unintended_shared_node_count"] == 1
+    assert unsupported["unsupported_axis_axis_shared_node_count"] == 1
     return result
 
 
