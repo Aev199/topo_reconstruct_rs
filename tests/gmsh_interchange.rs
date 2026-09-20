@@ -134,46 +134,52 @@ fn interchange_is_invariant_in_structure_under_scale_rotation_and_renumbering() 
     assert_eq!(baseline.surfaces.len(), changed.surfaces.len());
     assert_eq!(baseline.axes.len(), changed.axes.len());
     assert_eq!(baseline.contacts.len(), changed.contacts.len());
-    assert_eq!(
-        baseline
+    let surface_signature = |data: &gmsh::Interchange| {
+        let mut values = data
             .surfaces
             .iter()
             .map(|surface| (surface.stiffness, surface.source_elements.len(), surface.rings.len()))
-            .collect::<Vec<_>>(),
-        changed
-            .surfaces
-            .iter()
-            .map(|surface| (surface.stiffness, surface.source_elements.len(), surface.rings.len()))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        baseline
-            .axes
-            .iter()
-            .map(|axis| {
-                axis.property_spans
-                    .iter()
-                    .map(|span| span.stiffness)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>(),
-        changed
-            .axes
-            .iter()
-            .map(|axis| {
-                axis.property_spans
-                    .iter()
-                    .map(|span| span.stiffness)
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-    );
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    };
+    assert_eq!(surface_signature(&baseline), surface_signature(&changed));
 
-    for (a, b) in baseline.axes.iter().zip(&changed.axes) {
-        let baseline_length =
-            DVec3::from_array(a.endpoints[0]).distance(DVec3::from_array(a.endpoints[1]));
-        let changed_length =
-            DVec3::from_array(b.endpoints[0]).distance(DVec3::from_array(b.endpoints[1]));
+    let axis_signature = |data: &gmsh::Interchange| {
+        let mut values = data
+            .axes
+            .iter()
+            .map(|axis| {
+                let mut stiffness = axis
+                    .property_spans
+                    .iter()
+                    .map(|span| span.stiffness)
+                    .collect::<Vec<_>>();
+                stiffness.sort_unstable();
+                stiffness
+            })
+            .collect::<Vec<_>>();
+        values.sort();
+        values
+    };
+    assert_eq!(axis_signature(&baseline), axis_signature(&changed));
+
+    let axis_lengths = |data: &gmsh::Interchange| {
+        let mut values = data
+            .axes
+            .iter()
+            .map(|axis| {
+                DVec3::from_array(axis.endpoints[0])
+                    .distance(DVec3::from_array(axis.endpoints[1]))
+            })
+            .collect::<Vec<_>>();
+        values.sort_by(f64::total_cmp);
+        values
+    };
+    for (baseline_length, changed_length) in axis_lengths(&baseline)
+        .into_iter()
+        .zip(axis_lengths(&changed))
+    {
         assert!((changed_length / baseline_length - 10.0).abs() < 1e-8);
     }
 }
