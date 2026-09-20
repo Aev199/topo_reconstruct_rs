@@ -1,6 +1,14 @@
 name: Gmsh backend probe
 
 on:
+  push:
+    branches:
+      - experiment/gmsh-occ-backend
+    paths:
+      - scripts/gmsh_occ_trial.py
+      - src/reconstruction/gmsh.rs
+      - tests/gmsh_interchange.rs
+      - .github/workflows/gmsh-probe.yml
   workflow_dispatch:
 
 jobs:
