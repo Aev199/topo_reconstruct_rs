@@ -116,3 +116,63 @@ and a dangling beam verifying material-only seeding, preserved constraints,
 area coverage and the zero-budget case. The independent assembly checker passes;
 an independent calculation from all triangle coordinates confirms maximum area,
 minimum angle, positive triangle areas and the 163 remaining angle violations.
+
+## Global surface-junction audit, 2026-09-20
+
+The user accepted the current triangle quality for a trial MIDAS import; further
+20-degree refinement is not the priority. The independent global audit of the
+`b18e2d4` full-model report **does not pass**. The earlier trial handoff flag must
+not be interpreted as global geometric validity.
+
+`scripts/check_v2_global_geometry.py` checks planar polygon validity, positive-area
+coplanar overlap, and positive-length surface intersections. It distinguishes
+boundary contacts, T-junctions and interior crossings. A junction is represented
+only when shared model edge IDs cover its entire length. When a mesh is supplied,
+shared triangle edge IDs must independently cover that length. Merely coincident
+coordinates do not establish a shared connection. Each issue includes surface IDs,
+endpoints, length and both conformity flags. Counts refer to intersection segments,
+which may be subdivided by source boundary vertices, not independent defects.
+
+| Full-model check | Result |
+|---|---:|
+| Surfaces checked | 388 |
+| Candidate surface pairs | 1426 |
+| Invalid individual surfaces | 0 |
+| Maximum boundary planarity error, m | 3.795e-15 |
+| Positive-area coplanar overlaps detected | 0 |
+| Parallel face pairs within 50 mm with projected overlap | 0 |
+| Conforming boundary contact segments | 830 |
+| Unrepresented intersection segments | 520 |
+| Distinct affected surface pairs | 109 |
+| T-junction segments requiring geometry conformity | 498 |
+| Interior crossing segments requiring geometry conformity | 20 |
+| Boundary junction segments requiring conformity | 2 |
+| Above segments already conforming in the mesh | 65 |
+| Above segments also lacking shared mesh edges | 455 |
+
+These are meaningful structural junctions, not surfaces to delete. For example,
+surfaces 0/34 meet along an 8.5 m T-junction and surfaces 35/270 have an interior
+crossing about 5.1134 m long. The next repair must insert their intersection lines
+as shared constraints and split affected surface regions, preserving property
+provenance and synchronizing mesh vertices on both sides. The auditor itself is
+read-only and does not change the accepted mesh or geometry.
+
+The audit is deliberately incomplete: isolated point contacts, nonparallel
+near-misses, bar-bar intersections and load/property transfer are not checked.
+`audit_complete` and `solver_import_verified` remain false even if the implemented
+surface checks pass. Near-face findings are review items, not automatic merges.
+A successful PLAXIS or MIDAS import has not been demonstrated.
+
+Reproduction (optional Python audit dependencies):
+
+```sh
+python3 -m pip install -r scripts/requirements-audit.txt
+python3 -m unittest discover -s scripts -p test_v2_global_geometry.py
+python3 scripts/check_v2_global_geometry.py refined-final.json --output global-audit.json --strict
+```
+
+Ten analytic regression tests cover shared boundaries, T-junctions, crossings,
+coplanar overlaps, near faces, disjoint surfaces, holes, duplicated mesh node IDs,
+and translated/reversed-normal geometry. The full-model strict run exits 1 as
+expected and writes the complete diagnostic report before exiting. Private source
+coordinates and the full report are not committed.
