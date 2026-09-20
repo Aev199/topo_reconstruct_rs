@@ -24,9 +24,12 @@ path.
 3. Gmsh/OpenCASCADE performs exact mixed-dimensional General Fuse.
 4. Only Rust-declared rod/surface contacts are explicitly mesh-embedded.
 5. Gmsh creates the conforming 2D/1D mesh.
-6. A conservative local cleanup handles only sub-resolution connected
-   micro-edge components and logs every node move.
-7. Independent audits decide whether the result satisfies the geometry contract.
+6. Conservative local repairs handle only proven sub-resolution micro-edges
+   and sliver-producing near-vertex junctions inside the explicit engineering
+   movement budget; every node move is logged.
+7. Unsupported geometric point-only contacts are separated by node identity
+   without moving their coordinates.
+8. Independent audits decide whether the result satisfies the geometry contract.
 
 The old custom Rust mesher/junction implementation remains a fallback/reference
 until solver import is verified.
@@ -163,47 +166,64 @@ Independent private-model coverage verification:
 - 0 shell stiffness mismatches;
 - 0 bar stiffness mismatches.
 
+## Multi-model geometry regression
+
+Geometry is now exercised on three private real FE fixtures with one common
+policy. The detailed matrix is in `docs/GEOMETRY_REGRESSION_MATRIX.md`.
+
+All three currently satisfy `backend_ready=true`, complete source/property
+coverage, zero duplicate/degenerate compact elements, zero failed declared
+bar/surface contacts, zero unintended final shared nodes, zero finite
+surface-pair changes caused by repair and numerical surface planarity.
+
+The new fixtures established two general rules:
+
+- near-vertex junction regularization is allowed only for sliver-producing
+  edges, inside the 50 mm engineering movement budget, never for a real source
+  boundary edge, with explicit move provenance;
+- unsupported isolated point-only CAD contacts are separated by node identity
+  at unchanged coordinates.
+
+These rules are inactive on the clean `skala2` control fixture and the
+near-vertex rule is inactive on `skala1`, providing a non-regression check.
+
 ## MIDAS adapter state
 
-`scripts/midas_fpn.py` now validates the solver mesh and produces a deterministic
-`topo-reconstruct-midas-gts-plan-v1`:
-
-- 1-based MIDAS node numbering;
-- globally unique shell + bar element numbering;
-- planned TRIA/LINE connectivity;
-- dimensionality-separated stiffness mesh sets;
-- retained region/provenance mapping.
-
-Direct FPN serialization remains intentionally disabled until the exact modern
-GTS NX record layout is calibrated on one tiny target-version FPN export.
-See `docs/MIDAS_FPN_ADAPTER.md`.
+The neutral solver-mesh boundary and the preliminary MIDAS import-plan code
+remain in the branch, but FPN work is **paused**. Current development priority
+is broader geometry validation.
 
 ## Current readiness
 
-The implemented surface/surface, rod/surface and shared-node semantic topology
-classes are verified on the private full model. The final compact solver mesh
-also passes property/source coverage checks.
+The geometry backend is multi-model regression-tested, but additional diverse
+real FE fixtures are still valuable before declaring the geometry problem
+closed.
 
-The project is **not** final solver readiness yet. Still required:
+Current strict gates are:
 
-- calibrate the exact target-version GTS NX FPN serialization;
-- import a tiny generated fixture into MIDAS;
-- import the private full solver mesh into MIDAS;
-- PLAXIS geometry export/import verification;
-- loads, materials, stages and other analysis semantics later.
+- complete region/source-element/property coverage;
+- no invalid, degenerate or duplicate compact elements;
+- all declared mixed-dimensional contacts conforming;
+- no unintended shared-node semantics;
+- no repair-induced loss or creation of finite shared-surface pairs;
+- numerical surface planarity;
+- bounded, provenance-logged geometry movement.
 
-Final `export_ready` flags must remain false until target-program import is
-verified.
+Mesh-angle statistics remain diagnostics. A few local low-angle triangles are
+not by themselves a topology failure if all geometry gates pass.
+
+Final `export_ready` remains false; solver-specific export/import work is
+deliberately deferred.
 
 ## Next coherent development batch
 
-1. Keep `topo-reconstruct-solver-mesh-v1` as the stable adapter boundary.
-2. Obtain/inspect one minimal target-version GTS NX FPN reference file.
-3. Implement the calibrated FPN writer from the already deterministic MIDAS
-   import plan.
-4. Validate a tiny generated file in MIDAS before the private full model.
-5. Only after actual solver rejection consider further local mesh-quality
-   repairs.
+1. Keep the three current private fixtures as mandatory geometry regressions.
+2. Add more structurally different real FE fixtures when available.
+3. Improve geometry logic only when a new fixture exposes a general topology
+   class, not to optimize isolated mesh-angle outliers.
+4. Keep `topo-reconstruct-solver-mesh-v1` stable while geometry validation
+   continues.
+5. Do not resume FPN serialization until geometry coverage is broad enough.
 
 ## Efficient execution / Actions
 
