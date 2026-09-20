@@ -67,7 +67,7 @@ impl PlaneFrame {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EdgeUse {
     pub edge: usize,
     pub reversed: bool,
