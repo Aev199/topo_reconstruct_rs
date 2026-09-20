@@ -102,6 +102,14 @@ fn interchange_preserves_surface_property_and_source_ownership() {
         .iter()
         .flat_map(|surface| &surface.rings)
         .all(|ring| ring.len() >= 3 && ring.iter().flatten().all(|x| x.is_finite())));
+    assert!(data.surfaces.iter().all(|surface| {
+        surface.rings.len() == surface.ring_source_nodes.len()
+            && surface
+                .rings
+                .iter()
+                .zip(&surface.ring_source_nodes)
+                .all(|(ring, source_nodes)| ring.len() == source_nodes.len())
+    }));
 }
 
 #[test]
