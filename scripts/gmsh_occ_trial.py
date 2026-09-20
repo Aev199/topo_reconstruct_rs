@@ -99,6 +99,66 @@ def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
                     ],
                 }
             )
+        axis_report = topology.get("axis_assembly", {})
+        axes = []
+        for axis in axis_report.get("axes", []):
+            endpoints = [model["vertices"][int(vertex)] for vertex in axis["endpoints"]]
+            axes.append(
+                {
+                    "source_axis": int(axis["source_axis"]),
+                    "endpoints": endpoints,
+                    "property_spans": [
+                        {
+                            "source_element": int(span["element"]),
+                            "stiffness": int(span["stiffness"]),
+                            "start_t": float(span["start_t"]),
+                            "end_t": float(span["end_t"]),
+                        }
+                        for span in axis.get("spans", [])
+                    ],
+                    "anchors": [
+                        {
+                            "source_node": int(anchor["source_node"]),
+                            "t": float(anchor["t"]),
+                            "point": model["vertices"][int(anchor["vertex"])],
+                        }
+                        for anchor in axis.get("anchors", [])
+                    ],
+                }
+            )
+
+        contacts = []
+        for contact in axis_report.get("contacts", []):
+            axis_index = int(contact["axis"])
+            item = {
+                "kind": contact["kind"],
+                "axis": axis_index,
+                "surface": int(contact["surface"]),
+                "location": contact["location"],
+            }
+            if contact["kind"] == "point":
+                t = float(contact["t"])
+                item.update(
+                    {
+                        "t": t,
+                        "point": list(axis_point(axes[axis_index], t)),
+                    }
+                )
+            else:
+                start_t = float(contact["start_t"])
+                end_t = float(contact["end_t"])
+                item.update(
+                    {
+                        "start_t": start_t,
+                        "end_t": end_t,
+                        "endpoints": [
+                            list(axis_point(axes[axis_index], start_t)),
+                            list(axis_point(axes[axis_index], end_t)),
+                        ],
+                    }
+                )
+            contacts.append(item)
+
         policy = topology.get("policy", {})
         normalized = {
             "format": INPUT_FORMAT,
@@ -110,11 +170,11 @@ def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
             },
             "source_coverage_complete": bool(
                 topology.get("all_surface_patches_built", True)
-                and topology.get("axis_assembly", {}).get("all_axes_built", True)
+                and axis_report.get("all_axes_built", True)
             ),
             "surfaces": surfaces,
-            "axes": [],
-            "contacts": [],
+            "axes": axes,
+            "contacts": contacts,
             "blockers": [],
         }
 
