@@ -1,179 +1,143 @@
 # Development state
 
 Updated: 2026-09-20
-Repository baseline reviewed through commit `2e1a9a2`.
 
-This file is intentionally short. It is the entry point for the next development
-session; detailed rationale belongs in `docs/GEOTECHNICAL_GEOMETRY.md` and
-`docs/RECONSTRUCTION_V2.md`.
+This file is intentionally short. Detailed reconstruction rules remain in
+`docs/GEOTECHNICAL_GEOMETRY.md` and `docs/RECONSTRUCTION_V2.md`. The verified
+Gmsh experiment is documented in `docs/GMSH_OCC_TRIAL.md`.
 
 ## Product objective
 
-Produce valid, connected structural geometry from imperfect FE input for:
+Produce robust structural geometry from imperfect FE input for PLAXIS geometry
+and a quality conforming MIDAS mesh. Exact reproduction of the source FE
+tessellation is secondary.
 
-- reliable remeshing / geometry import in PLAXIS;
-- a quality conforming mesh for MIDAS;
-- later transfer of structural properties, loads and provenance.
+## Verified Rust baseline
 
-Exact reproduction of the source FE tessellation is not the objective.
+Before the Gmsh/OpenCASCADE experiment the private full model had a usable local
+surface mesh, approximately:
 
-## Current verified state
-
-The current geotechnical assembly preserves supported source coverage on the
-private full `скала1` fixture:
-
-- 388 assembled surfaces;
-- 581 assembled axes;
-- 0 unresolved supported surface source elements in the mesh;
-- 0 unresolved supported axis source elements in the mesh;
-- trial topology gate passes;
-- external-mesher trial gate passes;
-- no invalid individual surfaces in the current global surface audit;
-- maximum reported boundary planarity error: 3.795e-15 m;
-- no positive-area coplanar overlaps detected;
-- no parallel projected-overlap near-face findings within the implemented
-  50 mm audit check.
-
-Interior mesh refinement was repaired. On the last verified full-model run:
-
-- maximum triangle area: 0.399988 m²;
-- minimum triangle angle: 2.39098°;
-- triangles below 20°: 163;
 - 22,170 shell triangles;
-- 4,482 bar segments;
-- refinement cap is not reached.
+- maximum triangle area about 0.400 m²;
+- minimum triangle angle about 2.39°;
+- 163 triangles below 20°.
 
-The user accepted the present local triangle quality as adequate for the next
-MIDAS-oriented step. Do not spend the next batch chasing the 20° target unless a
-new solver/import failure shows it is necessary.
+The remaining blocker was global surface-junction conformity.
 
-## Current blocker
+## Verified Gmsh/OpenCASCADE experiment
 
-The global surface-junction audit does **not** pass.
+On an existing v2 preview of the private full model, the independent input audit
+found 1,258 finite surface-contact segments and 524 unrepresented junction
+segments.
 
-Last verified audit:
+Passing the reconstructed planar surfaces through OpenCASCADE General Fuse via
+Gmsh `occ.fragment()` fixed **524 / 524** previously unrepresented segments.
+A strict shared-mesh-edge audit found:
 
-- 1,426 candidate surface pairs;
-- 830 conforming boundary-contact segments;
-- 520 unrepresented intersection segments;
-- 109 distinct affected surface pairs;
-- 498 T-junction segments requiring conformity;
-- 20 interior-crossing segments requiring conformity;
-- 2 boundary-junction segments requiring conformity;
-- 65 of those segments already conforming in the mesh;
-- 455 still lacking shared mesh-edge coverage.
+- 0 remaining unrepresented tested surface contacts;
+- 0 regressions among previously conforming contacts;
+- all tested T-junction and interior-crossing classes conforming.
 
-These are structural junctions to represent, not surfaces to delete.
+The exact Boolean operation produced 444 output faces from 387 input surfaces.
+The returned input-to-output map is sufficient to carry source-surface
+provenance through fragmentation.
+
+A global fuzzy Boolean tolerance is rejected: even 0.1 mm changed the
+fragmentation too aggressively and lost expected junction representation.
+
+## Selected experimental mesh policy
+
+Use exact General Fuse, then:
+
+- explicit target size, currently 0.75 m for the full-model trial;
+- `MeshSizeFromPoints=0`;
+- `MeshSizeFromCurvature=0`;
+- `MeshSizeExtendFromBoundary=0`;
+- 10 smoothing passes;
+- `Relocate2D` optimization;
+- local minimum-edge cleanup only for connected sub-resolution mesh edges.
+
+The full-model General Fuse produced one pathological CAD micro-edge of about
+0.036 mm. Its local mesh component is safely handled by keeping the existing
+multi-surface junction node fixed and collapsing only the adjacent parasitic
+nodes. No nearest-neighbor weld is allowed.
+
+With a 0.75 m target size after this cleanup:
+
+- 20,108 triangles;
+- maximum triangle area about 0.372 m²;
+- minimum triangle angle about 8.13°;
+- 8 triangles below 20°;
+- 0 tested surface-contact defects;
+- only two parasitic nodes merged;
+- maximum node movement about 0.084 mm;
+- three degenerate sliver triangles removed.
+
+This is currently better than the custom Rust meshing baseline on both tested
+junction conformity and triangle-quality outliers while keeping a comparable
+mesh size.
+
+## Architecture direction
+
+Do **not** continue building a custom general-purpose surface Boolean/junction
+kernel as the primary path.
+
+Preferred split:
+
+1. Rust reconstructs engineering meaning: axes, planes, contours/openings,
+   properties, movement bounds and provenance.
+2. Gmsh/OpenCASCADE performs exact surface fragmentation and conformal CAD
+   topology.
+3. Gmsh generates the surface mesh for MIDAS.
+4. A small deterministic post-process removes only sub-resolution micro-edge
+   artifacts while preserving proven junction nodes and logging movement.
+5. Independent project audits verify the result.
+6. PLAXIS can consume the healed conformal geometry and remesh it itself.
+
+The custom surface-junction branch/PR remains a fallback/reference until the
+Gmsh adapter is integrated, but should not be merged as the primary solution.
 
 ## Next coherent development batch
 
-### Goal
+Integrate the experimental backend without disturbing the existing working
+pipeline:
 
-Make surface-surface junctions topologically explicit and mesh-conforming for
-the intersection classes already detected by the global auditor.
+- define a stable Rust -> Gmsh interchange representation;
+- preserve stiffness/property/source-element ownership through
+  `occ.fragment()` output mapping;
+- implement deterministic minimum-edge mesh cleanup with movement/provenance
+  diagnostics;
+- carry rods/axes and their surface contacts into the fragmented model;
+- add synthetic regression fixtures for T-junctions, crossings, openings,
+  property boundaries and sub-resolution edge cleanup;
+- keep the old mesher available behind a backend choice until the new path
+  passes MIDAS import and PLAXIS geometry verification.
 
-### Required approach
+Do not optimize the old custom surface-junction implementation further unless
+the Gmsh path exposes a class it cannot represent.
 
-- Derive intersection lines geometrically from the participating surfaces.
-- Insert the junction into the shared topology, not independently into two
-  coincident meshes.
-- Split affected surface regions as needed.
-- Synchronize mesh vertices/edges on both sides of the junction.
-- Preserve property/material regions and source provenance through the split.
-- Treat T-junctions, interior crossings and boundary contacts by geometry class,
-  not by source IDs.
-- Keep the global auditor independent/read-only.
+## Still not globally complete
 
-### Regression cases before/with implementation
-
-At minimum cover:
-
-- a T-junction terminating in another panel interior;
-- two panels with an interior crossing;
-- a junction ending on an existing boundary vertex;
-- a junction that crosses a property-region boundary;
-- reversed surface orientation/normals;
-- translated/rotated geometry;
-- a nearby but non-intersecting surface pair that must remain separate.
-
-Where practical, verify idempotence: assembling an already conforming junction
-must not continue splitting or moving it.
-
-### Batch acceptance
-
-Tier A:
-
-```sh
-cargo test --offline
-```
-
-Relevant global-audit Python unit tests must also pass.
-
-Before the private full-model run, the synthetic cases must demonstrate shared
-model-edge identity and shared mesh-edge coverage along the whole expected
-junction.
-
-On the private full model, compare at least:
-
-- invalid surfaces;
-- coplanar overlaps;
-- unrepresented intersection segments;
-- affected surface pairs;
-- mesh-conforming intersection segments;
-- unresolved source-element coverage;
-- surface/axis counts;
-- triangle/bar-segment counts;
-- provenance/reconciliation failures.
-
-The batch must not trade fewer junction defects for new invalid faces,
-overlaps, lost provenance or missing source-element coverage.
-
-A useful target is to eliminate the currently implemented classes of
-unrepresented junctions. If some remain, classify the residual geometry and add
-a regression case instead of relaxing the audit.
-
-## Explicitly not complete yet
-
-Even if the next surface-junction batch passes, global readiness is not yet
-proven. Remaining audit scope includes:
+The current successful audit covers finite surface-surface contact segments. It
+does not yet prove:
 
 - isolated point contacts;
 - non-parallel near misses;
 - bar-bar intersections;
-- full load/property transfer verification;
-- actual MIDAS/PLAXIS import verification.
+- complete loads/properties transfer;
+- actual MIDAS import;
+- actual PLAXIS geometry import.
 
-Do not set `export_ready` or equivalent final-readiness flags merely because
-the current surface audit becomes green.
+Final readiness flags must remain false until those checks exist.
 
-## Efficient execution policy
+## Efficient execution / Actions
 
-Use `AGENTS.md` for the full development workflow.
+Use `AGENTS.md` as the development contract.
 
-In particular:
+Normal push/PR CI on `main` is one Ubuntu `cargo test --locked` job.
+Cross-platform release builds are manual only. The Gmsh runtime probe in this
+experiment branch is also manual-only; the private full model must never be put
+in Actions.
 
-- use small synthetic regressions as the inner loop;
-- use the private full model only as an integration gate;
-- perform one coherent implementation/test/review batch before asking the user
-  for another "continue";
-- do not add model-specific exceptions;
-- update this file only after verified state or priorities change.
-
-## GitHub Actions budget
-
-The repository is public, so standard hosted-runner compute is currently free
-for public-repository Actions. Still avoid waste because artifact/cache storage,
-queue time and developer attention remain finite.
-
-Current `.github/workflows/build.yml` builds Windows and Ubuntu release
-binaries on pushes/PRs and can also be dispatched manually. During geometry
-iteration:
-
-- use `[skip ci]` when a cross-platform release build adds no information;
-- do not use Actions for the private full-model loop;
-- avoid unnecessary reruns;
-- keep artifact-producing runs for points where a binary is actually useful.
-
-Revisit the workflow itself only if artifact storage or unnecessary
-cross-platform builds become a practical issue; do not redesign CI merely for
-the sake of redesigning it.
+Use local/synthetic regressions as the inner loop and the private full model only
+as an integration gate.
