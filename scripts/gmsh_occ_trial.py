@@ -2,7 +2,7 @@
 """Gmsh/OpenCASCADE backend prototype for topo_reconstruct_rs.
 
 The JSON result keeps scalar quality counters separate from mesh arrays.
-Mixed-dimensional regression covers both embedded rod intervals and point crossings.
+Mixed-dimensional regression covers embedded rods, junction regularization and semantic point splitting.
 
 The preferred input is the versioned `topo-reconstruct-gmsh-v1` interchange
 emitted by Rust. Legacy v2 preview JSON is accepted only to keep the private
@@ -1176,7 +1176,7 @@ def reconcile_moved_contact_audit(
                 moves.extend(component.get("moves", []))
     result = []
     failed = 0
-    accepted_by_healing = 0
+    accepted_by_repair_provenance = 0
     if len(raw["details"]) != len(strict_after_repairs["details"]):
         raise RuntimeError("contact audit length changed across geometry repairs")
 
@@ -1211,7 +1211,7 @@ def reconcile_moved_contact_audit(
                 item["repair_movement"] = movement
                 item["repair_from_node"] = int(move["from"])
                 item["repair_to_node"] = int(move["to"])
-                accepted_by_healing += 1
+                accepted_by_repair_provenance += 1
                 break
 
         if not accepted:
@@ -1223,7 +1223,7 @@ def reconcile_moved_contact_audit(
         "contact_count": len(result),
         "conforming_contact_count": len(result) - failed,
         "failed_contact_count": failed,
-        "accepted_by_healing_count": accepted_by_healing,
+        "accepted_by_repair_provenance_count": accepted_by_repair_provenance,
         "details": result,
     }
 
@@ -2565,7 +2565,7 @@ def self_test() -> dict:
         fake_data, raw_audit, strict_audit, [report], 1e-8
     )
     assert reconciled["failed_contact_count"] == 0
-    assert reconciled["accepted_by_healing_count"] == 1
+    assert reconciled["accepted_by_repair_provenance_count"] == 1
     assert reconciled["details"][0]["conformity"] == "micro_edge_healing"
 
     unsupported = audit_semantic_shared_nodes(
