@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Gmsh/OpenCASCADE backend prototype for topo_reconstruct_rs.
 
+The JSON result keeps scalar quality counters separate from mesh arrays.
+
 The preferred input is the versioned `topo-reconstruct-gmsh-v1` interchange
 emitted by Rust. Legacy v2 preview JSON is accepted only to keep the private
 full-model regression reproducible during migration.
