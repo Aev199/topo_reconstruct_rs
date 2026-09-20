@@ -658,7 +658,7 @@ fn assemble_impl(
             }),
         }
     }
-    let axis_assembly = bars::assemble(
+    let mut axis_assembly = bars::assemble(
         mesh,
         source,
         &mut model,
@@ -673,6 +673,27 @@ fn assemble_impl(
     // materialized so generated junction vertices cannot disturb the
     // source-node-to-vertex prefix used by axis assembly.
     let surface_junctions = junctions::conform(&mut model, policy.precision)?;
+    // Two independently assembled source surfaces can carry distinct vertex
+    // identities at the same verified junction point. When the junction pass
+    // canonicalizes those identities, keep all already assembled bar anchors
+    // and point contacts on the same canonical model vertex as the surfaces.
+    let replacements: BTreeMap<_, _> = surface_junctions
+        .vertex_replacements
+        .iter()
+        .map(|item| (item.from, item.to))
+        .collect();
+    let remap = |vertex: usize| replacements.get(&vertex).copied().unwrap_or(vertex);
+    for axis in &mut axis_assembly.axes {
+        axis.endpoints = axis.endpoints.map(remap);
+        for anchor in &mut axis.anchors {
+            anchor.vertex = remap(anchor.vertex);
+        }
+    }
+    for contact in &mut axis_assembly.contacts {
+        if let bars::Contact::Point { vertex, .. } = contact {
+            *vertex = remap(*vertex);
+        }
+    }
     Ok(Report {
         policy: policy.clone(),
         export_ready: false,
