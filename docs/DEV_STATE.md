@@ -110,18 +110,85 @@ Micro-edge cleanup on this full run:
 - 0 bar elements removed;
 - 0 unresolved cleanup components.
 
+## Semantic shared-node gate
+
+Geometric coincidence produced by OCC is not automatically treated as a
+structural connection.
+
+Before healing, every mesh node with more than one surface/axis owner is checked
+against a semantic owner graph. Allowed direct relations are:
+
+- surface/surface: a finite shared mesh edge or a common source boundary node;
+- axis/axis: a common source anchor node;
+- axis/surface: an explicit Rust-declared point or interval contact.
+
+Transitive connectivity through valid relations is allowed. Coordinate
+proximity alone is never a relation.
+
+Private full-model result:
+
+- 3,340 shared mesh nodes checked;
+- 0 unintended shared nodes;
+- 1,335 direct axis/axis shared-node relations;
+- 1 axis/axis relation connected transitively through valid surface semantics;
+- 0 unsupported axis/axis shared-node relations.
+
+This audit is a blocker: any disconnected semantic owner components sharing one
+mesh node make the backend not ready.
+
+## Frozen solver-mesh contract
+
+The Gmsh backend now produces a separate
+`topo-reconstruct-solver-mesh-v1` package. Solver adapters depend only on this
+package, not on OCC tags or internal reconstruction structures.
+
+It contains:
+
+- compact global vertices;
+- triangular shell elements;
+- two-node bar elements;
+- surface regions with stiffness/source provenance;
+- bar regions with axis/span/stiffness/source provenance.
+
+The standalone package is written only after a clean coverage audit.
+
+Independent private-model coverage verification:
+
+- 387 / 387 surface regions represented;
+- 2,601 / 2,601 bar regions represented;
+- 13,301 / 13,301 source shell elements covered;
+- 2,601 / 2,601 source bar elements covered;
+- 0 invalid or degenerate compact shell elements;
+- 0 invalid or degenerate compact bar elements;
+- 0 shell stiffness mismatches;
+- 0 bar stiffness mismatches.
+
+## MIDAS adapter state
+
+`scripts/midas_fpn.py` now validates the solver mesh and produces a deterministic
+`topo-reconstruct-midas-gts-plan-v1`:
+
+- 1-based MIDAS node numbering;
+- globally unique shell + bar element numbering;
+- planned TRIA/LINE connectivity;
+- dimensionality-separated stiffness mesh sets;
+- retained region/provenance mapping.
+
+Direct FPN serialization remains intentionally disabled until the exact modern
+GTS NX record layout is calibrated on one tiny target-version FPN export.
+See `docs/MIDAS_FPN_ADAPTER.md`.
+
 ## Current readiness
 
-The geometry backend is now verified for the implemented surface/surface and
-rod/surface contact classes on the private full model. It is **not** final
-solver readiness yet.
+The implemented surface/surface, rod/surface and shared-node semantic topology
+classes are verified on the private full model. The final compact solver mesh
+also passes property/source coverage checks.
 
-Still required:
+The project is **not** final solver readiness yet. Still required:
 
-- independent bar/bar intersection audit;
-- property/source coverage audit on the final compact mesh package;
-- choose and implement the MIDAS GTS NX import path;
-- actual MIDAS import verification;
+- calibrate the exact target-version GTS NX FPN serialization;
+- import a tiny generated fixture into MIDAS;
+- import the private full solver mesh into MIDAS;
 - PLAXIS geometry export/import verification;
 - loads, materials, stages and other analysis semantics later.
 
@@ -130,15 +197,13 @@ verified.
 
 ## Next coherent development batch
 
-1. Add a bar/bar intersection audit and prove that General Fuse gives shared
-   mesh-node identity at every declared/actual rod intersection.
-2. Freeze the compact solver-mesh result schema: global vertices, shell
-   triangles, bar segments, stiffness IDs and source provenance.
-3. Build the first MIDAS adapter around that schema instead of around internal
-   Rust/Gmsh structures.
-4. Use a tiny synthetic import fixture before trying the private full model.
-5. Only after a successful target-program import consider local mesh-quality
-   repairs for any solver-rejected elements.
+1. Keep `topo-reconstruct-solver-mesh-v1` as the stable adapter boundary.
+2. Obtain/inspect one minimal target-version GTS NX FPN reference file.
+3. Implement the calibrated FPN writer from the already deterministic MIDAS
+   import plan.
+4. Validate a tiny generated file in MIDAS before the private full model.
+5. Only after actual solver rejection consider further local mesh-quality
+   repairs.
 
 ## Efficient execution / Actions
 
