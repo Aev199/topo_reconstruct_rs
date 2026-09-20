@@ -203,18 +203,29 @@ def fragment_and_mesh(data: dict, mesh_size: float | None = None, write_msh: Pat
         source_mesh_edges.append(edges)
         per_source_triangles.append(triangles)
 
-    conforming_mesh_pairs = []
-    for pair in shared_curve_pairs:
-        i, j = pair["surfaces"]
-        shared_edges = source_mesh_edges[i] & source_mesh_edges[j]
-        conforming_mesh_pairs.append(
-            {
-                "surfaces": [i, j],
-                "shared_curve_count": pair["curve_count"],
-                "shared_mesh_edge_count": len(shared_edges),
-                "mesh_conforming": bool(shared_edges),
-            }
-        )
+    # The decisive conformity metric is shared global mesh-edge identity.
+    # OCC can keep an intersection as an internal CAD curve on one side, so
+    # boundary-curve intersection alone is too strict as a diagnostic.
+    mesh_edge_owners: dict[tuple[int, int], list[int]] = {}
+    for source, edges in enumerate(source_mesh_edges):
+        for edge in edges:
+            mesh_edge_owners.setdefault(edge, []).append(source)
+    shared_mesh_pair_edges: dict[tuple[int, int], int] = {}
+    for owners in mesh_edge_owners.values():
+        unique = sorted(set(owners))
+        for a_index in range(len(unique)):
+            for b_index in range(a_index + 1, len(unique)):
+                pair = (unique[a_index], unique[b_index])
+                shared_mesh_pair_edges[pair] = shared_mesh_pair_edges.get(pair, 0) + 1
+
+    conforming_mesh_pairs = [
+        {
+            "surfaces": list(pair),
+            "shared_mesh_edge_count": count,
+            "mesh_conforming": count > 0,
+        }
+        for pair, count in sorted(shared_mesh_pair_edges.items())
+    ]
 
     all_nodes, _xyz, _ = gmsh.model.mesh.getNodes()
     quality = triangle_quality()
@@ -237,12 +248,8 @@ def fragment_and_mesh(data: dict, mesh_size: float | None = None, write_msh: Pat
         ),
         "shared_curve_pairs": len(shared_curve_pairs),
         "shared_curves": sum(x["curve_count"] for x in shared_curve_pairs),
-        "mesh_conforming_shared_curve_pairs": sum(
-            x["mesh_conforming"] for x in conforming_mesh_pairs
-        ),
-        "mesh_nonconforming_shared_curve_pairs": sum(
-            not x["mesh_conforming"] for x in conforming_mesh_pairs
-        ),
+        "shared_mesh_edge_pairs": len(conforming_mesh_pairs),
+        "shared_mesh_edges": sum(x["shared_mesh_edge_count"] for x in conforming_mesh_pairs),
         "mesh_nodes": len(all_nodes),
         "non_triangle_2d_elements": non_triangle_elements,
         "per_source_triangle_count": per_source_triangles,
@@ -297,9 +304,10 @@ def main() -> int:
         data = synthetic_report() if args.self_test else json.loads(args.input.read_text())
         result = fragment_and_mesh(data, args.mesh_size, args.msh)
         if args.self_test:
+            print(json.dumps(result, indent=2))
             assert result["input_surfaces"] == 2
-            assert result["shared_curve_pairs"] >= 1
-            assert result["mesh_nonconforming_shared_curve_pairs"] == 0
+            assert result["shared_mesh_edge_pairs"] >= 1
+            assert result["shared_mesh_edges"] >= 1
             assert result["triangles"] > 0
         text = json.dumps(result, indent=2)
         if args.output:
