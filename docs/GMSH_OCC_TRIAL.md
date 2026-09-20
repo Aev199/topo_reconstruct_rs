@@ -219,18 +219,32 @@ The full-model coverage audit found:
 This means MIDAS/PLAXIS adapters no longer need to understand Gmsh entity tags
 or OpenCASCADE fragmentation maps.
 
+## Additional real-model regression
+
+The backend has since been tested on two additional private FE fixtures. One is
+a clean control case; the other exposed near-vertex surface-junction slivers
+and unsupported isolated point-only CAD contacts.
+
+Those cases led to two conservative production rules:
+
+- regularize only proven sliver-producing near-vertex junction edges inside the
+  reconstruction movement budget, with full move provenance and no global
+  fuzzy tolerance;
+- split unsupported point-only sharing by node identity while preserving exact
+  coordinates.
+
+All three current private fixtures pass the final topology, coverage,
+planarity, duplicate-element and declared-contact gates. See
+`docs/GEOMETRY_REGRESSION_MATRIX.md` for aggregate results.
+
+The remaining sub-5-degree mesh outliers are deliberately not chased with more
+custom geometry code while the topology gates are clean.
+
 ## Remaining validation
 
-The geometry/backend phase is sufficiently closed to move to the target-program
-boundary.
+Continue testing structurally different real FE fixtures and treat newly exposed
+general topology classes as regression cases. Solver-specific FPN work is
+paused while this broader geometry validation continues.
 
-Next work is:
-
-- calibrate the exact modern GTS NX FPN element/group record layout;
-- generate and import a tiny MIDAS fixture;
-- then import the private full solver mesh;
-- verify PLAXIS geometry handoff separately;
-- add loads/materials/stages only after geometry import is stable.
-
-The Gmsh GitHub Actions probe is manual-only. Private full-model data is never
-put in Actions.
+The Gmsh GitHub Actions probe is manual-only. Private model data is never put in
+Actions.
