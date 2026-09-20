@@ -3,7 +3,7 @@
 pub mod bars;
 mod features;
 mod holes;
-use super::{frame, planes, Model, PlaneFrame};
+use super::{frame, junctions, planes, Model, PlaneFrame};
 use crate::input::MeshData;
 pub use features::{FeaturePolicy, SimplifiedHole};
 use glam::DVec3;
@@ -50,6 +50,7 @@ pub struct Report {
     pub feature_policy: Option<FeaturePolicy>,
     pub simplified_holes: Vec<SimplifiedHole>,
     pub axis_assembly: bars::Report,
+    pub surface_junctions: junctions::Report,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -657,7 +658,7 @@ fn assemble_impl(
             }),
         }
     }
-    let axis_assembly = bars::assemble(
+    let mut axis_assembly = bars::assemble(
         mesh,
         source,
         &mut model,
@@ -668,6 +669,31 @@ fn assemble_impl(
     );
     maximum_closure_movement =
         maximum_closure_movement.max(axis_assembly.maximum_additional_movement);
+    // Surface intersections are resolved after axis/source vertices are
+    // materialized so generated junction vertices cannot disturb the
+    // source-node-to-vertex prefix used by axis assembly.
+    let surface_junctions = junctions::conform(&mut model, policy.precision)?;
+    // Two independently assembled source surfaces can carry distinct vertex
+    // identities at the same verified junction point. When the junction pass
+    // canonicalizes those identities, keep all already assembled bar anchors
+    // and point contacts on the same canonical model vertex as the surfaces.
+    let replacements: BTreeMap<_, _> = surface_junctions
+        .vertex_replacements
+        .iter()
+        .map(|item| (item.from, item.to))
+        .collect();
+    let remap = |vertex: usize| replacements.get(&vertex).copied().unwrap_or(vertex);
+    for axis in &mut axis_assembly.axes {
+        axis.endpoints = axis.endpoints.map(remap);
+        for anchor in &mut axis.anchors {
+            anchor.vertex = remap(anchor.vertex);
+        }
+    }
+    for contact in &mut axis_assembly.contacts {
+        if let bars::Contact::Point { vertex, .. } = contact {
+            *vertex = remap(*vertex);
+        }
+    }
     Ok(Report {
         policy: policy.clone(),
         export_ready: false,
@@ -681,6 +707,7 @@ fn assemble_impl(
         feature_policy: features.cloned(),
         simplified_holes,
         axis_assembly,
+        surface_junctions,
         issues,
         maximum_closure_movement,
         rejected_vertices,

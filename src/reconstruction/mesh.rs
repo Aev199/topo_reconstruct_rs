@@ -407,6 +407,17 @@ fn build_impl(
                 boundary.insert(key(pair[0].1, pair[1].1));
             }
         }
+        // Surface-surface junctions are explicit shared topology. They are
+        // meshed exactly like other interior constraints, with barrier status
+        // decided below from whether the complete chain reaches two boundary
+        // vertices.
+        for &edge in &surface.junctions {
+            for pair in edge_nodes[edge].windows(2) {
+                let segment = key(pair[0].1, pair[1].1);
+                constraints.insert(segment);
+                internal_constraint_edges.insert(segment);
+            }
+        }
         barriers.extend(&boundary);
         let boundary_nodes: BTreeSet<_> = boundary.iter().flatten().copied().collect();
         constraints.extend(&boundary);
@@ -499,7 +510,15 @@ fn build_impl(
             let h = cdt
                 .insert(Point2::new(uv[0], uv[1]))
                 .map_err(|_| "invalid CDT vertex")?;
-            if global.insert(h.index(), n).is_some() {
+            if let Some(previous) = global.insert(h.index(), n) {
+                eprintln!(
+                    "implicit CDT merge: surface={s} previous={previous} current={n} \
+                     previous_xyz={:?} current_xyz={:?} distance={:.12e} projected={:?}",
+                    vertices[previous],
+                    vertices[n],
+                    point(&vertices[previous]).distance(point(&vertices[n])),
+                    uv,
+                );
                 return Err("implicit vertex merge in CDT");
             }
             handles.insert(n, h);

@@ -58,6 +58,18 @@ class GlobalAuditTests(unittest.TestCase):
         r = audit(model([xy(), wall(y=.5, z0=-1)]))
         self.assertEqual(r['issues'][0]['contact_kind'], 'crossing')
 
+    def test_explicit_t_junction_constraint_is_conforming(self):
+        data = model([xy(), wall(y=.5)])
+        preview = data['topology']['preview']
+        wall_edges = [e['edge'] for e in preview['surfaces'][1]['boundaries'][0]]
+        # The wall bottom edge is the geometric T-junction. Giving the slab the
+        # same edge identity must be sufficient even though it is not a slab
+        # exterior boundary.
+        preview['surfaces'][0]['junctions'] = [wall_edges[0]]
+        r = audit(data)
+        self.assertTrue(r['global_surface_checks_passed'])
+        self.assertTrue(r['contacts'][0]['geometry_conforming'])
+
     def test_coplanar_shared_boundary(self):
         r = audit(model([xy(), xy(1,2)]))
         self.assertTrue(r['global_surface_checks_passed'])

@@ -230,9 +230,15 @@ pub(super) fn synchronize(
 
     let mut owners = vec![BTreeSet::new(); model.edges.len()];
     for (surface, item) in model.surfaces.iter().enumerate() {
-        for edge in item.boundaries.iter().flatten() {
+        for edge_id in item
+            .boundaries
+            .iter()
+            .flatten()
+            .map(|edge| edge.edge)
+            .chain(item.junctions.iter().copied())
+        {
             let owner = owners
-                .get_mut(edge.edge)
+                .get_mut(edge_id)
                 .ok_or("invalid surface edge reference")?;
             owner.insert(surface);
         }
@@ -297,8 +303,14 @@ pub(super) fn synchronize(
             continue;
         };
         let [a, b] = axes[axis].endpoints;
-        for edge_use in model.surfaces[surface].boundaries.iter().flatten() {
-            for &(_, vertex) in &edge_nodes[edge_use.edge] {
+        for edge_id in model.surfaces[surface]
+            .boundaries
+            .iter()
+            .flatten()
+            .map(|edge| edge.edge)
+            .chain(model.surfaces[surface].junctions.iter().copied())
+        {
+            for &(_, vertex) in &edge_nodes[edge_id] {
                 if let Some(t) = parameter(
                     point(&vertices[vertex]),
                     point(&vertices[a]),

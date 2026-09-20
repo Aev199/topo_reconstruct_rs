@@ -53,6 +53,7 @@ class Surface:
         self.points = np.concatenate(self.rings)
         self.low, self.high = self.points.min(axis=0), self.points.max(axis=0)
         self.edge_ids = {e["edge"] for ring in record["boundaries"] for e in ring}
+        self.edge_ids.update(record.get("junctions", []))
         ids = {v for e in self.edge_ids for v in model["edges"][e]}
         self.planarity = float(np.max(np.abs((vertices[list(ids)] - self.o) @ self.n)))
 

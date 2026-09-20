@@ -151,7 +151,7 @@ def check(data, baseline=None):
     epsilon = topology["policy"]["precision"]
     vertices = model["vertices"]
     source_nodes = topology["vertex_source_nodes"]
-    assert len(vertices) == len(source_nodes) == len(set(source_nodes))
+    assert len(vertices) >= len(source_nodes) == len(set(source_nodes))
     lookup = {n: i for i, n in enumerate(frame["node_ids"])}
     budget = {n: frame["policy"]["maximum_movement"] for n in source_nodes}
     for axis in frame["axes"]:
@@ -246,6 +246,11 @@ def check(data, baseline=None):
         current_by_node = dict(zip(source_nodes, vertices))
         boundary_vertices = {v for edge in before["edges"] for v in edge}
         for v in boundary_vertices:
+            # Surface-junction materialization appends generated vertices after
+            # all source-backed vertices. They have no immutable source node and
+            # are checked by the global geometry audit instead.
+            if v >= len(baseline["topology"]["vertex_source_nodes"]):
+                continue
             n = baseline["topology"]["vertex_source_nodes"][v]
             old = before["vertices"][v]
             if n in logged:
