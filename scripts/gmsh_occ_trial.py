@@ -1154,64 +1154,63 @@ def summarize_contact_audit(report: dict) -> dict:
     }
 
 
-def reconcile_healed_contact_audit(
+def reconcile_moved_contact_audit(
     data: dict,
     raw: dict,
-    strict_healed: dict,
-    healing: dict,
+    strict_after_repairs: dict,
+    movement_reports: list[dict],
     precision: float,
-    minimum_edge: float,
 ) -> dict:
-    """Accept a moved point contact only through an explicit healing move.
+    """Accept a moved point contact only through explicit logged provenance.
 
-    The contact must have been strictly conforming before healing, must remain
-    topologically shared afterwards, and its expected point must coincide with
-    the `from` node of the exact logged move whose `to` node is now shared.
+    The contact must have been strictly conforming before geometric repair,
+    remain topologically shared afterwards, and the exact logged node move
+    must link the original expected point to the current representative.
     No global tolerance is relaxed.
     """
     tolerance = precision * 10.0
-    moves = [
-        move
-        for component in healing.get("components", [])
-        if component.get("status") == "collapsed"
-        for move in component.get("moves", [])
-    ]
+    moves = []
+    for report in movement_reports:
+        for component in report.get("components", report.get("accepted", [])):
+            if component.get("status") == "collapsed" or "moves" in component:
+                moves.extend(component.get("moves", []))
     result = []
     failed = 0
     accepted_by_healing = 0
-    if len(raw["details"]) != len(strict_healed["details"]):
-        raise RuntimeError("contact audit length changed across healing")
+    if len(raw["details"]) != len(strict_after_repairs["details"]):
+        raise RuntimeError("contact audit length changed across geometry repairs")
 
-    for raw_item, healed_item in zip(raw["details"], strict_healed["details"]):
-        item = dict(healed_item)
-        if healed_item["mesh_conforming"]:
+    for raw_item, repaired_item in zip(raw["details"], strict_after_repairs["details"]):
+        item = dict(repaired_item)
+        if repaired_item["mesh_conforming"]:
             item["conformity"] = "strict"
             result.append(item)
             continue
 
         accepted = False
         if (
-            healed_item["kind"] == "point"
+            repaired_item["kind"] == "point"
             and raw_item["mesh_conforming"]
-            and healed_item.get("topologically_shared")
-            and healed_item.get("shared_node") is not None
+            and repaired_item.get("topologically_shared")
+            and repaired_item.get("shared_node") is not None
         ):
-            contact = data["contacts"][healed_item["contact"]]
+            contact = data["contacts"][repaired_item["contact"]]
             expected = tuple(float(x) for x in contact["point"])
             for move in moves:
-                if int(move["to"]) != int(healed_item["shared_node"]):
+                if int(move["to"]) != int(repaired_item["shared_node"]):
                     continue
                 if distance(move["from_coordinate"], expected) > tolerance:
                     continue
                 movement = float(move["movement"])
-                if movement >= minimum_edge:
+                movement_limit = float(move.get("movement_limit", 0.0))
+                if movement_limit <= 0.0 or movement >= movement_limit:
                     continue
                 accepted = True
                 item["mesh_conforming"] = True
-                item["conformity"] = "healed_shared_node"
-                item["healing_movement"] = movement
-                item["healing_from_node"] = int(move["from"])
-                item["healing_to_node"] = int(move["to"])
+                item["conformity"] = move.get("movement_kind", "moved_shared_node")
+                item["repair_movement"] = movement
+                item["repair_from_node"] = int(move["from"])
+                item["repair_to_node"] = int(move["to"])
                 accepted_by_healing += 1
                 break
 
