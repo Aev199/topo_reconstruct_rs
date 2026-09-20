@@ -510,19 +510,34 @@ def shared_mesh_edges_by_source(triangles: list[dict]) -> dict[tuple[int, int], 
 
 @dataclass
 class Fragmentation:
-    source_to_output: list[list[int]]
-    output_owners: dict[int, list[int]]
+    surface_to_output: list[list[int]]
+    surface_output_owners: dict[int, list[int]]
     output_surfaces: list[int]
+    curve_to_output: list[list[int]]
+    curve_output_owners: dict[int, list[int]]
+    output_curves: list[int]
+    curve_inputs: list[dict]
+    axis_build_blockers: list[str]
 
 
-def fragment(input_surfaces: list[dict]) -> Fragmentation:
-    input_entities = [(2, add_surface(surface)) for surface in input_surfaces]
+def fragment(
+    input_surfaces: list[dict],
+    axes: list[dict],
+    contacts: list[dict],
+    precision: float,
+) -> Fragmentation:
+    surface_entities = [(2, add_surface(surface)) for surface in input_surfaces]
+    curve_entities, curve_inputs, axis_build_blockers = build_axis_curve_inputs(
+        axes, contacts, precision
+    )
+    input_entities = surface_entities + curve_entities
+
     if not input_entities:
-        return Fragmentation([], {}, [])
+        return Fragmentation([], {}, [], [], {}, [], curve_inputs, axis_build_blockers)
 
     if len(input_entities) == 1:
-        source_to_output = [[input_entities[0][1]]]
-        output_surfaces = [input_entities[0][1]]
+        output_map = [[input_entities[0]]]
+        output = [input_entities[0]]
     else:
         output, output_map = gmsh.model.occ.fragment(
             [input_entities[0]],
@@ -530,35 +545,75 @@ def fragment(input_surfaces: list[dict]) -> Fragmentation:
             removeObject=True,
             removeTool=True,
         )
-        source_to_output = [
-            sorted({tag for dim, tag in mapped if dim == 2}) for mapped in output_map
-        ]
-        output_surfaces = sorted({tag for dim, tag in output if dim == 2})
+
+    surface_count = len(surface_entities)
+    surface_map_raw = output_map[:surface_count]
+    curve_map_raw = output_map[surface_count:]
+
+    surface_to_output = [
+        sorted({tag for dim, tag in mapped if dim == 2}) for mapped in surface_map_raw
+    ]
+    curve_to_output = [
+        sorted({tag for dim, tag in mapped if dim == 1}) for mapped in curve_map_raw
+    ]
+    output_surfaces = sorted(
+        {tag for mapped in surface_to_output for tag in mapped}
+        | {tag for dim, tag in output if dim == 2}
+    )
+    output_curves = sorted({tag for mapped in curve_to_output for tag in mapped})
 
     gmsh.model.occ.synchronize()
-    output_owners: dict[int, list[int]] = defaultdict(list)
-    for source, tags in enumerate(source_to_output):
+
+    surface_output_owners: dict[int, list[int]] = defaultdict(list)
+    for source, tags in enumerate(surface_to_output):
         for tag in tags:
-            output_owners[tag].append(source)
+            surface_output_owners[tag].append(source)
+
+    curve_output_owners: dict[int, list[int]] = defaultdict(list)
+    for source, tags in enumerate(curve_to_output):
+        for tag in tags:
+            curve_output_owners[tag].append(source)
+
     return Fragmentation(
-        source_to_output=source_to_output,
-        output_owners={tag: sorted(set(owners)) for tag, owners in output_owners.items()},
+        surface_to_output=surface_to_output,
+        surface_output_owners={
+            tag: sorted(set(owners)) for tag, owners in surface_output_owners.items()
+        },
         output_surfaces=output_surfaces,
+        curve_to_output=curve_to_output,
+        curve_output_owners={
+            tag: sorted(set(owners)) for tag, owners in curve_output_owners.items()
+        },
+        output_curves=output_curves,
+        curve_inputs=curve_inputs,
+        axis_build_blockers=axis_build_blockers,
     )
 
 
-def physical_groups(fragmentation: Fragmentation, surfaces: list[dict]) -> list[dict]:
-    by_stiffness: dict[int, list[int]] = defaultdict(list)
+def physical_groups(
+    fragmentation: Fragmentation,
+    surfaces: list[dict],
+) -> list[dict]:
+    surface_by_stiffness: dict[int, list[int]] = defaultdict(list)
     for tag in fragmentation.output_surfaces:
-        owners = fragmentation.output_owners.get(tag, [])
+        owners = fragmentation.surface_output_owners.get(tag, [])
         if len(owners) != 1:
             continue
-        by_stiffness[int(surfaces[owners[0]]["stiffness"])].append(tag)
+        surface_by_stiffness[int(surfaces[owners[0]]["stiffness"])].append(tag)
+
+    curve_by_stiffness: dict[int, list[int]] = defaultdict(list)
+    for tag in fragmentation.output_curves:
+        owners = fragmentation.curve_output_owners.get(tag, [])
+        if len(owners) != 1:
+            continue
+        curve_by_stiffness[
+            int(fragmentation.curve_inputs[owners[0]]["stiffness"])
+        ].append(tag)
 
     result = []
-    for stiffness, tags in sorted(by_stiffness.items()):
+    for stiffness, tags in sorted(surface_by_stiffness.items()):
         group = gmsh.model.addPhysicalGroup(2, sorted(set(tags)))
-        name = f"stiffness_{stiffness}"
+        name = f"surface_stiffness_{stiffness}"
         gmsh.model.setPhysicalName(2, group, name)
         result.append(
             {
@@ -566,9 +621,24 @@ def physical_groups(fragmentation: Fragmentation, surfaces: list[dict]) -> list[
                 "physical_tag": group,
                 "name": name,
                 "stiffness": stiffness,
-                "surface_tags": sorted(set(tags)),
+                "entity_tags": sorted(set(tags)),
             }
         )
+
+    for stiffness, tags in sorted(curve_by_stiffness.items()):
+        group = gmsh.model.addPhysicalGroup(1, sorted(set(tags)))
+        name = f"bar_stiffness_{stiffness}"
+        gmsh.model.setPhysicalName(1, group, name)
+        result.append(
+            {
+                "dimension": 1,
+                "physical_tag": group,
+                "name": name,
+                "stiffness": stiffness,
+                "entity_tags": sorted(set(tags)),
+            }
+        )
+
     return result
 
 
