@@ -2,6 +2,7 @@
 """Gmsh/OpenCASCADE backend prototype for topo_reconstruct_rs.
 
 The JSON result keeps scalar quality counters separate from mesh arrays.
+Mixed-dimensional regression covers both embedded rod intervals and point crossings.
 
 The preferred input is the versioned `topo-reconstruct-gmsh-v1` interchange
 emitted by Rust. Legacy v2 preview JSON is accepted only to keep the private
