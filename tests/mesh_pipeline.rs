@@ -305,6 +305,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         feature_policy: None,
         simplified_holes: vec![],
         axis_assembly: assembly::bars::Report::default(),
+        surface_junctions: topo_reconstruct_rs::reconstruction::junctions::Report::default(),
         issues: vec![],
         maximum_closure_movement: 0.,
         rejected_vertices: BTreeMap::new(),
