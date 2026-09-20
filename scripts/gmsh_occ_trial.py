@@ -22,8 +22,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from itertools import product
 from pathlib import Path
 from typing import Iterable
 
@@ -180,6 +181,9 @@ def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
             "policy": {
                 "precision": float(policy.get("precision", 1e-7)),
                 "minimum_edge": float(policy.get("minimum_edge", 1e-3)),
+                "junction_movement_limit": float(
+                    policy.get("junction_movement_limit", 0.05)
+                ),
                 "target_mesh_size": 0.75,
             },
             "source_coverage_complete": bool(
@@ -209,6 +213,10 @@ def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
 
     precision = float(policy["precision"])
     minimum_edge = float(policy["minimum_edge"])
+    junction_movement_limit = float(
+        policy.get("junction_movement_limit", max(0.05, minimum_edge))
+    )
+    policy["junction_movement_limit"] = junction_movement_limit
     target = float(policy["target_mesh_size"])
     if (
         not math.isfinite(precision)
@@ -216,6 +224,8 @@ def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
         or not math.isfinite(target)
         or precision <= 0
         or minimum_edge <= precision
+        or not math.isfinite(junction_movement_limit)
+        or junction_movement_limit < minimum_edge
         or target < minimum_edge
     ):
         raise ValueError("invalid backend policy")
@@ -539,6 +549,8 @@ def heal_micro_edges(
                         "from_coordinate": coords[node],
                         "to_coordinate": coords[representative],
                         "movement": movements[node],
+                        "movement_limit": minimum_edge,
+                        "movement_kind": "micro_edge_healing",
                     }
                 )
         maximum_movement = max(maximum_movement, component_max)
@@ -579,6 +591,409 @@ def heal_micro_edges(
         "removed_degenerate_triangles": removed_degenerate,
         "near_degenerate_triangles_after": near_degenerate,
         "components": diagnostics,
+    }
+
+
+
+def _source_vertex_context(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    tolerance: float,
+) -> tuple[
+    dict[int, list[tuple[int, int]]],
+    dict[int, set[tuple[int, int]]],
+]:
+    """Map mesh nodes to explicit source vertices without proximity welding."""
+    buckets: dict[tuple[int, int, int], list[tuple[int, int, tuple[float, float, float]]]] = defaultdict(list)
+    cell = max(tolerance, 1e-12)
+
+    def key(point: Iterable[float]) -> tuple[int, int, int]:
+        return tuple(math.floor(float(value) / cell) for value in point)
+
+    boundary_edges: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    for surface_index, surface in enumerate(data.get("surfaces", [])):
+        for ring, source_nodes in zip(
+            surface.get("rings", []), surface.get("ring_source_nodes", [])
+        ):
+            for point, source_node in zip(ring, source_nodes):
+                xyz = tuple(float(x) for x in point)
+                buckets[key(xyz)].append((surface_index, int(source_node), xyz))
+            for index, source_node in enumerate(source_nodes):
+                other = source_nodes[(index + 1) % len(source_nodes)]
+                if int(source_node) != int(other):
+                    boundary_edges[surface_index].add(
+                        tuple(sorted((int(source_node), int(other))))
+                    )
+
+    memberships: dict[int, list[tuple[int, int]]] = {}
+    for node, point in coords.items():
+        base = key(point)
+        found = set()
+        for offset in product((-1, 0, 1), repeat=3):
+            candidate_key = tuple(base[i] + offset[i] for i in range(3))
+            for surface, source_node, source_point in buckets.get(candidate_key, []):
+                if distance(point, source_point) <= tolerance:
+                    found.add((surface, source_node))
+        if found:
+            memberships[node] = sorted(found)
+    return memberships, boundary_edges
+
+
+def regularize_near_vertex_junctions(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    movement_limit: float,
+    minimum_edge: float,
+    precision: float,
+    angle_limit_degrees: float = 5.0,
+) -> tuple[
+    dict[int, tuple[float, float, float]],
+    list[dict],
+    list[dict],
+    dict,
+]:
+    """Collapse only sliver-producing near-vertex junction edges.
+
+    This is deliberately narrower than a distance weld:
+    - the edge must be the shortest edge of a triangle below angle_limit;
+    - its length must be below the engineering junction movement limit;
+    - at least one endpoint must be an explicit reconstructed source vertex;
+    - an original source boundary edge is never collapsed;
+    - a generated junction is preferred over moving it off the exact
+      intersection; two weak source vertices on an artificial shared
+      intersection segment may collapse to their midpoint.
+    """
+
+    source_tolerance = precision * 10.0
+    source_memberships, source_boundary_edges = _source_vertex_context(
+        data, coords, source_tolerance
+    )
+    node_owners = node_source_owners(triangles)
+    edge_owners: dict[tuple[int, int], set[int]] = defaultdict(set)
+    bad_shortest_edges = set()
+
+    for triangle in triangles:
+        nodes = triangle["nodes"]
+        points = [coords[node] for node in nodes]
+        angles = triangle_angles(*points)
+        if min(angles) >= angle_limit_degrees:
+            continue
+        local_edges = [
+            tuple(sorted((nodes[0], nodes[1]))),
+            tuple(sorted((nodes[1], nodes[2]))),
+            tuple(sorted((nodes[2], nodes[0]))),
+        ]
+        lengths = [
+            distance(points[0], points[1]),
+            distance(points[1], points[2]),
+            distance(points[2], points[0]),
+        ]
+        bad_shortest_edges.add(local_edges[min(range(3), key=lengths.__getitem__)])
+
+    for triangle in triangles:
+        nodes = triangle["nodes"]
+        surface = int(triangle["source_surface"])
+        for edge in (
+            tuple(sorted((nodes[0], nodes[1]))),
+            tuple(sorted((nodes[1], nodes[2]))),
+            tuple(sorted((nodes[2], nodes[0]))),
+        ):
+            edge_owners[edge].add(surface)
+
+    def anchor_strength(memberships: list[tuple[int, int]]) -> int:
+        counts = Counter(source_node for _surface, source_node in memberships)
+        return max(counts.values(), default=0)
+
+    def is_original_boundary_edge(a: int, b: int) -> bool:
+        left = source_memberships.get(a, [])
+        right = source_memberships.get(b, [])
+        for surface_a, source_a in left:
+            for surface_b, source_b in right:
+                if surface_a != surface_b:
+                    continue
+                if tuple(sorted((source_a, source_b))) in source_boundary_edges.get(
+                    surface_a, set()
+                ):
+                    return True
+        return False
+
+    candidates = []
+    for edge in sorted(bad_shortest_edges):
+        a, b = edge
+        length = distance(coords[a], coords[b])
+        if length < minimum_edge or length >= movement_limit:
+            continue
+        source_a = source_memberships.get(a, [])
+        source_b = source_memberships.get(b, [])
+        if not source_a and not source_b:
+            continue
+        if is_original_boundary_edge(a, b):
+            continue
+        owners_a = node_owners.get(a, set())
+        owners_b = node_owners.get(b, set())
+        owners_edge = edge_owners.get(edge, set())
+        if (
+            len(owners_edge) < 2
+            and len(owners_a) < 2
+            and len(owners_b) < 2
+        ):
+            continue
+        candidates.append(
+            {
+                "edge": edge,
+                "length": length,
+                "source_a": source_a,
+                "source_b": source_b,
+                "owners_a": owners_a,
+                "owners_b": owners_b,
+                "owners_edge": owners_edge,
+            }
+        )
+
+    result_coords = dict(coords)
+    next_node = max(result_coords, default=0) + 1
+    mapping: dict[int, int] = {}
+    used_nodes = set()
+    accepted = []
+    skipped = []
+    midpoint_count = 0
+    maximum_movement = 0.0
+
+    for candidate in sorted(candidates, key=lambda item: (item["length"], item["edge"])):
+        a, b = candidate["edge"]
+        if a in used_nodes or b in used_nodes:
+            skipped.append({**candidate, "status": "overlapping_candidate"})
+            continue
+
+        source_a = candidate["source_a"]
+        source_b = candidate["source_b"]
+        moves = []
+        representative = None
+        status = None
+
+        if bool(source_a) ^ bool(source_b):
+            source_node = a if source_a else b
+            junction_node = b if source_a else a
+            source_context = source_a if source_a else source_b
+            source_owners = candidate["owners_a"] if source_a else candidate["owners_b"]
+            junction_owners = candidate["owners_b"] if source_a else candidate["owners_a"]
+            strength = anchor_strength(source_context)
+
+            if len(junction_owners) < 2:
+                skipped.append({**candidate, "status": "no_multi_surface_junction"})
+                continue
+
+            # A weak source vertex moves to the exact OCC junction. A source
+            # vertex already shared by several reconstructed surfaces remains
+            # fixed unless it is itself valid on every junction owner.
+            if strength >= 2:
+                if junction_owners.issubset(source_owners):
+                    representative = source_node
+                    moving = junction_node
+                    status = "junction_to_strong_source_vertex"
+                else:
+                    skipped.append({**candidate, "status": "strong_source_anchor"})
+                    continue
+            else:
+                representative = junction_node
+                moving = source_node
+                status = "source_vertex_to_exact_junction"
+
+            movement = distance(result_coords[moving], result_coords[representative])
+            if movement >= movement_limit:
+                skipped.append({**candidate, "status": "movement_limit"})
+                continue
+            mapping[moving] = representative
+            moves.append(
+                {
+                    "from": moving,
+                    "to": representative,
+                    "from_coordinate": result_coords[moving],
+                    "to_coordinate": result_coords[representative],
+                    "movement": movement,
+                    "movement_limit": movement_limit,
+                    "movement_kind": "near_vertex_junction_regularization",
+                }
+            )
+        elif source_a and source_b:
+            if len(candidate["owners_edge"]) < 2:
+                skipped.append({**candidate, "status": "two_source_vertices_not_shared_edge"})
+                continue
+            strength_a = anchor_strength(source_a)
+            strength_b = anchor_strength(source_b)
+
+            if strength_a >= 2 or strength_b >= 2:
+                if strength_a == strength_b:
+                    skipped.append({**candidate, "status": "two_strong_source_anchors"})
+                    continue
+                representative = a if strength_a > strength_b else b
+                moving = b if representative == a else a
+                movement = distance(result_coords[moving], result_coords[representative])
+                mapping[moving] = representative
+                moves.append(
+                    {
+                        "from": moving,
+                        "to": representative,
+                        "from_coordinate": result_coords[moving],
+                        "to_coordinate": result_coords[representative],
+                        "movement": movement,
+                        "movement_limit": movement_limit,
+                        "movement_kind": "near_vertex_junction_regularization",
+                    }
+                )
+                status = "weak_source_vertex_to_strong_source_vertex"
+            else:
+                # Both weak source vertices lie on the exact shared OCC edge.
+                # Midpoint minimizes the maximum displacement and stays on the
+                # same intersection line/planes.
+                midpoint = tuple(
+                    0.5 * (result_coords[a][i] + result_coords[b][i])
+                    for i in range(3)
+                )
+                representative = next_node
+                next_node += 1
+                result_coords[representative] = midpoint
+                midpoint_count += 1
+                for moving in (a, b):
+                    movement = distance(result_coords[moving], midpoint)
+                    mapping[moving] = representative
+                    moves.append(
+                        {
+                            "from": moving,
+                            "to": representative,
+                            "from_coordinate": result_coords[moving],
+                            "to_coordinate": midpoint,
+                            "movement": movement,
+                            "movement_limit": movement_limit,
+                            "movement_kind": "near_vertex_junction_regularization",
+                        }
+                    )
+                status = "two_weak_source_vertices_to_shared_midpoint"
+        else:
+            continue
+
+        used_nodes.update((a, b))
+        component_max = max((move["movement"] for move in moves), default=0.0)
+        maximum_movement = max(maximum_movement, component_max)
+        accepted.append(
+            {
+                "edge": [a, b],
+                "edge_length": candidate["length"],
+                "representative": representative,
+                "status": status,
+                "maximum_movement": component_max,
+                "moves": moves,
+            }
+        )
+
+    def remap_entities(items: list[dict], dimension: int) -> tuple[list[dict], int]:
+        result = []
+        removed = 0
+        for item in items:
+            nodes = tuple(mapping.get(node, node) for node in item["nodes"])
+            if len(set(nodes)) < dimension + 1:
+                removed += 1
+                continue
+            result.append({**item, "nodes": nodes})
+        return result, removed
+
+    regularized_triangles, removed_triangles = remap_entities(triangles, 2)
+    regularized_bars, removed_bars = remap_entities(bars, 1)
+    return result_coords, regularized_triangles, regularized_bars, {
+        "angle_limit_degrees": angle_limit_degrees,
+        "movement_limit": movement_limit,
+        "candidate_count": len(candidates),
+        "accepted_count": len(accepted),
+        "midpoint_count": midpoint_count,
+        "moved_node_count": len(mapping),
+        "maximum_node_movement": maximum_movement,
+        "removed_degenerate_triangles": removed_triangles,
+        "removed_degenerate_bars": removed_bars,
+        "accepted": accepted,
+        "skipped": skipped,
+    }
+
+
+def split_unintended_shared_nodes(
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    semantic_audit: dict,
+) -> tuple[
+    dict[int, tuple[float, float, float]],
+    list[dict],
+    list[dict],
+    dict,
+]:
+    """Duplicate coincident mesh-node IDs when semantics do not justify sharing.
+
+    Coordinates are unchanged. Each connected semantic owner component keeps a
+    common node ID, but disconnected components receive duplicate IDs.
+    """
+    result_coords = dict(coords)
+    next_node = max(result_coords, default=0) + 1
+    surface_mapping: dict[tuple[int, int], int] = {}
+    axis_mapping: dict[tuple[int, int], int] = {}
+    details = []
+
+    for issue in semantic_audit.get("unintended_shared_nodes", []):
+        node = int(issue["node"])
+        components = [
+            [tuple(owner) for owner in component]
+            for component in issue["components"]
+        ]
+        if len(components) <= 1:
+            continue
+
+        component_nodes = [node]
+        for _component in components[1:]:
+            clone = next_node
+            next_node += 1
+            result_coords[clone] = result_coords[node]
+            component_nodes.append(clone)
+
+        for component, assigned_node in zip(components, component_nodes):
+            for kind, owner in component:
+                if kind == "surface":
+                    surface_mapping[(node, int(owner))] = assigned_node
+                elif kind == "axis":
+                    axis_mapping[(node, int(owner))] = assigned_node
+                else:
+                    raise RuntimeError(f"unknown semantic owner kind: {kind}")
+
+        details.append(
+            {
+                "original_node": node,
+                "coordinate": result_coords[node],
+                "component_count": len(components),
+                "component_nodes": component_nodes,
+                "components": components,
+            }
+        )
+
+    split_triangles = []
+    for triangle in triangles:
+        surface = int(triangle["source_surface"])
+        nodes = tuple(
+            surface_mapping.get((node, surface), node)
+            for node in triangle["nodes"]
+        )
+        split_triangles.append({**triangle, "nodes": nodes})
+
+    split_bars = []
+    for bar in bars:
+        axis = int(bar["axis"])
+        nodes = tuple(axis_mapping.get((node, axis), node) for node in bar["nodes"])
+        split_bars.append({**bar, "nodes": nodes})
+
+    return result_coords, split_triangles, split_bars, {
+        "split_shared_node_count": len(details),
+        "created_duplicate_node_count": sum(
+            detail["component_count"] - 1 for detail in details
+        ),
+        "details": details,
     }
 
 
@@ -1867,6 +2282,7 @@ def synthetic_report() -> dict:
         "policy": {
             "precision": 1e-8,
             "minimum_edge": 1e-3,
+            "junction_movement_limit": 0.05,
             "target_mesh_size": 0.5,
         },
         "source_coverage_complete": True,
