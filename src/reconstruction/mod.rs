@@ -3,6 +3,7 @@ pub mod assembly;
 pub mod axes;
 pub mod frame;
 pub mod graph;
+pub mod junctions;
 pub mod mesh;
 pub mod planes;
 pub mod recognize;
@@ -77,6 +78,9 @@ pub struct Surface {
     /// Exterior first, followed by holes. Geometry lives in plane coordinates.
     pub contours: Vec<Vec<[f64; 2]>>,
     pub boundaries: Vec<Vec<EdgeUse>>,
+    /// Shared surface-surface intersection edges. These are explicit topology,
+    /// not proximity welds, and may lie in a surface interior.
+    pub junctions: Vec<usize>,
     pub source_elements: Vec<u32>,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +220,7 @@ impl Model {
             plane,
             contours,
             boundaries,
+            junctions: vec![],
             source_elements,
         });
         Ok(id)
