@@ -1053,6 +1053,43 @@ def synthetic_report() -> dict:
             ]],
         },
     ]
+    axes = [
+        {
+            "source_axis": 0,
+            "endpoints": [[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]],
+            "property_spans": [
+                {
+                    "source_element": 100,
+                    "stiffness": 50,
+                    "start_t": 0.0,
+                    "end_t": 1.0,
+                }
+            ],
+            "anchors": [
+                {"source_node": 101, "t": 0.0, "point": [-1.5, 0.0, 0.0]},
+                {"source_node": 102, "t": 1.0, "point": [1.5, 0.0, 0.0]},
+            ],
+        }
+    ]
+    contacts = [
+        {
+            "kind": "interval",
+            "axis": 0,
+            "surface": 0,
+            "start_t": 0.0,
+            "end_t": 1.0,
+            "endpoints": [[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]],
+            "location": "interior",
+        },
+        {
+            "kind": "point",
+            "axis": 0,
+            "surface": 1,
+            "t": 0.5,
+            "point": [0.0, 0.0, 0.0],
+            "location": "interior",
+        },
+    ]
     return {
         "format": INPUT_FORMAT,
         "length_unit": "model_unit",
@@ -1063,8 +1100,8 @@ def synthetic_report() -> dict:
         },
         "source_coverage_complete": True,
         "surfaces": surfaces,
-        "axes": [],
-        "contacts": [],
+        "axes": axes,
+        "contacts": contacts,
         "blockers": [],
     }
 
@@ -1076,7 +1113,15 @@ def self_test() -> dict:
     assert result["mesh"]["triangle_count"] > 0
     assert result["mesh"]["shared_surface_pair_count"] >= 1
     assert result["mesh"]["shared_mesh_edge_count"] >= 1
-    assert not result["ownership_conflicts"]
+    assert result["mesh"]["bar_count"] > 0
+    assert result["bar_surface_contacts"]["contact_count"] == 2
+    assert result["bar_surface_contacts"]["failed_contact_count"] == 0
+    assert not result["surface_ownership_conflicts"]
+    assert not result["curve_ownership_conflicts"]
+    assert any(
+        group["dimension"] == 1 and group["stiffness"] == 50
+        for group in result["physical_groups"]
+    )
     assert result["backend_ready"], result["blockers"]
 
     # Pure healing regression: only the pre-existing multi-surface junction node
