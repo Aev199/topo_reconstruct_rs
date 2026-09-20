@@ -508,6 +508,134 @@ def shared_mesh_edges_by_source(triangles: list[dict]) -> dict[tuple[int, int], 
     return dict(result)
 
 
+def surface_edges_by_source(triangles: list[dict]) -> dict[int, set[tuple[int, int]]]:
+    result: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    for triangle in triangles:
+        a, b, c = triangle["nodes"]
+        result[triangle["source_surface"]].update(
+            {
+                tuple(sorted((a, b))),
+                tuple(sorted((b, c))),
+                tuple(sorted((c, a))),
+            }
+        )
+    return result
+
+
+def surface_nodes_by_source(triangles: list[dict]) -> dict[int, set[int]]:
+    result: dict[int, set[int]] = defaultdict(set)
+    for triangle in triangles:
+        result[triangle["source_surface"]].update(triangle["nodes"])
+    return result
+
+
+def axis_parameter(point: Iterable[float], axis: dict) -> tuple[float, float]:
+    a = tuple(float(x) for x in axis["endpoints"][0])
+    b = tuple(float(x) for x in axis["endpoints"][1])
+    p = tuple(float(x) for x in point)
+    d = tuple(b[i] - a[i] for i in range(3))
+    length2 = sum(x * x for x in d)
+    if length2 == 0:
+        return 0.0, float("inf")
+    t = sum((p[i] - a[i]) * d[i] for i in range(3)) / length2
+    q = tuple(a[i] + t * d[i] for i in range(3))
+    return t, distance(p, q)
+
+
+def audit_contacts(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    precision: float,
+) -> dict:
+    """Verify that declared reconstructed bar/surface contacts became mesh identity."""
+
+    surface_edges = surface_edges_by_source(triangles)
+    surface_nodes = surface_nodes_by_source(triangles)
+    axis_nodes: dict[int, set[int]] = defaultdict(set)
+    for bar in bars:
+        axis_nodes[bar["axis"]].update(bar["nodes"])
+
+    details = []
+    failed = 0
+    tolerance = precision * 10.0
+    for index, contact in enumerate(data.get("contacts", [])):
+        axis_index = int(contact["axis"])
+        surface = int(contact["surface"])
+        axis = data["axes"][axis_index]
+
+        if contact["kind"] == "point":
+            expected = tuple(float(x) for x in contact["point"])
+            shared = axis_nodes.get(axis_index, set()) & surface_nodes.get(surface, set())
+            nearest = min(
+                (distance(coords[node], expected), node) for node in shared
+            ) if shared else None
+            conforming = nearest is not None and nearest[0] <= tolerance
+            if not conforming:
+                failed += 1
+            details.append(
+                {
+                    "contact": index,
+                    "kind": "point",
+                    "axis": axis_index,
+                    "surface": surface,
+                    "mesh_conforming": conforming,
+                    "shared_node": nearest[1] if conforming else None,
+                    "distance": nearest[0] if nearest else None,
+                }
+            )
+            continue
+
+        start_t = float(contact["start_t"])
+        end_t = float(contact["end_t"])
+        expected_length = axis_length(axis) * (end_t - start_t)
+        axis_tol = tolerance / max(axis_length(axis), tolerance)
+        total = 0.0
+        shared_total = 0.0
+        for bar in bars:
+            if int(bar["axis"]) != axis_index:
+                continue
+            p0 = coords[bar["nodes"][0]]
+            p1 = coords[bar["nodes"][1]]
+            midpoint = tuple((p0[i] + p1[i]) * 0.5 for i in range(3))
+            t, residual = axis_parameter(midpoint, axis)
+            if residual > tolerance:
+                continue
+            if start_t - axis_tol <= t <= end_t + axis_tol:
+                length = distance(p0, p1)
+                total += length
+                if tuple(sorted(bar["nodes"])) in surface_edges.get(surface, set()):
+                    shared_total += length
+
+        length_tolerance = max(tolerance, expected_length * 1e-10)
+        conforming = (
+            abs(total - expected_length) <= length_tolerance
+            and abs(shared_total - expected_length) <= length_tolerance
+        )
+        if not conforming:
+            failed += 1
+        details.append(
+            {
+                "contact": index,
+                "kind": "interval",
+                "axis": axis_index,
+                "surface": surface,
+                "mesh_conforming": conforming,
+                "expected_length": expected_length,
+                "bar_length": total,
+                "shared_mesh_edge_length": shared_total,
+            }
+        )
+
+    return {
+        "contact_count": len(details),
+        "conforming_contact_count": len(details) - failed,
+        "failed_contact_count": failed,
+        "details": details,
+    }
+
+
 @dataclass
 class Fragmentation:
     surface_to_output: list[list[int]]
