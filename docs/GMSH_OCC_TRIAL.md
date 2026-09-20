@@ -174,11 +174,63 @@ geometry for remeshing.
 The custom Rust surface Boolean/junction implementation should remain a
 fallback/reference, not the primary path.
 
+## Shared-node semantic audit
+
+A bar/bar check based only on geometric intersection initially appeared to show
+one unsupported relation. Inspecting the complete local topology showed why a
+pairwise test is insufficient: two axes can legitimately share a node through
+two surfaces whose own junction is valid.
+
+The production gate therefore audits the complete owner graph at every shared
+mesh node. Direct relations are allowed only through a finite shared surface
+edge, a common source node, or an explicit Rust rod/surface contact; transitive
+paths through those valid relations are accepted.
+
+Private full-model result before healing:
+
+- 3,340 shared nodes checked;
+- 0 unintended shared nodes;
+- 1,335 direct axis/axis relations;
+- 1 surface-mediated axis/axis relation;
+- 0 unsupported axis/axis relations.
+
+The backend is blocked if a single mesh node contains more than one disconnected
+semantic owner component.
+
+Surface boundary source-node IDs are now exported explicitly in
+`topo-reconstruct-gmsh-v1`; the audit never infers source identity from
+coordinates.
+
+## Solver-mesh handoff
+
+The final adapter boundary is
+`topo-reconstruct-solver-mesh-v1`, containing compact vertices, triangular
+shells, two-node bars and separate surface/bar region registries.
+
+The full-model coverage audit found:
+
+- 387 / 387 surface regions represented;
+- 2,601 / 2,601 bar regions represented;
+- 13,301 / 13,301 source shell elements represented;
+- 2,601 / 2,601 source bar elements represented;
+- no invalid or degenerate compact elements;
+- no stiffness mismatches.
+
+This means MIDAS/PLAXIS adapters no longer need to understand Gmsh entity tags
+or OpenCASCADE fragmentation maps.
+
 ## Remaining validation
 
-The next geometry-class gap is bar/bar intersections. After that, freeze the
-compact solver-mesh schema and validate an actual MIDAS import. PLAXIS geometry
-import and analysis semantics such as loads/materials/stages remain later work.
+The geometry/backend phase is sufficiently closed to move to the target-program
+boundary.
+
+Next work is:
+
+- calibrate the exact modern GTS NX FPN element/group record layout;
+- generate and import a tiny MIDAS fixture;
+- then import the private full solver mesh;
+- verify PLAXIS geometry handoff separately;
+- add loads/materials/stages only after geometry import is stable.
 
 The Gmsh GitHub Actions probe is manual-only. Private full-model data is never
 put in Actions.
