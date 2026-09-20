@@ -407,6 +407,17 @@ fn build_impl(
                 boundary.insert(key(pair[0].1, pair[1].1));
             }
         }
+        // Surface-surface junctions are explicit shared topology. They are
+        // meshed exactly like other interior constraints, with barrier status
+        // decided below from whether the complete chain reaches two boundary
+        // vertices.
+        for &edge in &surface.junctions {
+            for pair in edge_nodes[edge].windows(2) {
+                let segment = key(pair[0].1, pair[1].1);
+                constraints.insert(segment);
+                internal_constraint_edges.insert(segment);
+            }
+        }
         barriers.extend(&boundary);
         let boundary_nodes: BTreeSet<_> = boundary.iter().flatten().copied().collect();
         constraints.extend(&boundary);
