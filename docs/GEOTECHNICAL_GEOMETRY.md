@@ -78,3 +78,41 @@ cargo run --offline -- --v2-mesh-preview-json geotechnical.json model.txt
 python3 scripts/check_v2_assembly.py geotechnical.json
 cargo run --offline -- --v2-preserve-details --v2-mesh-preview-json strict.json model.txt
 ```
+
+## Interior refinement correction, 2026-09-20
+
+The earlier missing interior points were a meshing defect, not evidence that
+their surfaces needed geometric simplification. Internal beam constraints could
+be mistaken for winding boundaries by the triangulator. Disabling exterior
+exclusion avoided that problem but spent the shared surface budget outside the
+material; subsequent regions could then receive no refinement.
+
+Size control now seeds the entire material domain before local angle refinement.
+Only actual surface boundaries toggle inside/outside membership; internal bars
+remain constraints. Exterior refinement is disabled. A material-only angle pass
+revisits faces the library may have excluded because of internal constraints,
+protects fixed edges from encroachment, and recalculates circumcenters after
+each insertion. Both stages remain bounded by the configured vertex budget.
+Coordinates, contours, source-property provenance and shared boundaries are
+unchanged; the additional nodes are mesh nodes, not restored source FE nodes.
+
+| Full скала1 measurement | Before | After |
+|---|---:|---:|
+| Maximum triangle area, m² | 3.61125 | 0.399988 |
+| Minimum triangle angle | 0.30886° | 2.39098° |
+| Triangles below 20° | 462 | 163 |
+| Triangles | 17348 | 22170 |
+| Bar segments | 4482 | 4482 |
+| Refinement cap reached | yes | no |
+
+All 388 surfaces and 581 axes remain represented, with complete supported
+source-element coverage. Trial topology and the external-mesher gate pass.
+The only remaining local quality blocker is `minimum_angle_not_met`; export
+readiness is still false. Do not attribute the remaining acute triangles to
+bad source geometry without a targeted constraint audit.
+
+Validation: 126 Rust tests pass, including a new scale-varied case with a hole
+and a dangling beam verifying material-only seeding, preserved constraints,
+area coverage and the zero-budget case. The independent assembly checker passes;
+an independent calculation from all triangle coordinates confirms maximum area,
+minimum angle, positive triangle areas and the 163 remaining angle violations.

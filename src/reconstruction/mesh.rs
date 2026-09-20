@@ -373,7 +373,6 @@ fn build_impl(
         let mut constraints = BTreeSet::new();
         let mut boundary = BTreeSet::new();
         let mut barriers = BTreeSet::new();
-        let mut has_open_internal_constraint = false;
         let mut internal_constraint_edges = BTreeSet::new();
         let mut nodes = BTreeSet::new();
         // Closing a collapsed opening removes only its material boundary.
@@ -486,8 +485,6 @@ fn build_impl(
                 .any(|a| right_boundary.iter().any(|b| a != b))
             {
                 barriers.insert(edge);
-            } else {
-                has_open_internal_constraint = true;
             }
         }
         nodes.extend(constraints.iter().flatten().copied());
@@ -519,7 +516,6 @@ fn build_impl(
             &boundary,
             &barriers,
             &constraints,
-            has_open_internal_constraint,
             &plane,
             &mut vertices,
             policy,
