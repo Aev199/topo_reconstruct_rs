@@ -901,6 +901,16 @@ def regularize_near_vertex_junctions(
 
     regularized_triangles, removed_triangles = remap_entities(triangles, 2)
     regularized_bars, removed_bars = remap_entities(bars, 1)
+
+    def diagnostic_json(item: dict) -> dict:
+        result = dict(item)
+        for key in ("owners_a", "owners_b", "owners_edge"):
+            if key in result:
+                result[key] = sorted(result[key])
+        if "edge" in result:
+            result["edge"] = list(result["edge"])
+        return result
+
     return result_coords, regularized_triangles, regularized_bars, {
         "angle_limit_degrees": angle_limit_degrees,
         "movement_limit": movement_limit,
@@ -912,7 +922,7 @@ def regularize_near_vertex_junctions(
         "removed_degenerate_triangles": removed_triangles,
         "removed_degenerate_bars": removed_bars,
         "accepted": accepted,
-        "skipped": skipped,
+        "skipped": [diagnostic_json(item) for item in skipped],
     }
 
 
