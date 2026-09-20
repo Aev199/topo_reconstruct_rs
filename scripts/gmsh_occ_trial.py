@@ -1234,6 +1234,7 @@ def audit_semantic_shared_nodes(
     triangles: list[dict],
     bars: list[dict],
     precision: float,
+    movement_reports: list[dict] | None = None,
 ) -> dict:
     """Reject shared mesh nodes that have no reconstructed semantic path.
 
@@ -1244,6 +1245,33 @@ def audit_semantic_shared_nodes(
     alone is never a relation.
     """
     tolerance = precision * 10.0
+    movement_reports = movement_reports or []
+    reverse_moves: dict[int, list[dict]] = defaultdict(list)
+    for report in movement_reports:
+        for component in report.get("components", report.get("accepted", [])):
+            for move in component.get("moves", []):
+                movement = float(move.get("movement", float("inf")))
+                movement_limit = float(move.get("movement_limit", 0.0))
+                if movement_limit > 0.0 and movement < movement_limit:
+                    reverse_moves[int(move["to"])].append(move)
+
+    def node_matches_point(node: int, expected: Iterable[float]) -> bool:
+        expected = tuple(float(x) for x in expected)
+        if distance(coords[node], expected) <= tolerance:
+            return True
+        stack = [node]
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for move in reverse_moves.get(current, []):
+                if distance(move["from_coordinate"], expected) <= tolerance:
+                    return True
+                stack.append(int(move["from"]))
+        return False
+
     node_surfaces: dict[int, set[int]] = defaultdict(set)
     node_axes: dict[int, set[int]] = defaultdict(set)
     edge_surfaces: dict[tuple[int, int], set[int]] = defaultdict(set)
@@ -1312,10 +1340,10 @@ def audit_semantic_shared_nodes(
             common = set(surface_source_points[s1]) & set(surface_source_points[s2])
             for source_node in common:
                 if any(
-                    distance(candidate, point) <= tolerance
+                    node_matches_point(node, candidate)
                     for candidate in surface_source_points[s1][source_node]
                 ) and any(
-                    distance(candidate, point) <= tolerance
+                    node_matches_point(node, candidate)
                     for candidate in surface_source_points[s2][source_node]
                 ):
                     return True, f"shared_surface_source_node:{source_node}"
@@ -1326,8 +1354,8 @@ def audit_semantic_shared_nodes(
             common = set(axis_source_points[a1]) & set(axis_source_points[a2])
             for source_node in common:
                 if (
-                    distance(axis_source_points[a1][source_node], point) <= tolerance
-                    and distance(axis_source_points[a2][source_node], point) <= tolerance
+                    node_matches_point(node, axis_source_points[a1][source_node])
+                    and node_matches_point(node, axis_source_points[a2][source_node])
                 ):
                     return True, f"shared_axis_source_node:{source_node}"
             return False, None
@@ -1339,7 +1367,7 @@ def audit_semantic_shared_nodes(
         parameter_tolerance = tolerance / max(axis_length(geometry), tolerance)
         for contact in contacts_by_pair.get((axis, surface), []):
             if contact["kind"] == "point":
-                if distance(contact["point"], point) <= tolerance:
+                if node_matches_point(node, contact["point"]):
                     return True, "declared_point_contact"
             elif (
                 residual <= tolerance
@@ -2093,8 +2121,14 @@ def run_backend(
         healed_bars.append({**bar, "nodes": nodes})
     healing["removed_degenerate_bars"] = removed_degenerate_bars
 
+    movement_reports = [junction_regularization, healing]
     semantic_before_point_split = audit_semantic_shared_nodes(
-        data, regularized_coords, healed_triangles, healed_bars, precision
+        data,
+        regularized_coords,
+        healed_triangles,
+        healed_bars,
+        precision,
+        movement_reports,
     )
     (
         final_coords,
@@ -2108,7 +2142,12 @@ def run_backend(
         semantic_before_point_split,
     )
     final_semantic_node_audit = audit_semantic_shared_nodes(
-        data, final_coords, final_triangles, final_bars, precision
+        data,
+        final_coords,
+        final_triangles,
+        final_bars,
+        precision,
+        movement_reports,
     )
 
     final_quality = quality(final_coords, final_triangles)
@@ -2120,7 +2159,7 @@ def run_backend(
         data,
         raw_contact_audit,
         strict_final_contact_audit,
-        [junction_regularization, healing],
+        movement_reports,
         precision,
     )
 
