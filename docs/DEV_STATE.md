@@ -28,6 +28,31 @@ These acute elements remain a solver-mesh quality risk: this is evidence of
 shared topology, not evidence of solver import or acceptable target mesh
 quality. Older counters below describe the superseded unjoined mesh.
 
+### Follow-up on acute `test5` elements
+
+Of the 39 triangles below 5 degrees, 37 belong to source floor 95 at elevation
+6.45 m; the other two belong to adjacent walls. The worst triangle has a
+0.000878-degree angle and an area of about 1.22e-6 square metres. At one
+affected junction, lower wall 79 and upper wall 97 have separate source
+boundary nodes and parallel midsurfaces about 25 mm apart. The floor bridges
+that distance. Its boundary also misses the nearby wall endpoint by about
+5.6 micrometres. Merging the two wall midsurfaces just to improve a mesh
+angle would discard an actual source distinction and is not justified.
+
+A three-surface diagnostic (walls 79 and 97, floor 95) at nominal sizes 0.75
+and 0.25 m reduced triangles below 5 degrees from 10 to 1, but the minimum
+angle only changed from 0.000878 to 0.001807 degrees. Global refinement alone
+does not remove the near-collinear wedge. On the full exported `test5` MSH,
+Gmsh reports 40,551 triangles, zero nonpositive minimum Jacobians, minimum
+signed inverse condition number 2.64e-5, and a positive minimum edge length
+of 11.94 mm. The mesh is noninverted but has a severe conditioning outlier.
+
+Next: assess solver import and conditioning on this exact MSH. If it fails,
+repair the near-collinear floor/wall endpoint in source geometry with a
+bounded, provenance-logged transaction that preserves distinct wall regions,
+then rerun full intersection, region, contact and quality audits. Do not
+introduce a global tolerance or weld the lower and upper wall centrelines.
+
 This is the short handoff for the next development session. Detailed geometry
 rules remain in `docs/GEOTECHNICAL_GEOMETRY.md` and
 `docs/RECONSTRUCTION_V2.md`; the Gmsh evidence is in
