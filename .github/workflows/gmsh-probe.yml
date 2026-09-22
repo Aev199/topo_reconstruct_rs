@@ -24,6 +24,9 @@ jobs:
       - name: Install Gmsh
         run: python -m pip install --no-deps gmsh-wheel/*.whl
 
+      - name: Install geometry audit dependencies
+        run: python -m pip install -r scripts/requirements-audit.txt
+
       - name: Run OCC fragmentation self-test
         run: python scripts/gmsh_occ_trial.py --self-test --mesh-size 0.5
 
@@ -35,4 +38,7 @@ jobs:
           path: |
             gmsh-wheel/*.whl
             scripts/gmsh_occ_trial.py
+            scripts/check_gmsh_surface_junctions.py
+            scripts/check_v2_global_geometry.py
+            scripts/requirements-audit.txt
           retention-days: 1

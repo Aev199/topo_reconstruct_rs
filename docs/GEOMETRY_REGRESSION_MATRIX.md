@@ -1,6 +1,6 @@
 # Geometry regression matrix
 
-Updated: 2026-09-20
+Updated: 2026-09-22
 
 This matrix is the current private integration gate for the Gmsh/OpenCASCADE
 backend. Only aggregate results are committed; source fixtures remain private.
@@ -13,7 +13,34 @@ All models use the same reconstruction and backend policy:
 - target Gmsh surface size: 0.75 model units;
 - exact OCC General Fuse; no global Boolean fuzzy tolerance.
 
-## Current result
+## Current result after finite-junction correction
+
+| metric | skala1 | skala2 | test5 |
+| --- | ---: | ---: | ---: |
+| backend ready | yes | yes | yes |
+| all finite surface intersections with shared mesh edges | 534/534 | 272/272 | 354/354¹ |
+| reconstructed surfaces | 388 | 23 | 108 |
+| shell triangles | 22,686 | 16,872 | 40,551 |
+| bar segments | 3,335 | 2,522 | 56 |
+| minimum triangle angle | 0.80084° | 21.95616° | 0.00088° |
+| triangles below 5° | 8 | 0 | 39 |
+| bar/surface contacts conforming | 4,570/4,570 | 2,787/2,787 | 12/12 |
+| missing regions / source elements | 0 | 0 | 0 |
+| unintended shared nodes | 0 | 0 | 0 |
+
+¹ One `test5` endpoint is accepted only through its exact logged 15.09 mm
+move; no generic expanded proximity tolerance. Before the fix the independent
+auditor found **121/354 missing** finite junction segments on the final mesh,
+including a 10.85 m wall/slab contact with zero common edges. The old
+`surface_pair_audit` compared only relations present before and after repair,
+so it could incorrectly pass disconnected CAD intersections.
+
+The quality cost is explicit: the new internal intersection constraints raise
+`test5` triangle count and sliver count. Angles remain diagnostics pending
+target solver evaluation, not evidence that this mesh is a finished MIDAS mesh.
+Private fixture and reports remain outside the repository.
+
+## Historical result before finite-junction correction
 
 | metric | skala1 | skala2 | test5 |
 | --- | ---: | ---: | ---: |
@@ -154,6 +181,8 @@ better. All private fixtures must continue to satisfy:
 - zero failed declared bar/surface contacts;
 - zero unintended final shared nodes;
 - zero lost or newly created finite shared-surface pairs due to repair;
+- complete representation of every finite source-surface intersection by
+  shared final mesh edge IDs, except exactly logged bounded endpoint repair;
 - surface planarity within numerical tolerance;
 - every geometry movement bounded and provenance logged.
 

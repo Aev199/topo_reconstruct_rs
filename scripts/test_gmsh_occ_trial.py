@@ -20,6 +20,47 @@ gmsh_occ_trial = importlib.import_module("gmsh_occ_trial")
 
 
 class GmshOccTrialTests(unittest.TestCase):
+    def test_occ_fragments_tool_tool_wall_slab_and_hole(self):
+        import gmsh
+
+        def face(rings, region):
+            return {"rings": rings, "source_surface": region, "source_patch": region,
+                    "stiffness": region + 1, "source_elements": [region + 1]}
+
+        unrelated = face([[[10, 0, 0], [11, 0, 0], [11, 1, 0], [10, 1, 0]]], 0)
+        slab = face([
+            [[0, 0, 0], [4, 0, 0], [4, 4, 0], [0, 4, 0]],
+            [[1, 1, 0], [1, 2, 0], [2, 2, 0], [2, 1, 0]],
+        ], 1)
+        wall = face([[[3, 0, -1], [3, 4, -1], [3, 4, 1], [3, 0, 1]]], 2)
+        gmsh.initialize()
+        try:
+            gmsh.option.setNumber("General.Terminal", 0)
+            for shift, reverse in ((0.0, False), (100000.0, True)):
+                gmsh.clear()
+                gmsh.model.add("tool_tool_junction")
+                items = json.loads(json.dumps([unrelated, slab, wall]))
+                for item in items:
+                    for ring in item["rings"]:
+                        if reverse:
+                            ring.reverse()
+                        for point in ring:
+                            point[0] += shift
+                            point[1] -= shift
+                fragmented = gmsh_occ_trial.fragment(items, [], [], 1e-8)
+                slab_edges = {tag for face_tag in fragmented.surface_to_output[1]
+                              for dim, tag in gmsh.model.getBoundary([(2, face_tag)], oriented=False)
+                              if dim == 1}
+                wall_edges = {tag for face_tag in fragmented.surface_to_output[2]
+                              for dim, tag in gmsh.model.getBoundary([(2, face_tag)], oriented=False)
+                              if dim == 1}
+                self.assertTrue(slab_edges & wall_edges)
+                slab_area = sum(gmsh.model.occ.getMass(2, tag)
+                                for tag in fragmented.surface_to_output[1])
+                self.assertAlmostEqual(slab_area, 15.0, places=7)
+        finally:
+            gmsh.finalize()
+
     def test_near_vertex_inversion_is_transactionally_rejected(self):
         coords = {
             1: (0.0, 0.0, 0.0), 2: (0.02, 0.0, 0.0), 3: (0.02, 1.0, 0.0),

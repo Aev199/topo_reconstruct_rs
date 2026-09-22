@@ -1,6 +1,32 @@
 # Development state
 
-Updated: 2026-09-20
+Updated: 2026-09-22
+
+## Finite junction coverage correction
+
+The earlier `backend_ready=true` gate only compared finite surface-pair
+identities before and after local repair. It did not check source geometric
+intersections that never acquired shared mesh edges. The private `test5` model
+exposed a wall/floor line 10.85 m long with zero shared mesh edges, despite
+complete region and source-element coverage.
+
+The OCC adapter now normalizes outer/hole wire orientation for its own
+convention and fragments all input faces and curves together. The independent
+finite-intersection auditor checks every source surface intersection against
+actual shared mesh edge IDs, accepting a changed endpoint only with the exact
+logged bounded repair move. `nonconforming_surface_junction` blocks export and
+solver-mesh writing. `numpy` and `shapely` are now backend requirements for
+this audit; the manual Gmsh workflow installs them.
+
+Fresh full-model results at mesh size 0.75: `skala1` 534/534, `skala2`
+272/272, `test5` 354/354 finite intersection segments conforming (one `test5`
+endpoint covered by a logged 15.09 mm movement). All three retain complete
+source/property/contact coverage, no unintended shared nodes and zero backend
+blockers. `test5` now has 40,551 shell triangles and 39 below 5 degrees
+(minimum 0.00088 degrees), versus 37,183 and 4 in the incomplete prior mesh.
+These acute elements remain a solver-mesh quality risk: this is evidence of
+shared topology, not evidence of solver import or acceptable target mesh
+quality. Older counters below describe the superseded unjoined mesh.
 
 This is the short handoff for the next development session. Detailed geometry
 rules remain in `docs/GEOTECHNICAL_GEOMETRY.md` and

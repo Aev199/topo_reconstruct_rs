@@ -247,6 +247,34 @@ def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
     return normalized
 
 
+def _ring_normal(points3d: list[list[float]]) -> tuple[float, float, float]:
+    """Return a translation-stable normal for a planar polygon ring."""
+    normal = [0.0, 0.0, 0.0]
+    origin = [float(value) for value in points3d[0]]
+    for first, second in zip(points3d, points3d[1:] + points3d[:1]):
+        a = [float(first[index]) - origin[index] for index in range(3)]
+        b = [float(second[index]) - origin[index] for index in range(3)]
+        normal[0] += a[1] * b[2] - a[2] * b[1]
+        normal[1] += a[2] * b[0] - a[0] * b[2]
+        normal[2] += a[0] * b[1] - a[1] * b[0]
+    length = math.sqrt(sum(value * value for value in normal))
+    if length <= 0.0:
+        raise ValueError("degenerate surface ring")
+    return tuple(value / length for value in normal)
+
+
+def _ring_orientation(points3d: list[list[float]], normal: tuple[float, float, float]) -> float:
+    total = [0.0, 0.0, 0.0]
+    origin = [float(value) for value in points3d[0]]
+    for first, second in zip(points3d, points3d[1:] + points3d[:1]):
+        a = [float(first[index]) - origin[index] for index in range(3)]
+        b = [float(second[index]) - origin[index] for index in range(3)]
+        total[0] += a[1] * b[2] - a[2] * b[1]
+        total[1] += a[2] * b[0] - a[0] * b[2]
+        total[2] += a[0] * b[1] - a[1] * b[0]
+    return sum(total[index] * normal[index] for index in range(3))
+
+
 def add_ring(points3d: list[list[float]]) -> int:
     if len(points3d) < 3:
         raise ValueError("surface ring has fewer than 3 points")
@@ -259,7 +287,23 @@ def add_ring(points3d: list[list[float]]) -> int:
 
 
 def add_surface(surface: dict) -> int:
-    wires = [add_ring(ring) for ring in surface["rings"]]
+    # OCC uses wire orientation when classifying the first wire and holes.
+    # FE contours do not guarantee a consistent winding, so relying on their
+    # input order silently turns holes into filled material (or vice versa).
+    # Normalize relative to the first ring.  ``addPlaneSurface`` classifies
+    # subsequent wires as holes, but in the OCC Python binding it expects all
+    # supplied wires to use the same winding.  FE contours often mix winding
+    # conventions, which otherwise turns a hole into filled material.
+    rings = [[list(point) for point in ring] for ring in surface["rings"]]
+    normal = _ring_normal(rings[0])
+    outer_sign = 1.0 if _ring_orientation(rings[0], normal) >= 0.0 else -1.0
+    oriented = []
+    for index, ring in enumerate(rings):
+        sign = _ring_orientation(ring, normal)
+        if sign * outer_sign < 0.0:
+            ring = list(reversed(ring))
+        oriented.append(ring)
+    wires = [add_ring(ring) for ring in oriented]
     return gmsh.model.occ.addPlaneSurface(wires)
 
 
@@ -1795,9 +1839,13 @@ def fragment(
         output_map = [[input_entities[0]]]
         output = [input_entities[0]]
     else:
+        # Pass every entity as an object.  Passing the first entity as the
+        # object and all remaining entities as tools leaves tool/tool
+        # intersections unsplit in OCC; that creates disconnected slab/wall
+        # meshes even though the geometry intersects.
         output, output_map = gmsh.model.occ.fragment(
-            [input_entities[0]],
-            input_entities[1:],
+            input_entities,
+            [],
             removeObject=True,
             removeTool=True,
         )
@@ -2665,6 +2713,17 @@ def run_backend(
         precision,
     )
 
+    # A repair-delta check alone cannot detect a junction that never became
+    # conforming in OCC. Check every finite geometric source intersection
+    # independently against the final shared mesh edge IDs.
+    from check_gmsh_surface_junctions import check as check_surface_junctions
+
+    surface_junction_audit = check_surface_junctions(data, {
+        "mesh": {"vertices": compact_vertices, "triangles": compact_triangles},
+        "junction_regularization": junction_regularization,
+        "healing": healing,
+    })
+
     blockers = list(data.get("blockers", []))
     if not bool(data.get("source_coverage_complete", False)):
         blockers.append("incomplete_source_coverage")
@@ -2694,6 +2753,8 @@ def run_backend(
         blockers.append("surface_planarity_failure")
     if not solver_mesh_audit["clean"]:
         blockers.append("solver_mesh_coverage_failure")
+    if not surface_junction_audit["clean"]:
+        blockers.append("nonconforming_surface_junction")
 
     if write_msh and not blockers:
         write_solver_mesh_msh(write_msh, solver_mesh)
@@ -2744,6 +2805,7 @@ def run_backend(
         "surface_pair_audit": surface_pair_audit,
         "surface_planarity_audit": planarity_audit,
         "solver_mesh_audit": solver_mesh_audit,
+        "surface_junction_audit": surface_junction_audit,
         "solver_mesh": solver_mesh,
         "mesh": {
             **final_quality,
