@@ -70,6 +70,41 @@ class GmshOccTrialTests(unittest.TestCase):
         self.assertEqual(report["unresolved_component_count"], 0)
         self.assertEqual(len(healed), 2)
 
+    def test_subresolution_hole_edge_may_close_with_logged_bounded_move(self):
+        # A plate has a 0.5 mm triangular hole edge.  Node 5 is also the
+        # declared wall junction, so the existing junction-local policy may
+        # absorb node 6 and simplify this micro-opening.
+        coords = {
+            1: (-1.0, -1.0, 0.0), 2: (1.0, -1.0, 0.0), 3: (1.0, 2.0, 0.0),
+            4: (-1.0, 2.0, 0.0), 5: (0.0, 0.0, 0.0), 6: (0.0005, 0.0, 0.0),
+            7: (0.0, 1.0, 0.0), 8: (1.0, 0.0, 0.0), 9: (1.0, 1.0, 0.0),
+            10: (0.2, 1.5, 0.0), 11: (-1.0, 1.5, 0.0),
+            12: (0.0, 0.0, 1.0), 13: (0.0, 0.2, 2.0),
+        }
+        triangles = [
+            {"nodes": nodes, "source_surface": 0} for nodes in [
+                (5, 6, 8), (5, 8, 9), (5, 9, 7), (5, 7, 10),
+                (5, 10, 11), (5, 11, 4),
+            ]
+        ] + [{"nodes": (5, 12, 13), "source_surface": 1}]
+        healed, mapping, report = gmsh_occ_trial.heal_micro_edges(coords, triangles, 0.001, 1e-8)
+        self.assertEqual(mapping, {6: 5})
+        self.assertEqual(report["collapsed_component_count"], 1)
+        self.assertEqual(report["removed_degenerate_triangles"], 1)
+        move = report["components"][0]["moves"][0]
+        self.assertEqual((move["from"], move["to"]), (6, 5))
+        self.assertLess(move["movement"], 0.001)
+        self.assertTrue(all(
+            gmsh_occ_trial.triangle_area(*(coords[node] for node in triangle["nodes"])) > 1e-16
+            for triangle in healed
+        ))
+
+    def test_overlap_guard_is_stable_for_translated_scaled_coordinates(self):
+        for scale, shift in ((1.0, 0.0), (1e-3, 1e9)):
+            left = [(shift + scale * x, shift + scale * y, 0.0) for x, y in ((0, 0), (2, 0), (0, 2))]
+            right = [(shift + scale * x, shift + scale * y, 0.0) for x, y in ((0.5, 0.5), (2.5, 0.5), (0.5, 2.5))]
+            self.assertTrue(gmsh_occ_trial._coplanar_triangle_overlap(left, right, max(1e-12, scale * 1e-8)))
+
     def test_incomplete_coverage_is_a_blocker_for_both_formats(self):
         versioned = {
             "format": gmsh_occ_trial.INPUT_FORMAT,

@@ -497,11 +497,15 @@ def _project_triangle(points: list[tuple[float, float, float]], drop: int) -> li
 
 
 def _polygon_area_2d(points: list[tuple[float, float]]) -> float:
+    if not points:
+        return 0.0
+    origin = points[0]
+    shifted = [(point[0] - origin[0], point[1] - origin[1]) for point in points]
     return 0.5 * abs(sum(
-        points[index][0] * points[(index + 1) % len(points)][1]
-        - points[(index + 1) % len(points)][0] * points[index][1]
-        for index in range(len(points))
-    )) if points else 0.0
+        shifted[index][0] * shifted[(index + 1) % len(shifted)][1]
+        - shifted[(index + 1) % len(shifted)][0] * shifted[index][1]
+        for index in range(len(shifted))
+    ))
 
 
 def _clip_polygon_2d(
@@ -572,7 +576,7 @@ def _coplanar_triangle_overlap(
         (left_2d[1][0] - left_2d[0][0]) * (left_2d[2][1] - left_2d[0][1])
         - (left_2d[1][1] - left_2d[0][1]) * (left_2d[2][0] - left_2d[0][0])
     )
-    if abs(orientation) <= tolerance:
+    if abs(orientation) <= tolerance * tolerance:
         return False
     clipped = right_2d
     for index in range(3):
