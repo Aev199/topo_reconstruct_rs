@@ -70,6 +70,14 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     v2_mesh_preview_json: Option<String>,
 
+    /// Записать стабильный Rust -> Gmsh/OpenCASCADE interchange JSON
+    #[arg(long, value_name = "PATH")]
+    v2_gmsh_input_json: Option<String>,
+
+    /// Целевой размер поверхностной сетки Gmsh в единицах модели
+    #[arg(long, default_value_t = 0.75)]
+    v2_gmsh_mesh_size: f64,
+
     /// Сохранить даже вырожденные отверстия вместо геотехнического упрощения
     #[arg(long)]
     v2_preserve_details: bool,
@@ -77,14 +85,16 @@ struct Args {
 
 fn run_v2_preview(
     input: &str,
-    output: &str,
+    output: Option<&str>,
+    gmsh_output: Option<&str>,
+    gmsh_mesh_size: f64,
     iterations: usize,
     include_mesh: bool,
     preserve_details: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use topo_reconstruct_rs::{
         parsers::LiraParser as V2LiraParser,
-        reconstruction::{assembly, frame, graph, mesh, planes, recognize, reconcile},
+        reconstruction::{assembly, frame, gmsh, graph, mesh, planes, recognize, reconcile},
     };
 
     if iterations == 0 {
@@ -140,6 +150,16 @@ fn run_v2_preview(
             &assembly::FeaturePolicy::default(),
         )?
     };
+    if let Some(path) = gmsh_output {
+        let interchange = gmsh::from_assembly(&topology, gmsh_mesh_size)?;
+        if path == "-" {
+            serde_json::to_writer_pretty(std::io::stdout().lock(), &interchange)?;
+            println!();
+        } else {
+            serde_json::to_writer_pretty(File::create(path)?, &interchange)?;
+        }
+    }
+
     let reconciliation =
         reconcile::solve(&mesh, &result, &topology, &reconcile::Policy::default())?;
     let (mesh_report, mesh_error) = if include_mesh {
@@ -170,11 +190,13 @@ fn run_v2_preview(
         report["mesh"] = serde_json::to_value(mesh_report)?;
         report["mesh_error"] = serde_json::to_value(mesh_error)?;
     }
-    if output == "-" {
-        serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
-        println!();
-    } else {
-        serde_json::to_writer_pretty(File::create(output)?, &report)?;
+    if let Some(output) = output {
+        if output == "-" {
+            serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
+            println!();
+        } else {
+            serde_json::to_writer_pretty(File::create(output)?, &report)?;
+        }
     }
     Ok(())
 }
@@ -196,36 +218,40 @@ fn main() {
         }
     }
 
-    if let Some(path) = &args.v2_preview_json {
-        if args.v2_mesh_preview_json.is_some() {
+    if args.v2_preview_json.is_some()
+        || args.v2_mesh_preview_json.is_some()
+        || args.v2_gmsh_input_json.is_some()
+    {
+        if args.v2_preview_json.is_some() && args.v2_mesh_preview_json.is_some() {
             eprintln!("Нельзя одновременно задавать --v2-preview-json и --v2-mesh-preview-json.");
             std::process::exit(2);
         }
+        if !args.v2_gmsh_mesh_size.is_finite() || args.v2_gmsh_mesh_size <= 0.0 {
+            eprintln!("--v2-gmsh-mesh-size должен быть конечным положительным числом.");
+            std::process::exit(2);
+        }
+        let preview_output = args
+            .v2_mesh_preview_json
+            .as_deref()
+            .or(args.v2_preview_json.as_deref());
         if let Err(error) = run_v2_preview(
             &args.input,
-            path,
+            preview_output,
+            args.v2_gmsh_input_json.as_deref(),
+            args.v2_gmsh_mesh_size,
             args.v2_iterations,
-            false,
+            args.v2_mesh_preview_json.is_some(),
             args.v2_preserve_details,
         ) {
-            eprintln!("[V2 PREVIEW ERROR] {error}");
+            eprintln!("[V2 ERROR] {error}");
             std::process::exit(1);
         }
-        eprintln!("[V2 PREVIEW] JSON сохранен: {path}");
-        return;
-    }
-    if let Some(path) = &args.v2_mesh_preview_json {
-        if let Err(error) = run_v2_preview(
-            &args.input,
-            path,
-            args.v2_iterations,
-            true,
-            args.v2_preserve_details,
-        ) {
-            eprintln!("[V2 MESH PREVIEW ERROR] {error}");
-            std::process::exit(1);
+        if let Some(path) = preview_output {
+            eprintln!("[V2 PREVIEW] JSON сохранен: {path}");
         }
-        eprintln!("[V2 MESH PREVIEW] JSON сохранен: {path}");
+        if let Some(path) = &args.v2_gmsh_input_json {
+            eprintln!("[V2 GMSH INPUT] JSON сохранен: {path}");
+        }
         return;
     }
 

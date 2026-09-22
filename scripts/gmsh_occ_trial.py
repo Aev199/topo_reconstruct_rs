@@ -1,0 +1,3170 @@
+#!/usr/bin/env python3
+"""Gmsh/OpenCASCADE backend prototype for topo_reconstruct_rs.
+
+The JSON result keeps scalar quality counters separate from mesh arrays.
+Mixed-dimensional regression covers embedded rods, junction regularization and semantic point splitting.
+
+The preferred input is the versioned `topo-reconstruct-gmsh-v1` interchange
+emitted by Rust. Legacy v2 preview JSON is accepted only to keep the private
+full-model regression reproducible during migration.
+
+Engineering recognition stays in Rust. This backend:
+1. creates OpenCASCADE planar faces from explicit 3D rings;
+2. runs exact General Fuse (occ.fragment) with no global fuzzy tolerance;
+3. carries source/property ownership through the Boolean output map;
+4. builds one conformal 2D mesh;
+5. performs conservative sub-resolution micro-edge cleanup;
+6. emits a versioned mesh/provenance result for later MIDAS/PLAXIS adapters.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from itertools import product
+from pathlib import Path
+from typing import Iterable
+
+import gmsh
+
+INPUT_FORMAT = "topo-reconstruct-gmsh-v1"
+RESULT_FORMAT = "topo-reconstruct-gmsh-result-v1"
+SOLVER_MESH_FORMAT = "topo-reconstruct-solver-mesh-v1"
+
+
+def distance(a: Iterable[float], b: Iterable[float]) -> float:
+    return math.dist(tuple(a), tuple(b))
+
+
+def triangle_area(a: Iterable[float], b: Iterable[float], c: Iterable[float]) -> float:
+    a = tuple(a)
+    b = tuple(b)
+    c = tuple(c)
+    ab = tuple(b[i] - a[i] for i in range(3))
+    ac = tuple(c[i] - a[i] for i in range(3))
+    cross = (
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    )
+    return 0.5 * math.sqrt(sum(x * x for x in cross))
+
+
+def triangle_angles(a: Iterable[float], b: Iterable[float], c: Iterable[float]) -> list[float]:
+    a = tuple(a)
+    b = tuple(b)
+    c = tuple(c)
+    ab = distance(a, b)
+    ac = distance(a, c)
+    bc = distance(b, c)
+    if min(ab, ac, bc) <= 0:
+        return [0.0, 0.0, 180.0]
+    result = []
+    for opposite, left, right in ((bc, ab, ac), (ac, ab, bc), (ab, ac, bc)):
+        cosine = (left * left + right * right - opposite * opposite) / (2 * left * right)
+        result.append(math.degrees(math.acos(max(-1.0, min(1.0, cosine)))))
+    return result
+
+
+def lift(plane: dict, uv: Iterable[float]) -> list[float]:
+    u, v = uv
+    return [
+        plane["origin"][k] + u * plane["u"][k] + v * plane["v"][k]
+        for k in range(3)
+    ]
+
+
+def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
+    if data.get("format") == INPUT_FORMAT:
+        normalized = data
+    else:
+        # Migration path from the previous full v2 preview report.
+        topology = data["topology"]
+        model = topology["preview"]
+        surfaces = []
+        stiffness = topology.get("surface_stiffness", [])
+        patches = topology.get("surface_source_patches", [])
+        for index, surface in enumerate(model["surfaces"]):
+            plane = model["planes"][surface["plane"]]
+            surfaces.append(
+                {
+                    "source_surface": index,
+                    "source_patch": patches[index] if index < len(patches) else index,
+                    "stiffness": stiffness[index] if index < len(stiffness) else 0,
+                    "source_elements": surface.get("source_elements", []),
+                    "rings": [
+                        [lift(plane, uv) for uv in ring]
+                        for ring in surface["contours"]
+                    ],
+                    "ring_source_nodes": [
+                        [
+                            int(topology["vertex_source_nodes"][
+                                (
+                                    model["edges"][edge_use["edge"]][1]
+                                    if edge_use["reversed"]
+                                    else model["edges"][edge_use["edge"]][0]
+                                )
+                            ])
+                            for edge_use in boundary
+                        ]
+                        for boundary in surface["boundaries"]
+                    ],
+                }
+            )
+        axis_report = topology.get("axis_assembly", {})
+        axes = []
+        for axis in axis_report.get("axes", []):
+            endpoints = [model["vertices"][int(vertex)] for vertex in axis["endpoints"]]
+            axes.append(
+                {
+                    "source_axis": int(axis["source_axis"]),
+                    "endpoints": endpoints,
+                    "property_spans": [
+                        {
+                            "source_element": int(span["element"]),
+                            "stiffness": int(span["stiffness"]),
+                            "start_t": float(span["start_t"]),
+                            "end_t": float(span["end_t"]),
+                        }
+                        for span in axis.get("spans", [])
+                    ],
+                    "anchors": [
+                        {
+                            "source_node": int(anchor["source_node"]),
+                            "t": float(anchor["t"]),
+                            "point": model["vertices"][int(anchor["vertex"])],
+                        }
+                        for anchor in axis.get("anchors", [])
+                    ],
+                }
+            )
+
+        contacts = []
+        for contact in axis_report.get("contacts", []):
+            axis_index = int(contact["axis"])
+            item = {
+                "kind": contact["kind"],
+                "axis": axis_index,
+                "surface": int(contact["surface"]),
+                "location": contact["location"],
+            }
+            if contact["kind"] == "point":
+                t = float(contact["t"])
+                item.update(
+                    {
+                        "t": t,
+                        "point": list(axis_point(axes[axis_index], t)),
+                    }
+                )
+            else:
+                start_t = float(contact["start_t"])
+                end_t = float(contact["end_t"])
+                item.update(
+                    {
+                        "start_t": start_t,
+                        "end_t": end_t,
+                        "endpoints": [
+                            list(axis_point(axes[axis_index], start_t)),
+                            list(axis_point(axes[axis_index], end_t)),
+                        ],
+                    }
+                )
+            contacts.append(item)
+
+        policy = topology.get("policy", {})
+        normalized = {
+            "format": INPUT_FORMAT,
+            "length_unit": "model_unit",
+            "policy": {
+                "precision": float(policy.get("precision", 1e-7)),
+                "minimum_edge": float(policy.get("minimum_edge", 1e-3)),
+                "junction_movement_limit": float(
+                    policy.get("junction_movement_limit", 0.05)
+                ),
+                "target_mesh_size": 0.75,
+            },
+            # Coverage is an explicit readiness contract.  Older preview
+            # reports that omit either flag are incomplete until proven
+            # otherwise; silently treating an omitted flag as complete lets a
+            # partial legacy model reach the solver adapter.
+            "source_coverage_complete": bool(
+                topology.get("all_surface_patches_built", False)
+                and axis_report.get("all_axes_built", False)
+            ),
+            "surfaces": surfaces,
+            "axes": axes,
+            "contacts": contacts,
+            "blockers": [],
+        }
+
+    # Keep the normalized object isolated from callers and make incomplete
+    # source coverage visible to the backend readiness gate for both input
+    # formats.  A diagnostic result is still useful, so this is a blocker
+    # rather than an input parsing error.
+    normalized = dict(normalized)
+    blockers = list(normalized.get("blockers", []))
+    if not bool(normalized.get("source_coverage_complete", False)):
+        if "incomplete_source_coverage" not in blockers:
+            blockers.append("incomplete_source_coverage")
+    normalized["blockers"] = blockers
+
+    policy = normalized["policy"]
+    if mesh_size_override is not None:
+        policy = dict(policy)
+        policy["target_mesh_size"] = mesh_size_override
+        normalized = dict(normalized)
+        normalized["policy"] = policy
+
+    for surface in normalized.get("surfaces", []):
+        rings = surface.get("rings", [])
+        source_rings = surface.get("ring_source_nodes")
+        if source_rings is None or len(rings) != len(source_rings):
+            raise ValueError("missing surface source-node provenance")
+        if any(len(ring) != len(nodes) for ring, nodes in zip(rings, source_rings)):
+            raise ValueError("surface source-node provenance length mismatch")
+
+    precision = float(policy["precision"])
+    minimum_edge = float(policy["minimum_edge"])
+    junction_movement_limit = float(
+        policy.get("junction_movement_limit", max(0.05, minimum_edge))
+    )
+    policy["junction_movement_limit"] = junction_movement_limit
+    target = float(policy["target_mesh_size"])
+    if (
+        not math.isfinite(precision)
+        or not math.isfinite(minimum_edge)
+        or not math.isfinite(target)
+        or precision <= 0
+        or minimum_edge <= precision
+        or not math.isfinite(junction_movement_limit)
+        or junction_movement_limit < minimum_edge
+        or target < minimum_edge
+    ):
+        raise ValueError("invalid backend policy")
+    return normalized
+
+
+def _ring_normal(points3d: list[list[float]]) -> tuple[float, float, float]:
+    """Return a translation-stable normal for a planar polygon ring."""
+    normal = [0.0, 0.0, 0.0]
+    origin = [float(value) for value in points3d[0]]
+    for first, second in zip(points3d, points3d[1:] + points3d[:1]):
+        a = [float(first[index]) - origin[index] for index in range(3)]
+        b = [float(second[index]) - origin[index] for index in range(3)]
+        normal[0] += a[1] * b[2] - a[2] * b[1]
+        normal[1] += a[2] * b[0] - a[0] * b[2]
+        normal[2] += a[0] * b[1] - a[1] * b[0]
+    length = math.sqrt(sum(value * value for value in normal))
+    if length <= 0.0:
+        raise ValueError("degenerate surface ring")
+    return tuple(value / length for value in normal)
+
+
+def _ring_orientation(points3d: list[list[float]], normal: tuple[float, float, float]) -> float:
+    total = [0.0, 0.0, 0.0]
+    origin = [float(value) for value in points3d[0]]
+    for first, second in zip(points3d, points3d[1:] + points3d[:1]):
+        a = [float(first[index]) - origin[index] for index in range(3)]
+        b = [float(second[index]) - origin[index] for index in range(3)]
+        total[0] += a[1] * b[2] - a[2] * b[1]
+        total[1] += a[2] * b[0] - a[0] * b[2]
+        total[2] += a[0] * b[1] - a[1] * b[0]
+    return sum(total[index] * normal[index] for index in range(3))
+
+
+def add_ring(points3d: list[list[float]]) -> int:
+    if len(points3d) < 3:
+        raise ValueError("surface ring has fewer than 3 points")
+    point_tags = [gmsh.model.occ.addPoint(*p) for p in points3d]
+    curves = [
+        gmsh.model.occ.addLine(point_tags[i], point_tags[(i + 1) % len(point_tags)])
+        for i in range(len(point_tags))
+    ]
+    return gmsh.model.occ.addWire(curves)
+
+
+def add_surface(surface: dict) -> int:
+    # OCC uses wire orientation when classifying the first wire and holes.
+    # FE contours do not guarantee a consistent winding, so relying on their
+    # input order silently turns holes into filled material (or vice versa).
+    # Normalize relative to the first ring.  ``addPlaneSurface`` classifies
+    # subsequent wires as holes, but in the OCC Python binding it expects all
+    # supplied wires to use the same winding.  FE contours often mix winding
+    # conventions, which otherwise turns a hole into filled material.
+    rings = [[list(point) for point in ring] for ring in surface["rings"]]
+    normal = _ring_normal(rings[0])
+    outer_sign = 1.0 if _ring_orientation(rings[0], normal) >= 0.0 else -1.0
+    oriented = []
+    for index, ring in enumerate(rings):
+        sign = _ring_orientation(ring, normal)
+        if sign * outer_sign < 0.0:
+            ring = list(reversed(ring))
+        oriented.append(ring)
+    wires = [add_ring(ring) for ring in oriented]
+    return gmsh.model.occ.addPlaneSurface(wires)
+
+
+def axis_point(axis: dict, t: float) -> tuple[float, float, float]:
+    a = axis["endpoints"][0]
+    b = axis["endpoints"][1]
+    return tuple(float(a[i]) + t * (float(b[i]) - float(a[i])) for i in range(3))
+
+
+def axis_length(axis: dict) -> float:
+    return distance(axis["endpoints"][0], axis["endpoints"][1])
+
+
+def unique_parameters(values: Iterable[float], length: float, precision: float) -> list[float]:
+    ordered = sorted(float(value) for value in values)
+    result = []
+    for value in ordered:
+        if not math.isfinite(value) or value < -precision / max(length, precision) or value > 1.0 + precision / max(length, precision):
+            raise ValueError("axis split parameter outside endpoints")
+        value = min(1.0, max(0.0, value))
+        if not result or abs(value - result[-1]) * length > precision:
+            result.append(value)
+    return result
+
+
+def build_axis_curve_inputs(
+    axes: list[dict],
+    contacts: list[dict],
+    precision: float,
+) -> tuple[list[tuple[int, int]], list[dict], list[str]]:
+    """Create property/contact-aware OCC curve pieces for all reconstructed axes."""
+
+    entities: list[tuple[int, int]] = []
+    curve_inputs: list[dict] = []
+    blockers: list[str] = []
+    contacts_by_axis: dict[int, list[dict]] = defaultdict(list)
+    for contact in contacts:
+        contacts_by_axis[int(contact["axis"])].append(contact)
+
+    for axis_index, axis in enumerate(axes):
+        length = axis_length(axis)
+        if not math.isfinite(length) or length <= precision:
+            blockers.append(f"degenerate_axis:{axis_index}")
+            continue
+
+        cuts = [0.0, 1.0]
+        for span in axis.get("property_spans", []):
+            cuts.extend((float(span["start_t"]), float(span["end_t"])))
+        for anchor in axis.get("anchors", []):
+            cuts.append(float(anchor["t"]))
+        for contact in contacts_by_axis.get(axis_index, []):
+            if contact["kind"] == "point":
+                cuts.append(float(contact["t"]))
+            elif contact["kind"] == "interval":
+                cuts.extend((float(contact["start_t"]), float(contact["end_t"])))
+
+        try:
+            cuts = unique_parameters(cuts, length, precision)
+        except ValueError:
+            blockers.append(f"invalid_axis_parameter:{axis_index}")
+            continue
+
+        point_tags = {
+            t: gmsh.model.occ.addPoint(*axis_point(axis, t))
+            for t in cuts
+        }
+        tolerance = precision / length
+        spans = axis.get("property_spans", [])
+        for start_t, end_t in zip(cuts, cuts[1:]):
+            if end_t - start_t <= tolerance:
+                continue
+            midpoint = 0.5 * (start_t + end_t)
+            active = [
+                span
+                for span in spans
+                if float(span["start_t"]) - tolerance <= midpoint <= float(span["end_t"]) + tolerance
+            ]
+            if not active:
+                blockers.append(
+                    f"axis_interval_without_property:axis={axis_index},start={start_t},end={end_t}"
+                )
+                continue
+            stiffnesses = {int(span["stiffness"]) for span in active}
+            if len(stiffnesses) != 1:
+                blockers.append(
+                    f"axis_interval_property_conflict:axis={axis_index},start={start_t},end={end_t}"
+                )
+                continue
+
+            tag = gmsh.model.occ.addLine(point_tags[start_t], point_tags[end_t])
+            source_elements = sorted(
+                {int(span["source_element"]) for span in active}
+            )
+            curve_inputs.append(
+                {
+                    "input_curve": len(curve_inputs),
+                    "axis": axis_index,
+                    "source_axis": int(axis["source_axis"]),
+                    "start_t": start_t,
+                    "end_t": end_t,
+                    "stiffness": next(iter(stiffnesses)),
+                    "source_elements": source_elements,
+                }
+            )
+            entities.append((1, tag))
+
+    return entities, curve_inputs, blockers
+
+
+def element_lines(curve_tag: int) -> list[tuple[int, int]]:
+    lines = []
+    types, _element_tags, node_tags = gmsh.model.mesh.getElements(1, curve_tag)
+    for element_type, nodes in zip(types, node_tags):
+        name, _dim, _order, nodes_per_element, _local, primary_nodes = (
+            gmsh.model.mesh.getElementProperties(element_type)
+        )
+        if not name.lower().startswith("line") or int(primary_nodes) < 2:
+            raise RuntimeError(
+                f"unsupported 1D element on curve {curve_tag}: {name}"
+            )
+        nodes_per_element = int(nodes_per_element)
+        for i in range(0, len(nodes), nodes_per_element):
+            lines.append(tuple(int(x) for x in nodes[i : i + 2]))
+    return lines
+
+
+def element_triangles(surface_tag: int) -> list[tuple[int, int, int]]:
+    triangles = []
+    types, _element_tags, node_tags = gmsh.model.mesh.getElements(2, surface_tag)
+    for element_type, nodes in zip(types, node_tags):
+        name, _dim, _order, nodes_per_element, _local, primary_nodes = (
+            gmsh.model.mesh.getElementProperties(element_type)
+        )
+        if not name.lower().startswith("triangle") or int(primary_nodes) < 3:
+            raise RuntimeError(
+                f"unsupported 2D element on surface {surface_tag}: {name}"
+            )
+        nodes_per_element = int(nodes_per_element)
+        for i in range(0, len(nodes), nodes_per_element):
+            triangles.append(tuple(int(x) for x in nodes[i : i + 3]))
+    return triangles
+
+
+def all_node_coordinates() -> dict[int, tuple[float, float, float]]:
+    tags, xyz, _ = gmsh.model.mesh.getNodes()
+    return {
+        int(tag): (float(xyz[i]), float(xyz[i + 1]), float(xyz[i + 2]))
+        for i, tag in zip(range(0, len(xyz), 3), tags)
+    }
+
+
+def quality(coords: dict[int, tuple[float, float, float]], triangles: list[dict]) -> dict:
+    minimum_angle = 180.0
+    maximum_area = 0.0
+    below_20 = 0
+    below_5 = 0
+    for triangle in triangles:
+        a, b, c = (coords[n] for n in triangle["nodes"])
+        area = triangle_area(a, b, c)
+        angles = triangle_angles(a, b, c)
+        local_min = min(angles)
+        minimum_angle = min(minimum_angle, local_min)
+        maximum_area = max(maximum_area, area)
+        below_20 += local_min < 20.0
+        below_5 += local_min < 5.0
+    return {
+        "triangle_count": len(triangles),
+        "minimum_triangle_angle_degrees": minimum_angle if triangles else None,
+        "maximum_triangle_area": maximum_area if triangles else None,
+        "triangles_below_20_degrees": below_20,
+        "triangles_below_5_degrees": below_5,
+    }
+
+
+class Dsu:
+    def __init__(self) -> None:
+        self.parent: dict[int, int] = {}
+
+    def find(self, x: int) -> int:
+        parent = self.parent.setdefault(x, x)
+        if parent != x:
+            self.parent[x] = self.find(parent)
+        return self.parent[x]
+
+    def union(self, a: int, b: int) -> None:
+        a = self.find(a)
+        b = self.find(b)
+        if a != b:
+            self.parent[max(a, b)] = min(a, b)
+
+
+def mesh_edges(triangles: list[dict]) -> set[tuple[int, int]]:
+    result = set()
+    for triangle in triangles:
+        a, b, c = triangle["nodes"]
+        result.update(
+            {
+                tuple(sorted((a, b))),
+                tuple(sorted((b, c))),
+                tuple(sorted((c, a))),
+            }
+        )
+    return result
+
+
+def node_source_owners(triangles: list[dict]) -> dict[int, set[int]]:
+    owners: dict[int, set[int]] = defaultdict(set)
+    for triangle in triangles:
+        for node in triangle["nodes"]:
+            owners[node].add(triangle["source_surface"])
+    return owners
+
+
+def _cross(a: Iterable[float], b: Iterable[float]) -> tuple[float, float, float]:
+    a = tuple(a)
+    b = tuple(b)
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _dot(a: Iterable[float], b: Iterable[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _sub(a: Iterable[float], b: Iterable[float]) -> tuple[float, float, float]:
+    return tuple(x - y for x, y in zip(a, b))
+
+
+def _project_triangle(points: list[tuple[float, float, float]], drop: int) -> list[tuple[float, float]]:
+    axes = [index for index in range(3) if index != drop]
+    return [(point[axes[0]], point[axes[1]]) for point in points]
+
+
+def _polygon_area_2d(points: list[tuple[float, float]]) -> float:
+    if not points:
+        return 0.0
+    origin = points[0]
+    shifted = [(point[0] - origin[0], point[1] - origin[1]) for point in points]
+    return 0.5 * abs(sum(
+        shifted[index][0] * shifted[(index + 1) % len(shifted)][1]
+        - shifted[(index + 1) % len(shifted)][0] * shifted[index][1]
+        for index in range(len(shifted))
+    ))
+
+
+def _clip_polygon_2d(
+    subject: list[tuple[float, float]],
+    start: tuple[float, float],
+    end: tuple[float, float],
+    orientation: float,
+    tolerance: float,
+) -> list[tuple[float, float]]:
+    if not subject:
+        return []
+
+    def signed(point: tuple[float, float]) -> float:
+        return orientation * (
+            (end[0] - start[0]) * (point[1] - start[1])
+            - (end[1] - start[1]) * (point[0] - start[0])
+        )
+
+    result = []
+    previous = subject[-1]
+    previous_inside = signed(previous) >= -tolerance
+    for current in subject:
+        current_inside = signed(current) >= -tolerance
+        if current_inside != previous_inside:
+            previous_value = signed(previous)
+            current_value = signed(current)
+            denominator = previous_value - current_value
+            fraction = previous_value / denominator if abs(denominator) > 0.0 else 0.0
+            result.append(
+                (
+                    previous[0] + fraction * (current[0] - previous[0]),
+                    previous[1] + fraction * (current[1] - previous[1]),
+                )
+            )
+        if current_inside:
+            result.append(current)
+        previous = current
+        previous_inside = current_inside
+    return result
+
+
+def _coplanar_triangle_overlap(
+    left: list[tuple[float, float, float]],
+    right: list[tuple[float, float, float]],
+    tolerance: float,
+) -> bool:
+    normal = _cross(_sub(left[1], left[0]), _sub(left[2], left[0]))
+    magnitude = math.sqrt(_dot(normal, normal))
+    if magnitude <= tolerance * tolerance:
+        return False
+    other_normal = _cross(_sub(right[1], right[0]), _sub(right[2], right[0]))
+    other_magnitude = math.sqrt(_dot(other_normal, other_normal))
+    if other_magnitude <= tolerance * tolerance:
+        return False
+    angular_tolerance = 1e-8
+    if math.sqrt(_dot(_cross(normal, other_normal), _cross(normal, other_normal))) > (
+        angular_tolerance * magnitude * other_magnitude
+    ):
+        return False
+    unit_normal = tuple(component / magnitude for component in normal)
+    if abs(_dot(unit_normal, _sub(right[0], left[0]))) > tolerance:
+        return False
+
+    drop = max(range(3), key=lambda index: abs(normal[index]))
+    left_2d = _project_triangle(left, drop)
+    right_2d = _project_triangle(right, drop)
+    orientation = (
+        (left_2d[1][0] - left_2d[0][0]) * (left_2d[2][1] - left_2d[0][1])
+        - (left_2d[1][1] - left_2d[0][1]) * (left_2d[2][0] - left_2d[0][0])
+    )
+    if abs(orientation) <= tolerance * tolerance:
+        return False
+    clipped = right_2d
+    for index in range(3):
+        clipped = _clip_polygon_2d(
+            clipped,
+            left_2d[index],
+            left_2d[(index + 1) % 3],
+            1.0 if orientation > 0.0 else -1.0,
+            tolerance,
+        )
+    return _polygon_area_2d(clipped) > tolerance * tolerance
+
+
+def _repair_candidate_valid(
+    before_coords: dict[int, tuple[float, float, float]],
+    before_triangles: list[dict],
+    candidate_coords: dict[int, tuple[float, float, float]],
+    candidate_triangles: list[dict],
+    changed_nodes: set[int],
+    precision: float,
+) -> tuple[bool, str]:
+    """Validate one local repair transaction before committing its mapping.
+
+    The orientation check compares every affected surviving face with its
+    pre-operation normal.  A small AABB neighborhood supplies nearby faces for
+    duplicate-edge and coplanar-overlap checks; this avoids a quadratic
+    all-mesh comparison for every candidate while still catching the local
+    inversion from the review regression.
+    """
+    before_by_key = {
+        (tuple(item["nodes"]), index): item for index, item in enumerate(before_triangles)
+    }
+    before_by_nodes = defaultdict(list)
+    for index, item in enumerate(before_triangles):
+        before_by_nodes[tuple(item["nodes"])].append(index)
+    affected = [
+        index for index, item in enumerate(before_triangles)
+        if set(item["nodes"]) & changed_nodes
+    ]
+    if not affected:
+        return True, "unchanged"
+
+    remapped = []
+    for index, item in enumerate(candidate_triangles):
+        if len(set(item["nodes"])) < 3:
+            continue
+        remapped.append((index, item))
+    # Preserve the source surface's local manifold and reject duplicate faces.
+    local_faces: dict[tuple[int, tuple[int, ...]], int] = {}
+    local_edges: dict[tuple[int, tuple[int, int]], int] = defaultdict(int)
+    affected_candidate = []
+    for index, item in remapped:
+        nodes = tuple(item["nodes"])
+        key = (int(item["source_surface"]), tuple(sorted(nodes)))
+        if key in local_faces:
+            return False, "duplicate_surviving_face"
+        local_faces[key] = index
+        edges = (
+            tuple(sorted((nodes[0], nodes[1]))),
+            tuple(sorted((nodes[1], nodes[2]))),
+            tuple(sorted((nodes[2], nodes[0]))),
+        )
+        for edge in edges:
+            edge_key = (int(item["source_surface"]), edge)
+            local_edges[edge_key] += 1
+            if local_edges[edge_key] > 2:
+                return False, "non_manifold_local_edge"
+        if index < len(before_triangles) and set(before_triangles[index]["nodes"]) & changed_nodes:
+            affected_candidate.append((index, item))
+
+    # Compare the candidate normal with the current normal, so multiple safe
+    # transactions can be applied without relying on a global winding rule.
+    for index, item in affected_candidate:
+        old = before_triangles[index]
+        old_points = [before_coords[node] for node in old["nodes"]]
+        new_points = [candidate_coords[node] for node in item["nodes"]]
+        old_normal = _cross(_sub(old_points[1], old_points[0]), _sub(old_points[2], old_points[0]))
+        new_normal = _cross(_sub(new_points[1], new_points[0]), _sub(new_points[2], new_points[0]))
+        old_size = math.sqrt(_dot(old_normal, old_normal))
+        new_size = math.sqrt(_dot(new_normal, new_normal))
+        if old_size <= precision * precision or new_size <= precision * precision:
+            return False, "degenerate_surviving_face"
+        if _dot(old_normal, new_normal) <= 0.0:
+            return False, "inverted_surviving_face"
+
+    # Build a local AABB neighborhood around changed faces.  This is O(N) to
+    # gather candidates and O(k^2) only for the small local neighborhood.
+    candidate_faces = [item for _index, item in remapped]
+    changed_faces = [item for _index, item in affected_candidate]
+    if not changed_faces:
+        return True, "unchanged"
+    boxes = []
+    for item in changed_faces:
+        points = [candidate_coords[node] for node in item["nodes"]]
+        boxes.append((
+            tuple(min(point[axis] for point in points) - precision for axis in range(3)),
+            tuple(max(point[axis] for point in points) + precision for axis in range(3)),
+        ))
+    neighborhood = []
+    for item in candidate_faces:
+        points = [candidate_coords[node] for node in item["nodes"]]
+        low = tuple(min(point[axis] for point in points) for axis in range(3))
+        high = tuple(max(point[axis] for point in points) for axis in range(3))
+        if any(all(low[axis] <= box_high[axis] and high[axis] >= box_low[axis] for axis in range(3)) for box_low, box_high in boxes):
+            neighborhood.append(item)
+    for left_index, left in enumerate(changed_faces):
+        left_points = [candidate_coords[node] for node in left["nodes"]]
+        for right in neighborhood:
+            if left is right or left["nodes"] == right["nodes"]:
+                continue
+            if int(left["source_surface"]) != int(right["source_surface"]):
+                continue
+            right_points = [candidate_coords[node] for node in right["nodes"]]
+            if _coplanar_triangle_overlap(left_points, right_points, precision):
+                return False, "positive_local_overlap"
+    return True, "valid"
+
+
+def heal_micro_edges(
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    minimum_edge: float,
+    precision: float,
+) -> tuple[list[dict], dict[int, int], dict]:
+    """Collapse only proven junction-local sub-resolution edge components.
+
+    A component is eligible only when it contains an already shared node owned
+    by at least two reconstructed source surfaces. That node remains fixed.
+    This deliberately refuses general proximity welding.
+    """
+
+    edges = mesh_edges(triangles)
+    short_edges = [
+        edge
+        for edge in edges
+        if precision < distance(coords[edge[0]], coords[edge[1]]) < minimum_edge
+    ]
+    dsu = Dsu()
+    for a, b in short_edges:
+        dsu.union(a, b)
+
+    components: dict[int, set[int]] = defaultdict(set)
+    for a, b in short_edges:
+        components[dsu.find(a)].update((a, b))
+
+    owners = node_source_owners(triangles)
+    mapping: dict[int, int] = {}
+    diagnostics = []
+    maximum_movement = 0.0
+    unresolved = 0
+
+    for nodes in sorted(components.values(), key=lambda x: (min(x), len(x))):
+        candidates = [
+            node for node in nodes if len(owners.get(node, set())) >= 2
+        ]
+        if not candidates:
+            diagnostics.append(
+                {
+                    "nodes": sorted(nodes),
+                    "status": "unresolved_no_shared_junction_node",
+                }
+            )
+            unresolved += 1
+            continue
+        maximum_owner_count = max(len(owners[node]) for node in candidates)
+        representatives = sorted(
+            node for node in candidates if len(owners[node]) == maximum_owner_count
+        )
+        # Two distinct already-shared junction nodes are structural evidence,
+        # not numerical noise. Never choose between them by an arbitrary tag.
+        if len(representatives) != 1:
+            diagnostics.append(
+                {
+                    "nodes": sorted(nodes),
+                    "candidate_representatives": representatives,
+                    "status": "unresolved_multiple_shared_junction_nodes",
+                }
+            )
+            unresolved += 1
+            continue
+
+        representative = representatives[0]
+        movements = {node: distance(coords[node], coords[representative]) for node in nodes}
+        component_max = max(movements.values(), default=0.0)
+        # A transitive chain of individually short edges can span much farther
+        # than the engineering minimum-edge threshold. Refuse such a collapse.
+        if component_max >= minimum_edge:
+            diagnostics.append(
+                {
+                    "nodes": sorted(nodes),
+                    "representative": representative,
+                    "status": "unresolved_component_extent",
+                    "maximum_movement": component_max,
+                }
+            )
+            unresolved += 1
+            continue
+
+        moves = []
+        for node in nodes:
+            if node != representative:
+                mapping[node] = representative
+                moves.append(
+                    {
+                        "from": node,
+                        "to": representative,
+                        "from_coordinate": coords[node],
+                        "to_coordinate": coords[representative],
+                        "movement": movements[node],
+                        "movement_limit": minimum_edge,
+                        "movement_kind": "micro_edge_healing",
+                    }
+                )
+        # Apply one component transactionally.  A collapse that inverts,
+        # degenerates or overlaps a surviving local face is rejected while
+        # later independent components remain eligible.
+        tentative_mapping = dict(mapping)
+        tentative_mapping.update({node: representative for node in nodes if node != representative})
+        tentative_triangles = [
+            {**triangle, "nodes": tuple(tentative_mapping.get(node, node) for node in triangle["nodes"])}
+            for triangle in triangles
+        ]
+        valid, reason = _repair_candidate_valid(
+            {node: coords[node] for node in coords},
+            [
+                {**triangle, "nodes": tuple(mapping.get(node, node) for node in triangle["nodes"])}
+                for triangle in triangles
+            ],
+            coords,
+            tentative_triangles,
+            {node for node in nodes if node != representative},
+            precision,
+        )
+        if not valid:
+            diagnostics.append({
+                "nodes": sorted(nodes),
+                "representative": representative,
+                "status": "rejected_local_validity",
+                "reason": reason,
+                "maximum_movement": component_max,
+            })
+            unresolved += 1
+            continue
+        mapping = tentative_mapping
+        maximum_movement = max(maximum_movement, component_max)
+        diagnostics.append(
+            {
+                "nodes": sorted(nodes),
+                "representative": representative,
+                "representative_source_owner_count": len(owners[representative]),
+                "status": "collapsed",
+                "maximum_movement": component_max,
+                "moves": moves,
+            }
+        )
+
+    healed = []
+    removed_degenerate = 0
+    near_degenerate = 0
+    for triangle in triangles:
+        nodes = tuple(mapping.get(node, node) for node in triangle["nodes"])
+        if len(set(nodes)) < 3:
+            removed_degenerate += 1
+            continue
+        if triangle_area(*(coords[node] for node in nodes)) <= precision * precision:
+            near_degenerate += 1
+            # Do not silently discard a non-topologically-degenerate triangle.
+            healed.append({**triangle, "nodes": nodes})
+            continue
+        healed.append({**triangle, "nodes": nodes})
+
+    return healed, mapping, {
+        "minimum_edge": minimum_edge,
+        "short_edge_count_before": len(short_edges),
+        "component_count": len(components),
+        "collapsed_component_count": sum(x["status"] == "collapsed" for x in diagnostics),
+        "unresolved_component_count": unresolved,
+        "merged_node_count": len(mapping),
+        "maximum_node_movement": maximum_movement,
+        "removed_degenerate_triangles": removed_degenerate,
+        "near_degenerate_triangles_after": near_degenerate,
+        "components": diagnostics,
+    }
+
+
+
+def _source_vertex_context(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    tolerance: float,
+) -> tuple[
+    dict[int, list[tuple[int, int]]],
+    dict[int, set[tuple[int, int]]],
+]:
+    """Map mesh nodes to explicit source vertices without proximity welding."""
+    buckets: dict[tuple[int, int, int], list[tuple[int, int, tuple[float, float, float]]]] = defaultdict(list)
+    cell = max(tolerance, 1e-12)
+
+    def key(point: Iterable[float]) -> tuple[int, int, int]:
+        return tuple(math.floor(float(value) / cell) for value in point)
+
+    boundary_edges: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    for surface_index, surface in enumerate(data.get("surfaces", [])):
+        for ring, source_nodes in zip(
+            surface.get("rings", []), surface.get("ring_source_nodes", [])
+        ):
+            for point, source_node in zip(ring, source_nodes):
+                xyz = tuple(float(x) for x in point)
+                buckets[key(xyz)].append((surface_index, int(source_node), xyz))
+            for index, source_node in enumerate(source_nodes):
+                other = source_nodes[(index + 1) % len(source_nodes)]
+                if int(source_node) != int(other):
+                    boundary_edges[surface_index].add(
+                        tuple(sorted((int(source_node), int(other))))
+                    )
+
+    memberships: dict[int, list[tuple[int, int]]] = {}
+    for node, point in coords.items():
+        base = key(point)
+        found = set()
+        for offset in product((-1, 0, 1), repeat=3):
+            candidate_key = tuple(base[i] + offset[i] for i in range(3))
+            for surface, source_node, source_point in buckets.get(candidate_key, []):
+                if distance(point, source_point) <= tolerance:
+                    found.add((surface, source_node))
+        if found:
+            memberships[node] = sorted(found)
+    return memberships, boundary_edges
+
+
+def regularize_near_vertex_junctions(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    movement_limit: float,
+    minimum_edge: float,
+    precision: float,
+    angle_limit_degrees: float = 5.0,
+) -> tuple[
+    dict[int, tuple[float, float, float]],
+    list[dict],
+    list[dict],
+    dict,
+]:
+    """Collapse only sliver-producing near-vertex junction edges.
+
+    This is deliberately narrower than a distance weld:
+    - the edge must be the shortest edge of a triangle below angle_limit;
+    - its length must be below the engineering junction movement limit;
+    - at least one endpoint must be an explicit reconstructed source vertex;
+    - an original source boundary edge is never collapsed;
+    - a generated junction is preferred over moving it off the exact
+      intersection; two weak source vertices on an artificial shared
+      intersection segment may collapse to their midpoint.
+    """
+
+    source_tolerance = precision * 10.0
+    source_memberships, source_boundary_edges = _source_vertex_context(
+        data, coords, source_tolerance
+    )
+    node_owners = node_source_owners(triangles)
+    edge_owners: dict[tuple[int, int], set[int]] = defaultdict(set)
+    bad_shortest_edges = set()
+
+    for triangle in triangles:
+        nodes = triangle["nodes"]
+        points = [coords[node] for node in nodes]
+        angles = triangle_angles(*points)
+        if min(angles) >= angle_limit_degrees:
+            continue
+        local_edges = [
+            tuple(sorted((nodes[0], nodes[1]))),
+            tuple(sorted((nodes[1], nodes[2]))),
+            tuple(sorted((nodes[2], nodes[0]))),
+        ]
+        lengths = [
+            distance(points[0], points[1]),
+            distance(points[1], points[2]),
+            distance(points[2], points[0]),
+        ]
+        bad_shortest_edges.add(local_edges[min(range(3), key=lengths.__getitem__)])
+
+    for triangle in triangles:
+        nodes = triangle["nodes"]
+        surface = int(triangle["source_surface"])
+        for edge in (
+            tuple(sorted((nodes[0], nodes[1]))),
+            tuple(sorted((nodes[1], nodes[2]))),
+            tuple(sorted((nodes[2], nodes[0]))),
+        ):
+            edge_owners[edge].add(surface)
+
+    def anchor_strength(memberships: list[tuple[int, int]]) -> int:
+        counts = Counter(source_node for _surface, source_node in memberships)
+        return max(counts.values(), default=0)
+
+    def is_original_boundary_edge(a: int, b: int) -> bool:
+        left = source_memberships.get(a, [])
+        right = source_memberships.get(b, [])
+        for surface_a, source_a in left:
+            for surface_b, source_b in right:
+                if surface_a != surface_b:
+                    continue
+                if tuple(sorted((source_a, source_b))) in source_boundary_edges.get(
+                    surface_a, set()
+                ):
+                    return True
+        return False
+
+    candidates = []
+    for edge in sorted(bad_shortest_edges):
+        a, b = edge
+        length = distance(coords[a], coords[b])
+        if length < minimum_edge or length >= movement_limit:
+            continue
+        source_a = source_memberships.get(a, [])
+        source_b = source_memberships.get(b, [])
+        if not source_a and not source_b:
+            continue
+        if is_original_boundary_edge(a, b):
+            continue
+        owners_a = node_owners.get(a, set())
+        owners_b = node_owners.get(b, set())
+        owners_edge = edge_owners.get(edge, set())
+        if (
+            len(owners_edge) < 2
+            and len(owners_a) < 2
+            and len(owners_b) < 2
+        ):
+            continue
+        candidates.append(
+            {
+                "edge": edge,
+                "length": length,
+                "source_a": source_a,
+                "source_b": source_b,
+                "owners_a": owners_a,
+                "owners_b": owners_b,
+                "owners_edge": owners_edge,
+            }
+        )
+
+    result_coords = dict(coords)
+    next_node = max(result_coords, default=0) + 1
+    mapping: dict[int, int] = {}
+    used_nodes = set()
+    accepted = []
+    skipped = []
+    midpoint_count = 0
+    maximum_movement = 0.0
+
+    for candidate in sorted(candidates, key=lambda item: (item["length"], item["edge"])):
+        a, b = candidate["edge"]
+        if a in used_nodes or b in used_nodes:
+            skipped.append({**candidate, "status": "overlapping_candidate"})
+            continue
+
+        prior_mapping = dict(mapping)
+        prior_coords = dict(result_coords)
+
+        source_a = candidate["source_a"]
+        source_b = candidate["source_b"]
+        moves = []
+        representative = None
+        status = None
+
+        if bool(source_a) ^ bool(source_b):
+            source_node = a if source_a else b
+            junction_node = b if source_a else a
+            source_context = source_a if source_a else source_b
+            source_owners = candidate["owners_a"] if source_a else candidate["owners_b"]
+            junction_owners = candidate["owners_b"] if source_a else candidate["owners_a"]
+            strength = anchor_strength(source_context)
+
+            if len(junction_owners) < 2:
+                skipped.append({**candidate, "status": "no_multi_surface_junction"})
+                continue
+
+            # A weak source vertex moves to the exact OCC junction. A source
+            # vertex already shared by several reconstructed surfaces remains
+            # fixed unless it is itself valid on every junction owner.
+            if strength >= 2:
+                if junction_owners.issubset(source_owners):
+                    representative = source_node
+                    moving = junction_node
+                    status = "junction_to_strong_source_vertex"
+                else:
+                    skipped.append({**candidate, "status": "strong_source_anchor"})
+                    continue
+            else:
+                representative = junction_node
+                moving = source_node
+                status = "source_vertex_to_exact_junction"
+
+            movement = distance(result_coords[moving], result_coords[representative])
+            if movement >= movement_limit:
+                skipped.append({**candidate, "status": "movement_limit"})
+                continue
+            mapping[moving] = representative
+            moves.append(
+                {
+                    "from": moving,
+                    "to": representative,
+                    "from_coordinate": result_coords[moving],
+                    "to_coordinate": result_coords[representative],
+                    "movement": movement,
+                    "movement_limit": movement_limit,
+                    "movement_kind": "near_vertex_junction_regularization",
+                }
+            )
+        elif source_a and source_b:
+            if len(candidate["owners_edge"]) < 2:
+                skipped.append({**candidate, "status": "two_source_vertices_not_shared_edge"})
+                continue
+            strength_a = anchor_strength(source_a)
+            strength_b = anchor_strength(source_b)
+
+            if strength_a >= 2 or strength_b >= 2:
+                if strength_a == strength_b:
+                    skipped.append({**candidate, "status": "two_strong_source_anchors"})
+                    continue
+                representative = a if strength_a > strength_b else b
+                moving = b if representative == a else a
+                movement = distance(result_coords[moving], result_coords[representative])
+                mapping[moving] = representative
+                moves.append(
+                    {
+                        "from": moving,
+                        "to": representative,
+                        "from_coordinate": result_coords[moving],
+                        "to_coordinate": result_coords[representative],
+                        "movement": movement,
+                        "movement_limit": movement_limit,
+                        "movement_kind": "near_vertex_junction_regularization",
+                    }
+                )
+                status = "weak_source_vertex_to_strong_source_vertex"
+            else:
+                # Both weak source vertices lie on the exact shared OCC edge.
+                # Midpoint minimizes the maximum displacement and stays on the
+                # same intersection line/planes.
+                midpoint = tuple(
+                    0.5 * (result_coords[a][i] + result_coords[b][i])
+                    for i in range(3)
+                )
+                representative = next_node
+                next_node += 1
+                result_coords[representative] = midpoint
+                midpoint_count += 1
+                for moving in (a, b):
+                    movement = distance(result_coords[moving], midpoint)
+                    mapping[moving] = representative
+                    moves.append(
+                        {
+                            "from": moving,
+                            "to": representative,
+                            "from_coordinate": result_coords[moving],
+                            "to_coordinate": midpoint,
+                            "movement": movement,
+                            "movement_limit": movement_limit,
+                            "movement_kind": "near_vertex_junction_regularization",
+                        }
+                    )
+                status = "two_weak_source_vertices_to_shared_midpoint"
+        else:
+            continue
+
+        candidate_triangles = [
+            {**triangle, "nodes": tuple(mapping.get(node, node) for node in triangle["nodes"])}
+            for triangle in triangles
+        ]
+        before_triangles = [
+            {**triangle, "nodes": tuple(prior_mapping.get(node, node) for node in triangle["nodes"])}
+            for triangle in triangles
+        ]
+        valid, reason = _repair_candidate_valid(
+            prior_coords,
+            before_triangles,
+            result_coords,
+            candidate_triangles,
+            {int(move["from"]) for move in moves},
+            precision,
+        )
+        if not valid:
+            mapping = prior_mapping
+            result_coords = prior_coords
+            skipped.append({**candidate, "status": "rejected_local_validity", "reason": reason})
+            continue
+
+        used_nodes.update((a, b))
+        component_max = max((move["movement"] for move in moves), default=0.0)
+        maximum_movement = max(maximum_movement, component_max)
+        accepted.append(
+            {
+                "edge": [a, b],
+                "edge_length": candidate["length"],
+                "representative": representative,
+                "status": status,
+                "maximum_movement": component_max,
+                "moves": moves,
+            }
+        )
+
+    def remap_entities(items: list[dict], dimension: int) -> tuple[list[dict], int]:
+        result = []
+        removed = 0
+        for item in items:
+            nodes = tuple(mapping.get(node, node) for node in item["nodes"])
+            if len(set(nodes)) < dimension + 1:
+                removed += 1
+                continue
+            result.append({**item, "nodes": nodes})
+        return result, removed
+
+    regularized_triangles, removed_triangles = remap_entities(triangles, 2)
+    regularized_bars, removed_bars = remap_entities(bars, 1)
+
+    def diagnostic_json(item: dict) -> dict:
+        result = dict(item)
+        for key in ("owners_a", "owners_b", "owners_edge"):
+            if key in result:
+                result[key] = sorted(result[key])
+        if "edge" in result:
+            result["edge"] = list(result["edge"])
+        return result
+
+    return result_coords, regularized_triangles, regularized_bars, {
+        "angle_limit_degrees": angle_limit_degrees,
+        "movement_limit": movement_limit,
+        "candidate_count": len(candidates),
+        "accepted_count": len(accepted),
+        "midpoint_count": midpoint_count,
+        "moved_node_count": len(mapping),
+        "maximum_node_movement": maximum_movement,
+        "removed_degenerate_triangles": removed_triangles,
+        "removed_degenerate_bars": removed_bars,
+        "accepted": accepted,
+        "skipped": [diagnostic_json(item) for item in skipped],
+    }
+
+
+def split_unintended_shared_nodes(
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    semantic_audit: dict,
+) -> tuple[
+    dict[int, tuple[float, float, float]],
+    list[dict],
+    list[dict],
+    dict,
+]:
+    """Duplicate coincident mesh-node IDs when semantics do not justify sharing.
+
+    Coordinates are unchanged. Each connected semantic owner component keeps a
+    common node ID, but disconnected components receive duplicate IDs.
+    """
+    result_coords = dict(coords)
+    next_node = max(result_coords, default=0) + 1
+    surface_mapping: dict[tuple[int, int], int] = {}
+    axis_mapping: dict[tuple[int, int], int] = {}
+    details = []
+
+    for issue in semantic_audit.get("unintended_shared_nodes", []):
+        node = int(issue["node"])
+        components = [
+            [tuple(owner) for owner in component]
+            for component in issue["components"]
+        ]
+        if len(components) <= 1:
+            continue
+
+        component_nodes = [node]
+        for _component in components[1:]:
+            clone = next_node
+            next_node += 1
+            result_coords[clone] = result_coords[node]
+            component_nodes.append(clone)
+
+        for component, assigned_node in zip(components, component_nodes):
+            for kind, owner in component:
+                if kind == "surface":
+                    surface_mapping[(node, int(owner))] = assigned_node
+                elif kind == "axis":
+                    axis_mapping[(node, int(owner))] = assigned_node
+                else:
+                    raise RuntimeError(f"unknown semantic owner kind: {kind}")
+
+        details.append(
+            {
+                "original_node": node,
+                "coordinate": result_coords[node],
+                "component_count": len(components),
+                "component_nodes": component_nodes,
+                "components": components,
+            }
+        )
+
+    split_triangles = []
+    for triangle in triangles:
+        surface = int(triangle["source_surface"])
+        nodes = tuple(
+            surface_mapping.get((node, surface), node)
+            for node in triangle["nodes"]
+        )
+        split_triangles.append({**triangle, "nodes": nodes})
+
+    split_bars = []
+    for bar in bars:
+        axis = int(bar["axis"])
+        nodes = tuple(axis_mapping.get((node, axis), node) for node in bar["nodes"])
+        split_bars.append({**bar, "nodes": nodes})
+
+    return result_coords, split_triangles, split_bars, {
+        "split_shared_node_count": len(details),
+        "created_duplicate_node_count": sum(
+            detail["component_count"] - 1 for detail in details
+        ),
+        "details": details,
+    }
+
+
+def shared_mesh_edges_by_source(triangles: list[dict]) -> dict[tuple[int, int], int]:
+    edge_owners: dict[tuple[int, int], set[int]] = defaultdict(set)
+    for triangle in triangles:
+        a, b, c = triangle["nodes"]
+        for edge in (
+            tuple(sorted((a, b))),
+            tuple(sorted((b, c))),
+            tuple(sorted((c, a))),
+        ):
+            edge_owners[edge].add(triangle["source_surface"])
+
+    result: dict[tuple[int, int], int] = defaultdict(int)
+    for owners in edge_owners.values():
+        owners = sorted(owners)
+        for i in range(len(owners)):
+            for j in range(i + 1, len(owners)):
+                result[(owners[i], owners[j])] += 1
+    return dict(result)
+
+
+def surface_edges_by_source(triangles: list[dict]) -> dict[int, set[tuple[int, int]]]:
+    result: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    for triangle in triangles:
+        a, b, c = triangle["nodes"]
+        result[triangle["source_surface"]].update(
+            {
+                tuple(sorted((a, b))),
+                tuple(sorted((b, c))),
+                tuple(sorted((c, a))),
+            }
+        )
+    return result
+
+
+def surface_nodes_by_source(triangles: list[dict]) -> dict[int, set[int]]:
+    result: dict[int, set[int]] = defaultdict(set)
+    for triangle in triangles:
+        result[triangle["source_surface"]].update(triangle["nodes"])
+    return result
+
+
+def axis_parameter(point: Iterable[float], axis: dict) -> tuple[float, float]:
+    a = tuple(float(x) for x in axis["endpoints"][0])
+    b = tuple(float(x) for x in axis["endpoints"][1])
+    p = tuple(float(x) for x in point)
+    d = tuple(b[i] - a[i] for i in range(3))
+    length2 = sum(x * x for x in d)
+    if length2 == 0:
+        return 0.0, float("inf")
+    t = sum((p[i] - a[i]) * d[i] for i in range(3)) / length2
+    q = tuple(a[i] + t * d[i] for i in range(3))
+    return t, distance(p, q)
+
+
+def audit_contacts(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    precision: float,
+) -> dict:
+    """Verify that declared reconstructed bar/surface contacts became mesh identity."""
+
+    surface_edges = surface_edges_by_source(triangles)
+    surface_nodes = surface_nodes_by_source(triangles)
+    axis_nodes: dict[int, set[int]] = defaultdict(set)
+    bars_by_axis: dict[int, list[dict]] = defaultdict(list)
+    for bar in bars:
+        axis_nodes[bar["axis"]].update(bar["nodes"])
+        bars_by_axis[int(bar["axis"])].append(bar)
+
+    details = []
+    failed = 0
+    tolerance = precision * 10.0
+    for index, contact in enumerate(data.get("contacts", [])):
+        axis_index = int(contact["axis"])
+        surface = int(contact["surface"])
+        axis = data["axes"][axis_index]
+
+        if contact["kind"] == "point":
+            expected = tuple(float(x) for x in contact["point"])
+            shared = axis_nodes.get(axis_index, set()) & surface_nodes.get(surface, set())
+            nearest = min(
+                (distance(coords[node], expected), node) for node in shared
+            ) if shared else None
+            conforming = nearest is not None and nearest[0] <= tolerance
+            if not conforming:
+                failed += 1
+            details.append(
+                {
+                    "contact": index,
+                    "kind": "point",
+                    "axis": axis_index,
+                    "surface": surface,
+                    "mesh_conforming": conforming,
+                    "topologically_shared": nearest is not None,
+                    "shared_node": nearest[1] if nearest else None,
+                    "distance": nearest[0] if nearest else None,
+                }
+            )
+            continue
+
+        start_t = float(contact["start_t"])
+        end_t = float(contact["end_t"])
+        expected_length = axis_length(axis) * (end_t - start_t)
+        axis_tol = tolerance / max(axis_length(axis), tolerance)
+        total = 0.0
+        shared_total = 0.0
+        for bar in bars_by_axis.get(axis_index, []):
+            p0 = coords[bar["nodes"][0]]
+            p1 = coords[bar["nodes"][1]]
+            midpoint = tuple((p0[i] + p1[i]) * 0.5 for i in range(3))
+            t, residual = axis_parameter(midpoint, axis)
+            if residual > tolerance:
+                continue
+            if start_t - axis_tol <= t <= end_t + axis_tol:
+                length = distance(p0, p1)
+                total += length
+                if tuple(sorted(bar["nodes"])) in surface_edges.get(surface, set()):
+                    shared_total += length
+
+        length_tolerance = max(tolerance, expected_length * 1e-10)
+        conforming = (
+            abs(total - expected_length) <= length_tolerance
+            and abs(shared_total - expected_length) <= length_tolerance
+        )
+        if not conforming:
+            failed += 1
+        details.append(
+            {
+                "contact": index,
+                "kind": "interval",
+                "axis": axis_index,
+                "surface": surface,
+                "mesh_conforming": conforming,
+                "expected_length": expected_length,
+                "bar_length": total,
+                "shared_mesh_edge_length": shared_total,
+            }
+        )
+
+    return {
+        "contact_count": len(details),
+        "conforming_contact_count": len(details) - failed,
+        "failed_contact_count": failed,
+        "details": details,
+    }
+
+
+def summarize_contact_audit(report: dict) -> dict:
+    return {
+        "contact_count": report["contact_count"],
+        "conforming_contact_count": report["conforming_contact_count"],
+        "failed_contact_count": report["failed_contact_count"],
+    }
+
+
+def reconcile_moved_contact_audit(
+    data: dict,
+    raw: dict,
+    strict_after_repairs: dict,
+    movement_reports: list[dict],
+    precision: float,
+) -> dict:
+    """Accept a moved point contact only through explicit logged provenance.
+
+    The contact must have been strictly conforming before geometric repair,
+    remain topologically shared afterwards, and the exact logged node move
+    must link the original expected point to the current representative.
+    No global tolerance is relaxed.
+    """
+    tolerance = precision * 10.0
+    moves = []
+    for report in movement_reports:
+        for component in report.get("components", report.get("accepted", [])):
+            if component.get("status") == "collapsed" or "moves" in component:
+                moves.extend(component.get("moves", []))
+    result = []
+    failed = 0
+    accepted_by_repair_provenance = 0
+    if len(raw["details"]) != len(strict_after_repairs["details"]):
+        raise RuntimeError("contact audit length changed across geometry repairs")
+
+    for raw_item, repaired_item in zip(raw["details"], strict_after_repairs["details"]):
+        item = dict(repaired_item)
+        if repaired_item["mesh_conforming"]:
+            item["conformity"] = "strict"
+            result.append(item)
+            continue
+
+        accepted = False
+        if (
+            repaired_item["kind"] == "point"
+            and raw_item["mesh_conforming"]
+            and repaired_item.get("topologically_shared")
+            and repaired_item.get("shared_node") is not None
+        ):
+            contact = data["contacts"][repaired_item["contact"]]
+            expected = tuple(float(x) for x in contact["point"])
+            for move in moves:
+                if int(move["to"]) != int(repaired_item["shared_node"]):
+                    continue
+                if distance(move["from_coordinate"], expected) > tolerance:
+                    continue
+                movement = float(move["movement"])
+                movement_limit = float(move.get("movement_limit", 0.0))
+                if movement_limit <= 0.0 or movement >= movement_limit:
+                    continue
+                accepted = True
+                item["mesh_conforming"] = True
+                item["conformity"] = move.get("movement_kind", "moved_shared_node")
+                item["repair_movement"] = movement
+                item["repair_from_node"] = int(move["from"])
+                item["repair_to_node"] = int(move["to"])
+                accepted_by_repair_provenance += 1
+                break
+
+        if not accepted:
+            item["conformity"] = "failed"
+            failed += 1
+        result.append(item)
+
+    return {
+        "contact_count": len(result),
+        "conforming_contact_count": len(result) - failed,
+        "failed_contact_count": failed,
+        "accepted_by_repair_provenance_count": accepted_by_repair_provenance,
+        "details": result,
+    }
+
+
+def audit_semantic_shared_nodes(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    precision: float,
+    movement_reports: list[dict] | None = None,
+) -> dict:
+    """Reject shared mesh nodes that have no reconstructed semantic path.
+
+    Surface/surface identity is justified by a finite shared mesh edge or a
+    common source boundary node. Axis/axis identity requires a common source
+    anchor node. Axis/surface identity requires an explicit Rust contact.
+    Transitive paths through those relations are valid; coordinate proximity
+    alone is never a relation.
+    """
+    tolerance = precision * 10.0
+    movement_reports = movement_reports or []
+    reverse_moves: dict[int, list[dict]] = defaultdict(list)
+    for report in movement_reports:
+        for component in report.get("components", report.get("accepted", [])):
+            for move in component.get("moves", []):
+                movement = float(move.get("movement", float("inf")))
+                movement_limit = float(move.get("movement_limit", 0.0))
+                if movement_limit > 0.0 and movement < movement_limit:
+                    reverse_moves[int(move["to"])].append(move)
+
+    def node_matches_point(node: int, expected: Iterable[float]) -> bool:
+        expected = tuple(float(x) for x in expected)
+        if distance(coords[node], expected) <= tolerance:
+            return True
+        stack = [node]
+        seen = set()
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            for move in reverse_moves.get(current, []):
+                if distance(move["from_coordinate"], expected) <= tolerance:
+                    return True
+                stack.append(int(move["from"]))
+        return False
+
+    node_surfaces: dict[int, set[int]] = defaultdict(set)
+    node_axes: dict[int, set[int]] = defaultdict(set)
+    edge_surfaces: dict[tuple[int, int], set[int]] = defaultdict(set)
+
+    for triangle in triangles:
+        surface = int(triangle["source_surface"])
+        a, b, c = triangle["nodes"]
+        node_surfaces[a].add(surface)
+        node_surfaces[b].add(surface)
+        node_surfaces[c].add(surface)
+        for edge in (
+            tuple(sorted((a, b))),
+            tuple(sorted((b, c))),
+            tuple(sorted((c, a))),
+        ):
+            edge_surfaces[edge].add(surface)
+
+    for bar in bars:
+        axis = int(bar["axis"])
+        for node in bar["nodes"]:
+            node_axes[node].add(axis)
+
+    finite_surface_pairs_at_node: dict[int, set[tuple[int, int]]] = defaultdict(set)
+    for edge, owners in edge_surfaces.items():
+        owners = sorted(owners)
+        for i in range(len(owners)):
+            for j in range(i + 1, len(owners)):
+                pair = (owners[i], owners[j])
+                finite_surface_pairs_at_node[edge[0]].add(pair)
+                finite_surface_pairs_at_node[edge[1]].add(pair)
+
+    surface_source_points: list[dict[int, list[tuple[float, float, float]]]] = []
+    for surface in data.get("surfaces", []):
+        mapping: dict[int, list[tuple[float, float, float]]] = defaultdict(list)
+        for ring, source_nodes in zip(
+            surface.get("rings", []), surface.get("ring_source_nodes", [])
+        ):
+            for point, source_node in zip(ring, source_nodes):
+                mapping[int(source_node)].append(tuple(float(x) for x in point))
+        surface_source_points.append(mapping)
+
+    axis_source_points: list[dict[int, tuple[float, float, float]]] = []
+    for axis in data.get("axes", []):
+        axis_source_points.append(
+            {
+                int(anchor["source_node"]): tuple(float(x) for x in anchor["point"])
+                for anchor in axis.get("anchors", [])
+            }
+        )
+
+    contacts_by_pair: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    for contact in data.get("contacts", []):
+        contacts_by_pair[(int(contact["axis"]), int(contact["surface"]))].append(contact)
+
+    def relation(
+        node: int,
+        left: tuple[str, int],
+        right: tuple[str, int],
+    ) -> tuple[bool, str | None]:
+        point = coords[node]
+        if left[0] == "surface" and right[0] == "surface":
+            s1, s2 = left[1], right[1]
+            pair = tuple(sorted((s1, s2)))
+            if pair in finite_surface_pairs_at_node.get(node, set()):
+                return True, "shared_surface_edge"
+            common = set(surface_source_points[s1]) & set(surface_source_points[s2])
+            for source_node in common:
+                if any(
+                    node_matches_point(node, candidate)
+                    for candidate in surface_source_points[s1][source_node]
+                ) and any(
+                    node_matches_point(node, candidate)
+                    for candidate in surface_source_points[s2][source_node]
+                ):
+                    return True, f"shared_surface_source_node:{source_node}"
+            return False, None
+
+        if left[0] == "axis" and right[0] == "axis":
+            a1, a2 = left[1], right[1]
+            common = set(axis_source_points[a1]) & set(axis_source_points[a2])
+            for source_node in common:
+                if (
+                    node_matches_point(node, axis_source_points[a1][source_node])
+                    and node_matches_point(node, axis_source_points[a2][source_node])
+                ):
+                    return True, f"shared_axis_source_node:{source_node}"
+            return False, None
+
+        axis = left[1] if left[0] == "axis" else right[1]
+        surface = left[1] if left[0] == "surface" else right[1]
+        geometry = data["axes"][axis]
+        parameter, residual = axis_parameter(point, geometry)
+        parameter_tolerance = tolerance / max(axis_length(geometry), tolerance)
+        for contact in contacts_by_pair.get((axis, surface), []):
+            if contact["kind"] == "point":
+                if node_matches_point(node, contact["point"]):
+                    return True, "declared_point_contact"
+            elif (
+                residual <= tolerance
+                and float(contact["start_t"]) - parameter_tolerance
+                <= parameter
+                <= float(contact["end_t"]) + parameter_tolerance
+            ):
+                return True, "declared_interval_contact"
+        return False, None
+
+    shared_node_count = 0
+    unintended = []
+    direct_axis_axis = 0
+    mediated_axis_axis = 0
+    unsupported_axis_axis = 0
+    mediated_examples = []
+
+    for node in sorted(set(node_surfaces) | set(node_axes)):
+        owners = [
+            ("surface", surface) for surface in sorted(node_surfaces[node])
+        ] + [("axis", axis) for axis in sorted(node_axes[node])]
+        if len(owners) <= 1:
+            continue
+        shared_node_count += 1
+
+        adjacency = {owner: set() for owner in owners}
+        direct_relations: dict[tuple[tuple[str, int], tuple[str, int]], str] = {}
+        for i, left in enumerate(owners):
+            for right in owners[i + 1 :]:
+                connected, reason = relation(node, left, right)
+                if connected:
+                    adjacency[left].add(right)
+                    adjacency[right].add(left)
+                    direct_relations[(left, right)] = reason or "semantic_relation"
+
+        components = []
+        owner_component = {}
+        seen = set()
+        for owner in owners:
+            if owner in seen:
+                continue
+            stack = [owner]
+            seen.add(owner)
+            component = []
+            while stack:
+                current = stack.pop()
+                component.append(current)
+                for other in adjacency[current]:
+                    if other not in seen:
+                        seen.add(other)
+                        stack.append(other)
+            component_id = len(components)
+            for item in component:
+                owner_component[item] = component_id
+            components.append(component)
+
+        axes_here = sorted(node_axes[node])
+        for i, a1 in enumerate(axes_here):
+            for a2 in axes_here[i + 1 :]:
+                left = ("axis", a1)
+                right = ("axis", a2)
+                key = (left, right) if (left, right) in direct_relations else (right, left)
+                if key in direct_relations:
+                    direct_axis_axis += 1
+                elif owner_component[left] == owner_component[right]:
+                    mediated_axis_axis += 1
+                    if len(mediated_examples) < 20:
+                        mediated_examples.append(
+                            {"node": node, "axes": [a1, a2], "coordinate": coords[node]}
+                        )
+                else:
+                    unsupported_axis_axis += 1
+
+        if len(components) > 1:
+            unintended.append(
+                {
+                    "node": node,
+                    "coordinate": coords[node],
+                    "components": components,
+                }
+            )
+
+    return {
+        "shared_node_count": shared_node_count,
+        "unintended_shared_node_count": len(unintended),
+        "direct_axis_axis_shared_node_count": direct_axis_axis,
+        "surface_mediated_axis_axis_shared_node_count": mediated_axis_axis,
+        "unsupported_axis_axis_shared_node_count": unsupported_axis_axis,
+        "surface_mediated_axis_axis_examples": mediated_examples,
+        "unintended_shared_nodes": unintended,
+    }
+
+
+@dataclass
+class Fragmentation:
+    surface_to_output: list[list[int]]
+    surface_output_owners: dict[int, list[int]]
+    output_surfaces: list[int]
+    curve_to_output: list[list[int]]
+    curve_output_owners: dict[int, list[int]]
+    output_curves: list[int]
+    curve_inputs: list[dict]
+    axis_build_blockers: list[str]
+
+
+def fragment(
+    input_surfaces: list[dict],
+    axes: list[dict],
+    contacts: list[dict],
+    precision: float,
+) -> Fragmentation:
+    surface_entities = [(2, add_surface(surface)) for surface in input_surfaces]
+    curve_entities, curve_inputs, axis_build_blockers = build_axis_curve_inputs(
+        axes, contacts, precision
+    )
+    input_entities = surface_entities + curve_entities
+
+    if not input_entities:
+        return Fragmentation([], {}, [], [], {}, [], curve_inputs, axis_build_blockers)
+
+    if len(input_entities) == 1:
+        output_map = [[input_entities[0]]]
+        output = [input_entities[0]]
+    else:
+        # Pass every entity as an object.  Passing the first entity as the
+        # object and all remaining entities as tools leaves tool/tool
+        # intersections unsplit in OCC; that creates disconnected slab/wall
+        # meshes even though the geometry intersects.
+        output, output_map = gmsh.model.occ.fragment(
+            input_entities,
+            [],
+            removeObject=True,
+            removeTool=True,
+        )
+
+    surface_count = len(surface_entities)
+    surface_map_raw = output_map[:surface_count]
+    curve_map_raw = output_map[surface_count:]
+
+    surface_to_output = [
+        sorted({tag for dim, tag in mapped if dim == 2}) for mapped in surface_map_raw
+    ]
+    curve_to_output = [
+        sorted({tag for dim, tag in mapped if dim == 1}) for mapped in curve_map_raw
+    ]
+    output_surfaces = sorted(
+        {tag for mapped in surface_to_output for tag in mapped}
+        | {tag for dim, tag in output if dim == 2}
+    )
+    output_curves = sorted({tag for mapped in curve_to_output for tag in mapped})
+
+    gmsh.model.occ.synchronize()
+
+    surface_output_owners: dict[int, list[int]] = defaultdict(list)
+    for source, tags in enumerate(surface_to_output):
+        for tag in tags:
+            surface_output_owners[tag].append(source)
+
+    curve_output_owners: dict[int, list[int]] = defaultdict(list)
+    for source, tags in enumerate(curve_to_output):
+        for tag in tags:
+            curve_output_owners[tag].append(source)
+
+    return Fragmentation(
+        surface_to_output=surface_to_output,
+        surface_output_owners={
+            tag: sorted(set(owners)) for tag, owners in surface_output_owners.items()
+        },
+        output_surfaces=output_surfaces,
+        curve_to_output=curve_to_output,
+        curve_output_owners={
+            tag: sorted(set(owners)) for tag, owners in curve_output_owners.items()
+        },
+        output_curves=output_curves,
+        curve_inputs=curve_inputs,
+        axis_build_blockers=axis_build_blockers,
+    )
+
+
+def entity_point(tag: int) -> tuple[float, float, float]:
+    value = gmsh.model.getValue(0, tag, [])
+    return (float(value[0]), float(value[1]), float(value[2]))
+
+
+def curve_midpoint(tag: int) -> tuple[float, float, float]:
+    low_x, low_y, low_z, high_x, high_y, high_z = gmsh.model.getBoundingBox(1, tag)
+    return (
+        0.5 * (low_x + high_x),
+        0.5 * (low_y + high_y),
+        0.5 * (low_z + high_z),
+    )
+
+
+def embed_declared_contacts(
+    fragmentation: Fragmentation,
+    data: dict,
+    precision: float,
+) -> dict:
+    """Mesh-embed only contacts already established by Rust semantics."""
+    tolerance = precision * 10.0
+    curve_inputs_by_axis: dict[int, list[int]] = defaultdict(list)
+    for index, item in enumerate(fragmentation.curve_inputs):
+        curve_inputs_by_axis[int(item["axis"])].append(index)
+
+    # Point contacts already lying inside a declared interval contact need no
+    # separate 0D embed: embedding the interval curve makes every split point
+    # on that curve a surface mesh node by identity.
+    interval_coverage: dict[tuple[int, int], list[tuple[float, float]]] = defaultdict(list)
+    for contact in data.get("contacts", []):
+        if contact["kind"] == "interval":
+            interval_coverage[(int(contact["axis"]), int(contact["surface"]))].append(
+                (float(contact["start_t"]), float(contact["end_t"]))
+            )
+
+    embedded_curves: set[tuple[int, int]] = set()
+    embedded_points: set[tuple[int, int]] = set()
+    existing_boundary_curves = 0
+    existing_boundary_points = 0
+    covered_point_contacts = 0
+    blockers: list[str] = []
+
+    boundary_curves: dict[int, set[int]] = {}
+    boundary_points: dict[int, set[int]] = {}
+    for source_faces in fragmentation.surface_to_output:
+        for face in source_faces:
+            if face in boundary_curves:
+                continue
+            boundary_curves[face] = {
+                int(tag)
+                for dim, tag in gmsh.model.getBoundary(
+                    [(2, face)], combined=False, oriented=False, recursive=False
+                )
+                if dim == 1
+            }
+            points = set()
+            for curve in boundary_curves[face]:
+                points.update(
+                    int(tag)
+                    for dim, tag in gmsh.model.getBoundary(
+                        [(1, curve)], combined=False, oriented=False, recursive=False
+                    )
+                    if dim == 0
+                )
+            boundary_points[face] = points
+
+    # Interval contacts first. The curve pieces are already split at property,
+    # anchor and contact parameters; General Fuse may split them further at
+    # surface intersections, so each output curve can be assigned by midpoint.
+    for contact_index, contact in enumerate(data.get("contacts", [])):
+        if contact["kind"] != "interval":
+            continue
+        axis = int(contact["axis"])
+        surface = int(contact["surface"])
+        faces = fragmentation.surface_to_output[surface]
+        axis_length_value = axis_length(data["axes"][axis])
+        param_tol = tolerance / max(axis_length_value, tolerance)
+        start_t = float(contact["start_t"])
+        end_t = float(contact["end_t"])
+        selected = []
+        for input_curve in curve_inputs_by_axis.get(axis, []):
+            item = fragmentation.curve_inputs[input_curve]
+            if (
+                float(item["start_t"]) >= start_t - param_tol
+                and float(item["end_t"]) <= end_t + param_tol
+            ):
+                selected.extend(fragmentation.curve_to_output[input_curve])
+        if not selected:
+            blockers.append(f"interval_contact_without_curve:{contact_index}")
+            continue
+
+        for curve in sorted(set(selected)):
+            midpoint = curve_midpoint(curve)
+            owners = []
+            for face in faces:
+                if curve in boundary_curves[face]:
+                    existing_boundary_curves += 1
+                    owners.append(face)
+                    continue
+                # Rust already established this curve/surface contact. isInside
+                # selects only the OCC fragment containing this exact piece; no
+                # nearest-surface or fuzzy geometric inference is performed.
+                if gmsh.model.isInside(2, face, midpoint) > 0:
+                    gmsh.model.mesh.embed(1, [curve], 2, face)
+                    embedded_curves.add((curve, face))
+                    owners.append(face)
+            if not owners:
+                blockers.append(
+                    f"interval_curve_not_on_contact_surface:contact={contact_index},curve={curve}"
+                )
+
+    # Point-only contacts. Use the actual OCC endpoint created by the split
+    # axis curve and embed it only in the Rust-declared source surface.
+    for contact_index, contact in enumerate(data.get("contacts", [])):
+        if contact["kind"] != "point":
+            continue
+        axis = int(contact["axis"])
+        surface = int(contact["surface"])
+        t = float(contact["t"])
+        axis_length_value = axis_length(data["axes"][axis])
+        param_tol = tolerance / max(axis_length_value, tolerance)
+        if any(
+            start - param_tol <= t <= end + param_tol
+            for start, end in interval_coverage.get((axis, surface), [])
+        ):
+            covered_point_contacts += 1
+            continue
+
+        faces = fragmentation.surface_to_output[surface]
+        expected = tuple(float(x) for x in contact["point"])
+        candidates = set()
+        for input_curve in curve_inputs_by_axis.get(axis, []):
+            item = fragmentation.curve_inputs[input_curve]
+            if (
+                abs(float(item["start_t"]) - t) > param_tol
+                and abs(float(item["end_t"]) - t) > param_tol
+            ):
+                continue
+            for curve in fragmentation.curve_to_output[input_curve]:
+                candidates.update(
+                    int(tag)
+                    for dim, tag in gmsh.model.getBoundary(
+                        [(1, curve)], combined=False, oriented=False, recursive=False
+                    )
+                    if dim == 0 and distance(entity_point(int(tag)), expected) <= tolerance
+                )
+        if not candidates:
+            blockers.append(f"point_contact_without_axis_point:{contact_index}")
+            continue
+
+        placed = False
+        for point in sorted(candidates):
+            xyz = entity_point(point)
+            for face in faces:
+                if point in boundary_points[face]:
+                    existing_boundary_points += 1
+                    placed = True
+                    continue
+                if gmsh.model.isInside(2, face, xyz) > 0:
+                    gmsh.model.mesh.embed(0, [point], 2, face)
+                    embedded_points.add((point, face))
+                    placed = True
+        if not placed:
+            blockers.append(f"point_contact_not_on_contact_surface:{contact_index}")
+
+    return {
+        "embedded_curve_count": len(embedded_curves),
+        "embedded_point_count": len(embedded_points),
+        "covered_point_contact_count": covered_point_contacts,
+        "existing_boundary_curve_count": existing_boundary_curves,
+        "existing_boundary_point_count": existing_boundary_points,
+        "blockers": blockers,
+    }
+
+
+def physical_groups(
+    fragmentation: Fragmentation,
+    surfaces: list[dict],
+) -> list[dict]:
+    surface_by_stiffness: dict[int, list[int]] = defaultdict(list)
+    for tag in fragmentation.output_surfaces:
+        owners = fragmentation.surface_output_owners.get(tag, [])
+        if len(owners) != 1:
+            continue
+        surface_by_stiffness[int(surfaces[owners[0]]["stiffness"])].append(tag)
+
+    curve_by_stiffness: dict[int, list[int]] = defaultdict(list)
+    for tag in fragmentation.output_curves:
+        owners = fragmentation.curve_output_owners.get(tag, [])
+        if len(owners) != 1:
+            continue
+        curve_by_stiffness[
+            int(fragmentation.curve_inputs[owners[0]]["stiffness"])
+        ].append(tag)
+
+    result = []
+    for stiffness, tags in sorted(surface_by_stiffness.items()):
+        group = gmsh.model.addPhysicalGroup(2, sorted(set(tags)))
+        name = f"surface_stiffness_{stiffness}"
+        gmsh.model.setPhysicalName(2, group, name)
+        result.append(
+            {
+                "dimension": 2,
+                "physical_tag": group,
+                "name": name,
+                "stiffness": stiffness,
+                "entity_tags": sorted(set(tags)),
+            }
+        )
+
+    for stiffness, tags in sorted(curve_by_stiffness.items()):
+        group = gmsh.model.addPhysicalGroup(1, sorted(set(tags)))
+        name = f"bar_stiffness_{stiffness}"
+        gmsh.model.setPhysicalName(1, group, name)
+        result.append(
+            {
+                "dimension": 1,
+                "physical_tag": group,
+                "name": name,
+                "stiffness": stiffness,
+                "entity_tags": sorted(set(tags)),
+            }
+        )
+
+    return result
+
+
+def audit_surface_planarity(
+    data: dict,
+    coords: dict[int, tuple[float, float, float]],
+    triangles: list[dict],
+    precision: float,
+) -> dict:
+    """Verify that every final shell node stays on its reconstructed plane."""
+    surface_planes = []
+    invalid_surface_planes = []
+    for surface_index, surface in enumerate(data.get("surfaces", [])):
+        points = [
+            tuple(float(x) for x in point)
+            for ring in surface.get("rings", [])
+            for point in ring
+        ]
+        plane = None
+        if len(points) >= 3:
+            origin = points[0]
+            for i in range(1, len(points) - 1):
+                u = tuple(points[i][k] - origin[k] for k in range(3))
+                for j in range(i + 1, len(points)):
+                    v = tuple(points[j][k] - origin[k] for k in range(3))
+                    normal = (
+                        u[1] * v[2] - u[2] * v[1],
+                        u[2] * v[0] - u[0] * v[2],
+                        u[0] * v[1] - u[1] * v[0],
+                    )
+                    norm = math.sqrt(sum(x * x for x in normal))
+                    if norm > precision:
+                        plane = (origin, tuple(x / norm for x in normal))
+                        break
+                if plane is not None:
+                    break
+        if plane is None:
+            invalid_surface_planes.append(surface_index)
+        surface_planes.append(plane)
+
+    maximum_error = 0.0
+    worst = None
+    checked_nodes = 0
+    seen = set()
+    for triangle_index, triangle in enumerate(triangles):
+        surface = int(triangle["source_surface"])
+        plane = surface_planes[surface] if surface < len(surface_planes) else None
+        if plane is None:
+            continue
+        origin, normal = plane
+        for node in triangle["nodes"]:
+            key = (surface, node)
+            if key in seen:
+                continue
+            seen.add(key)
+            checked_nodes += 1
+            point = coords[node]
+            error = abs(sum((point[k] - origin[k]) * normal[k] for k in range(3)))
+            if error > maximum_error:
+                maximum_error = error
+                worst = {
+                    "surface": surface,
+                    "node": node,
+                    "coordinate": point,
+                    "error": error,
+                    "triangle": triangle_index,
+                }
+
+    tolerance = max(precision * 10.0, 1e-9)
+    return {
+        "checked_surface_node_count": checked_nodes,
+        "invalid_surface_planes": invalid_surface_planes,
+        "tolerance": tolerance,
+        "maximum_planarity_error": maximum_error,
+        "worst": worst,
+        "clean": not invalid_surface_planes and maximum_error <= tolerance,
+    }
+
+
+def build_solver_mesh_package(
+    data: dict,
+    fragmentation: Fragmentation,
+    vertices: list[tuple[float, float, float]],
+    triangles: list[dict],
+    bars: list[dict],
+    precision: float,
+) -> tuple[dict, dict]:
+    """Build and audit the backend-neutral mesh consumed by solver adapters."""
+
+    surface_regions = [
+        {
+            "region": int(surface["source_surface"]),
+            "source_patch": int(surface["source_patch"]),
+            "stiffness": int(surface["stiffness"]),
+            "source_elements": sorted({int(x) for x in surface["source_elements"]}),
+        }
+        for surface in data["surfaces"]
+    ]
+    bar_regions = [
+        {
+            "region": int(item["input_curve"]),
+            "axis": int(item["axis"]),
+            "source_axis": int(item["source_axis"]),
+            "stiffness": int(item["stiffness"]),
+            "source_elements": sorted({int(x) for x in item["source_elements"]}),
+            "start_t": float(item["start_t"]),
+            "end_t": float(item["end_t"]),
+        }
+        for item in fragmentation.curve_inputs
+    ]
+
+    shell_elements = [
+        {
+            "vertices": [int(x) for x in triangle["vertices"]],
+            "region": int(triangle["source_surface"]),
+        }
+        for triangle in triangles
+    ]
+    bar_elements = [
+        {
+            "vertices": [int(x) for x in bar["vertices"]],
+            "region": int(bar["input_curve"]),
+        }
+        for bar in bars
+    ]
+
+    surface_region_by_id = {item["region"]: item for item in surface_regions}
+    bar_region_by_id = {item["region"]: item for item in bar_regions}
+    vertex_count = len(vertices)
+
+    invalid_shell_indices = []
+    degenerate_shell_elements = []
+    shell_stiffness_mismatches = []
+    represented_surface_regions = set()
+    for index, (source, element) in enumerate(zip(triangles, shell_elements)):
+        ids = element["vertices"]
+        if len(ids) != 3 or any(node < 0 or node >= vertex_count for node in ids):
+            invalid_shell_indices.append(index)
+            continue
+        if len(set(ids)) != 3 or triangle_area(*(vertices[node] for node in ids)) <= precision * precision:
+            degenerate_shell_elements.append(index)
+        region = element["region"]
+        represented_surface_regions.add(region)
+        expected = surface_region_by_id.get(region)
+        if expected is None or int(source["stiffness"]) != expected["stiffness"]:
+            shell_stiffness_mismatches.append(index)
+
+    invalid_bar_indices = []
+    degenerate_bar_elements = []
+    bar_stiffness_mismatches = []
+    represented_bar_regions = set()
+    for index, (source, element) in enumerate(zip(bars, bar_elements)):
+        ids = element["vertices"]
+        if len(ids) != 2 or any(node < 0 or node >= vertex_count for node in ids):
+            invalid_bar_indices.append(index)
+            continue
+        if len(set(ids)) != 2 or distance(vertices[ids[0]], vertices[ids[1]]) <= precision:
+            degenerate_bar_elements.append(index)
+        region = element["region"]
+        represented_bar_regions.add(region)
+        expected = bar_region_by_id.get(region)
+        if expected is None or int(source["stiffness"]) != expected["stiffness"]:
+            bar_stiffness_mismatches.append(index)
+
+    expected_surface_regions = set(surface_region_by_id)
+    expected_bar_regions = set(bar_region_by_id)
+    missing_surface_regions = sorted(expected_surface_regions - represented_surface_regions)
+    unexpected_surface_regions = sorted(represented_surface_regions - expected_surface_regions)
+    missing_bar_regions = sorted(expected_bar_regions - represented_bar_regions)
+    unexpected_bar_regions = sorted(represented_bar_regions - expected_bar_regions)
+
+    expected_surface_elements = {
+        source_element
+        for region in surface_regions
+        for source_element in region["source_elements"]
+    }
+    represented_surface_elements = {
+        source_element
+        for region_id in represented_surface_regions
+        if region_id in surface_region_by_id
+        for source_element in surface_region_by_id[region_id]["source_elements"]
+    }
+    expected_bar_elements = {
+        source_element
+        for region in bar_regions
+        for source_element in region["source_elements"]
+    }
+    represented_bar_elements = {
+        source_element
+        for region_id in represented_bar_regions
+        if region_id in bar_region_by_id
+        for source_element in bar_region_by_id[region_id]["source_elements"]
+    }
+
+    duplicate_shell_element_indices = []
+    seen_shells = {}
+    for index, element in enumerate(shell_elements):
+        key = (element["region"], tuple(sorted(element["vertices"])))
+        if key in seen_shells:
+            duplicate_shell_element_indices.append(index)
+        else:
+            seen_shells[key] = index
+
+    duplicate_bar_element_indices = []
+    seen_bars = {}
+    for index, element in enumerate(bar_elements):
+        key = (element["region"], tuple(sorted(element["vertices"])))
+        if key in seen_bars:
+            duplicate_bar_element_indices.append(index)
+        else:
+            seen_bars[key] = index
+
+    audit = {
+        "surface_region_count": len(surface_regions),
+        "represented_surface_region_count": len(represented_surface_regions),
+        "bar_region_count": len(bar_regions),
+        "represented_bar_region_count": len(represented_bar_regions),
+        "expected_surface_source_element_count": len(expected_surface_elements),
+        "represented_surface_source_element_count": len(represented_surface_elements),
+        "expected_bar_source_element_count": len(expected_bar_elements),
+        "represented_bar_source_element_count": len(represented_bar_elements),
+        "missing_surface_regions": missing_surface_regions,
+        "unexpected_surface_regions": unexpected_surface_regions,
+        "missing_bar_regions": missing_bar_regions,
+        "unexpected_bar_regions": unexpected_bar_regions,
+        "missing_surface_source_elements": sorted(
+            expected_surface_elements - represented_surface_elements
+        ),
+        "unexpected_surface_source_elements": sorted(
+            represented_surface_elements - expected_surface_elements
+        ),
+        "missing_bar_source_elements": sorted(
+            expected_bar_elements - represented_bar_elements
+        ),
+        "unexpected_bar_source_elements": sorted(
+            represented_bar_elements - expected_bar_elements
+        ),
+        "invalid_shell_element_indices": invalid_shell_indices,
+        "invalid_bar_element_indices": invalid_bar_indices,
+        "degenerate_shell_element_indices": degenerate_shell_elements,
+        "degenerate_bar_element_indices": degenerate_bar_elements,
+        "shell_stiffness_mismatch_indices": shell_stiffness_mismatches,
+        "bar_stiffness_mismatch_indices": bar_stiffness_mismatches,
+        "duplicate_shell_element_indices": duplicate_shell_element_indices,
+        "duplicate_bar_element_indices": duplicate_bar_element_indices,
+    }
+    audit["clean"] = not any(
+        value
+        for key, value in audit.items()
+        if key not in {
+            "clean",
+            "surface_region_count",
+            "represented_surface_region_count",
+            "bar_region_count",
+            "represented_bar_region_count",
+            "expected_surface_source_element_count",
+            "represented_surface_source_element_count",
+            "expected_bar_source_element_count",
+            "represented_bar_source_element_count",
+        }
+    )
+
+    package = {
+        "format": SOLVER_MESH_FORMAT,
+        "length_unit": data.get("length_unit", "model_unit"),
+        "index_base": 0,
+        "vertices": vertices,
+        "surface_regions": surface_regions,
+        "bar_regions": bar_regions,
+        "shell_elements": shell_elements,
+        "bar_elements": bar_elements,
+    }
+    return package, audit
+
+
+def write_solver_mesh_msh(path: Path, solver_mesh: dict) -> None:
+    """Write the repaired solver package as a self-contained MSH 2 file.
+
+    This deliberately uses the compact solver vertices and elements rather
+    than the still-RAW OCC model.  Vertex indices remain distinct even when
+    coordinates coincide, preserving semantic identity after point splitting.
+    Physical groups encode source regions and stiffness for downstream import.
+    """
+    surface_groups = {
+        int(region["region"]): index + 1
+        for index, region in enumerate(solver_mesh.get("surface_regions", []))
+    }
+    bar_groups = {
+        int(region["region"]): index + 1 + len(surface_groups)
+        for index, region in enumerate(solver_mesh.get("bar_regions", []))
+    }
+    physical_names = []
+    for region in solver_mesh.get("surface_regions", []):
+        tag = surface_groups[int(region["region"])]
+        physical_names.append((2, tag, f"surface_region_{region['region']}_k{region['stiffness']}"))
+    for region in solver_mesh.get("bar_regions", []):
+        tag = bar_groups[int(region["region"])]
+        physical_names.append((1, tag, f"bar_region_{region['region']}_k{region['stiffness']}"))
+
+    lines = ["$MeshFormat", "2.2 0 8", "$EndMeshFormat", "$PhysicalNames", str(len(physical_names))]
+    lines.extend(f'{dimension} {tag} "{name}"' for dimension, tag, name in physical_names)
+    lines.extend(["$EndPhysicalNames", "$Nodes", str(len(solver_mesh.get("vertices", [])))])
+    for index, point in enumerate(solver_mesh.get("vertices", []), 1):
+        lines.append(f"{index} {float(point[0]):.17g} {float(point[1]):.17g} {float(point[2]):.17g}")
+    lines.extend(["$EndNodes", "$Elements"])
+    shell_elements = solver_mesh.get("shell_elements", [])
+    bar_elements = solver_mesh.get("bar_elements", [])
+    lines.append(str(len(shell_elements) + len(bar_elements)))
+    element_id = 1
+    for element in shell_elements:
+        region = int(element["region"])
+        physical = surface_groups[region]
+        nodes = " ".join(str(int(vertex) + 1) for vertex in element["vertices"])
+        lines.append(f"{element_id} 2 2 {physical} {physical} {nodes}")
+        element_id += 1
+    for element in bar_elements:
+        region = int(element["region"])
+        physical = bar_groups[region]
+        nodes = " ".join(str(int(vertex) + 1) for vertex in element["vertices"])
+        lines.append(f"{element_id} 1 2 {physical} {physical} {nodes}")
+        element_id += 1
+    lines.extend(["$EndElements", ""])
+    path.write_text("\n".join(lines))
+
+
+def run_backend(
+    data: dict,
+    mesh_size_override: float | None = None,
+    write_msh: Path | None = None,
+) -> dict:
+    data = normalize_input(data, mesh_size_override)
+    surfaces = data["surfaces"]
+    policy = data["policy"]
+    precision = float(policy["precision"])
+    minimum_edge = float(policy["minimum_edge"])
+    junction_movement_limit = float(policy["junction_movement_limit"])
+    mesh_size = float(policy["target_mesh_size"])
+
+    gmsh.clear()
+    gmsh.model.add("topo_reconstruct_occ")
+    gmsh.option.setNumber("General.Terminal", 1)
+    gmsh.option.setNumber("Geometry.OCCBooleanPreserveNumbering", 1)
+    gmsh.option.setNumber("Mesh.ElementOrder", 1)
+    # Exact General Fuse: do not use Geometry.ToleranceBoolean as a repair
+    # budget. The full-model trial showed that even 0.1 mm changed topology too
+    # aggressively.
+    gmsh.option.setNumber("Geometry.ToleranceBoolean", 0.0)
+
+    fragmentation = fragment(
+        surfaces,
+        data.get("axes", []),
+        data.get("contacts", []),
+        precision,
+    )
+
+    surface_ownership_conflicts = []
+    fragmented_surfaces = []
+    unmapped_output_surfaces = []
+    for tag in fragmentation.output_surfaces:
+        owners = fragmentation.surface_output_owners.get(tag, [])
+        if not owners:
+            unmapped_output_surfaces.append(tag)
+            continue
+        if len(owners) > 1:
+            stiffnesses = sorted({int(surfaces[owner]["stiffness"]) for owner in owners})
+            surface_ownership_conflicts.append(
+                {
+                    "output_surface": tag,
+                    "source_surfaces": owners,
+                    "stiffnesses": stiffnesses,
+                }
+            )
+            continue
+        source = owners[0]
+        item = surfaces[source]
+        fragmented_surfaces.append(
+            {
+                "output_surface": tag,
+                "source_surface": source,
+                "source_patch": item["source_patch"],
+                "stiffness": item["stiffness"],
+                "source_elements": item["source_elements"],
+            }
+        )
+
+    curve_ownership_conflicts = []
+    fragmented_curves = []
+    for tag in fragmentation.output_curves:
+        owners = fragmentation.curve_output_owners.get(tag, [])
+        if len(owners) != 1:
+            curve_ownership_conflicts.append(
+                {
+                    "output_curve": tag,
+                    "input_curves": owners,
+                    "reason": "unmapped" if not owners else "multiple_input_curves",
+                }
+            )
+            continue
+        source = owners[0]
+        item = fragmentation.curve_inputs[source]
+        fragmented_curves.append(
+            {
+                "output_curve": tag,
+                **item,
+            }
+        )
+
+    contact_embedding = embed_declared_contacts(fragmentation, data, precision)
+    groups = physical_groups(fragmentation, surfaces)
+
+    gmsh.option.setNumber("Mesh.MeshSizeMin", mesh_size)
+    gmsh.option.setNumber("Mesh.MeshSizeMax", mesh_size)
+    gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+    gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+    gmsh.option.setNumber("Mesh.Smoothing", 10)
+
+    gmsh.model.mesh.generate(2)
+    gmsh.model.mesh.optimize("Relocate2D", force=True, niter=10)
+
+    coords = all_node_coordinates()
+    triangles = []
+    bars = []
+    non_triangle_blockers = []
+    non_line_blockers = []
+    for item in fragmented_surfaces:
+        tag = item["output_surface"]
+        try:
+            local = element_triangles(tag)
+        except RuntimeError as error:
+            non_triangle_blockers.append(str(error))
+            continue
+        for nodes in local:
+            triangles.append(
+                {
+                    "nodes": nodes,
+                    "output_surface": tag,
+                    "source_surface": item["source_surface"],
+                    "stiffness": item["stiffness"],
+                }
+            )
+
+    for item in fragmented_curves:
+        tag = item["output_curve"]
+        try:
+            local = element_lines(tag)
+        except RuntimeError as error:
+            non_line_blockers.append(str(error))
+            continue
+        for nodes in local:
+            bars.append(
+                {
+                    "nodes": nodes,
+                    "output_curve": tag,
+                    "input_curve": item["input_curve"],
+                    "axis": item["axis"],
+                    "source_axis": item["source_axis"],
+                    "start_t": item["start_t"],
+                    "end_t": item["end_t"],
+                    "stiffness": item["stiffness"],
+                    "source_elements": item["source_elements"],
+                }
+            )
+
+    raw_quality = quality(coords, triangles)
+    raw_shared = shared_mesh_edges_by_source(triangles)
+    raw_contact_audit = audit_contacts(data, coords, triangles, bars, precision)
+    raw_semantic_node_audit = audit_semantic_shared_nodes(
+        data, coords, triangles, bars, precision
+    )
+
+    (
+        regularized_coords,
+        regularized_triangles,
+        regularized_bars,
+        junction_regularization,
+    ) = regularize_near_vertex_junctions(
+        data,
+        coords,
+        triangles,
+        bars,
+        junction_movement_limit,
+        minimum_edge,
+        precision,
+    )
+
+    healed_triangles, node_mapping, healing = heal_micro_edges(
+        regularized_coords, regularized_triangles, minimum_edge, precision
+    )
+
+    healed_bars = []
+    removed_degenerate_bars = 0
+    for bar in regularized_bars:
+        nodes = tuple(node_mapping.get(node, node) for node in bar["nodes"])
+        if nodes[0] == nodes[1]:
+            removed_degenerate_bars += 1
+            continue
+        healed_bars.append({**bar, "nodes": nodes})
+    healing["removed_degenerate_bars"] = removed_degenerate_bars
+
+    movement_reports = [junction_regularization, healing]
+    semantic_before_point_split = audit_semantic_shared_nodes(
+        data,
+        regularized_coords,
+        healed_triangles,
+        healed_bars,
+        precision,
+        movement_reports,
+    )
+    (
+        final_coords,
+        final_triangles,
+        final_bars,
+        isolated_point_split,
+    ) = split_unintended_shared_nodes(
+        regularized_coords,
+        healed_triangles,
+        healed_bars,
+        semantic_before_point_split,
+    )
+    final_semantic_node_audit = audit_semantic_shared_nodes(
+        data,
+        final_coords,
+        final_triangles,
+        final_bars,
+        precision,
+        movement_reports,
+    )
+
+    final_quality = quality(final_coords, final_triangles)
+    final_shared = shared_mesh_edges_by_source(final_triangles)
+    strict_final_contact_audit = audit_contacts(
+        data, final_coords, final_triangles, final_bars, precision
+    )
+    contact_audit = reconcile_moved_contact_audit(
+        data,
+        raw_contact_audit,
+        strict_final_contact_audit,
+        movement_reports,
+        precision,
+    )
+
+    used_nodes = sorted(
+        {node for triangle in final_triangles for node in triangle["nodes"]}
+        | {node for bar in final_bars for node in bar["nodes"]}
+    )
+    compact_index = {tag: index for index, tag in enumerate(used_nodes)}
+    compact_vertices = [final_coords[tag] for tag in used_nodes]
+    compact_triangles = [
+        {
+            "vertices": [compact_index[node] for node in triangle["nodes"]],
+            "output_surface": triangle["output_surface"],
+            "source_surface": triangle["source_surface"],
+            "stiffness": triangle["stiffness"],
+        }
+        for triangle in final_triangles
+    ]
+    compact_bars = [
+        {
+            "vertices": [compact_index[node] for node in bar["nodes"]],
+            "output_curve": bar["output_curve"],
+            "input_curve": bar["input_curve"],
+            "axis": bar["axis"],
+            "source_axis": bar["source_axis"],
+            "stiffness": bar["stiffness"],
+            "source_elements": bar["source_elements"],
+        }
+        for bar in final_bars
+    ]
+
+    raw_surface_pairs = set(raw_shared)
+    final_surface_pairs = set(final_shared)
+    surface_pair_audit = {
+        "raw_pair_count": len(raw_surface_pairs),
+        "final_pair_count": len(final_surface_pairs),
+        "lost_pairs": [list(pair) for pair in sorted(raw_surface_pairs - final_surface_pairs)],
+        "new_pairs": [list(pair) for pair in sorted(final_surface_pairs - raw_surface_pairs)],
+    }
+    surface_pair_audit["clean"] = (
+        not surface_pair_audit["lost_pairs"] and not surface_pair_audit["new_pairs"]
+    )
+
+    planarity_audit = audit_surface_planarity(
+        data, final_coords, final_triangles, precision
+    )
+
+    solver_mesh, solver_mesh_audit = build_solver_mesh_package(
+        data,
+        fragmentation,
+        compact_vertices,
+        compact_triangles,
+        compact_bars,
+        precision,
+    )
+
+    # A repair-delta check alone cannot detect a junction that never became
+    # conforming in OCC. Check every finite geometric source intersection
+    # independently against the final shared mesh edge IDs.
+    from check_gmsh_surface_junctions import check as check_surface_junctions
+
+    surface_junction_audit = check_surface_junctions(data, {
+        "mesh": {"vertices": compact_vertices, "triangles": compact_triangles},
+        "junction_regularization": junction_regularization,
+        "healing": healing,
+    })
+
+    blockers = list(data.get("blockers", []))
+    if not bool(data.get("source_coverage_complete", False)):
+        blockers.append("incomplete_source_coverage")
+    blockers.extend(fragmentation.axis_build_blockers)
+    blockers.extend(contact_embedding["blockers"])
+    if surface_ownership_conflicts:
+        blockers.append("ambiguous_surface_fragment_ownership")
+    if curve_ownership_conflicts:
+        blockers.append("ambiguous_curve_fragment_ownership")
+    if unmapped_output_surfaces:
+        blockers.append("unmapped_fragment_surface")
+    if non_triangle_blockers:
+        blockers.append("unsupported_2d_elements")
+    if non_line_blockers:
+        blockers.append("unsupported_1d_elements")
+    if healing["unresolved_component_count"]:
+        blockers.append("unresolved_micro_edge_component")
+    if healing["near_degenerate_triangles_after"]:
+        blockers.append("near_degenerate_triangle_after_healing")
+    if contact_audit["failed_contact_count"]:
+        blockers.append("nonconforming_bar_surface_contact")
+    if final_semantic_node_audit["unintended_shared_node_count"]:
+        blockers.append("unintended_shared_mesh_node")
+    if not surface_pair_audit["clean"]:
+        blockers.append("surface_pair_topology_changed_by_repair")
+    if not planarity_audit["clean"]:
+        blockers.append("surface_planarity_failure")
+    if not solver_mesh_audit["clean"]:
+        blockers.append("solver_mesh_coverage_failure")
+    if not surface_junction_audit["clean"]:
+        blockers.append("nonconforming_surface_junction")
+
+    if write_msh and not blockers:
+        write_solver_mesh_msh(write_msh, solver_mesh)
+
+    return {
+        "format": RESULT_FORMAT,
+        "backend": "gmsh_opencascade_fragment",
+        "gmsh_version": gmsh.option.getString("General.Version"),
+        "length_unit": data.get("length_unit", "model_unit"),
+        "policy": policy,
+        "source_coverage_complete": bool(data.get("source_coverage_complete", False)),
+        "backend_ready": not blockers,
+        "blockers": sorted(set(blockers)),
+        "input_surface_count": len(surfaces),
+        "output_surface_count": len(fragmentation.output_surfaces),
+        "source_to_output_surface_count": [
+            len(tags) for tags in fragmentation.surface_to_output
+        ],
+        "input_axis_count": len(data.get("axes", [])),
+        "input_curve_piece_count": len(fragmentation.curve_inputs),
+        "output_curve_piece_count": len(fragmentation.output_curves),
+        "source_to_output_curve_count": [
+            len(tags) for tags in fragmentation.curve_to_output
+        ],
+        "fragmented_surfaces": fragmented_surfaces,
+        "fragmented_curves": fragmented_curves,
+        "surface_ownership_conflicts": surface_ownership_conflicts,
+        "curve_ownership_conflicts": curve_ownership_conflicts,
+        "unmapped_output_surfaces": unmapped_output_surfaces,
+        "physical_groups": groups,
+        "contact_embedding": contact_embedding,
+        "bar_surface_contacts_before_repairs": summarize_contact_audit(raw_contact_audit),
+        "semantic_shared_nodes_before_repairs": raw_semantic_node_audit,
+        "junction_regularization": junction_regularization,
+        "semantic_shared_nodes_before_point_split": semantic_before_point_split,
+        "isolated_point_split": isolated_point_split,
+        "semantic_shared_nodes_after_repairs": final_semantic_node_audit,
+        "bar_surface_contacts_strict_after_repairs": summarize_contact_audit(
+            strict_final_contact_audit
+        ),
+        "raw_mesh": {
+            **raw_quality,
+            "shared_surface_pair_count": len(raw_shared),
+            "shared_mesh_edge_count": sum(raw_shared.values()),
+        },
+        "healing": healing,
+        "bar_surface_contacts": contact_audit,
+        "surface_pair_audit": surface_pair_audit,
+        "surface_planarity_audit": planarity_audit,
+        "solver_mesh_audit": solver_mesh_audit,
+        "surface_junction_audit": surface_junction_audit,
+        "solver_mesh": solver_mesh,
+        "mesh": {
+            **final_quality,
+            "bar_count": len(compact_bars),
+            "shared_surface_pair_count": len(final_shared),
+            "shared_mesh_edge_count": sum(final_shared.values()),
+            "vertices": compact_vertices,
+            "triangles": compact_triangles,
+            "bars": compact_bars,
+        },
+        "axes": data.get("axes", []),
+        "contacts": data.get("contacts", []),
+    }
+
+
+def synthetic_report() -> dict:
+    surfaces = [
+        {
+            "source_surface": 0,
+            "source_patch": 0,
+            "stiffness": 10,
+            "source_elements": [1],
+            "rings": [[
+                [-2.0, -1.0, 0.0],
+                [2.0, -1.0, 0.0],
+                [2.0, 1.0, 0.0],
+                [-2.0, 1.0, 0.0],
+            ]],
+            "ring_source_nodes": [[1, 2, 3, 4]],
+        },
+        {
+            "source_surface": 1,
+            "source_patch": 1,
+            "stiffness": 20,
+            "source_elements": [2],
+            "rings": [[
+                [0.0, -2.0, -1.0],
+                [0.0, 2.0, -1.0],
+                [0.0, 2.0, 1.0],
+                [0.0, -2.0, 1.0],
+            ]],
+            "ring_source_nodes": [[5, 6, 7, 8]],
+        },
+    ]
+    axes = [
+        {
+            "source_axis": 0,
+            "endpoints": [[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]],
+            "property_spans": [
+                {
+                    "source_element": 100,
+                    "stiffness": 50,
+                    "start_t": 0.0,
+                    "end_t": 1.0,
+                }
+            ],
+            "anchors": [
+                {"source_node": 101, "t": 0.0, "point": [-1.5, 0.0, 0.0]},
+                {"source_node": 102, "t": 1.0, "point": [1.5, 0.0, 0.0]},
+            ],
+        }
+    ]
+    contacts = [
+        {
+            "kind": "interval",
+            "axis": 0,
+            "surface": 0,
+            "start_t": 0.0,
+            "end_t": 1.0,
+            "endpoints": [[-1.5, 0.0, 0.0], [1.5, 0.0, 0.0]],
+            "location": "interior",
+        },
+        {
+            "kind": "point",
+            "axis": 0,
+            "surface": 1,
+            "t": 0.5,
+            "point": [0.0, 0.0, 0.0],
+            "location": "interior",
+        },
+    ]
+    return {
+        "format": INPUT_FORMAT,
+        "length_unit": "model_unit",
+        "policy": {
+            "precision": 1e-8,
+            "minimum_edge": 1e-3,
+            "junction_movement_limit": 0.05,
+            "target_mesh_size": 0.5,
+        },
+        "source_coverage_complete": True,
+        "surfaces": surfaces,
+        "axes": axes,
+        "contacts": contacts,
+        "blockers": [],
+    }
+
+
+def self_test() -> dict:
+    result = run_backend(synthetic_report())
+    assert result["input_surface_count"] == 2
+    assert result["output_surface_count"] >= 3
+    assert result["mesh"]["triangle_count"] > 0
+    assert result["mesh"]["shared_surface_pair_count"] >= 1
+    assert result["mesh"]["shared_mesh_edge_count"] >= 1
+    assert result["mesh"]["bar_count"] > 0
+    assert result["bar_surface_contacts"]["contact_count"] == 2
+    assert result["bar_surface_contacts"]["failed_contact_count"] == 0
+    assert result["semantic_shared_nodes_after_repairs"]["unintended_shared_node_count"] == 0
+    assert result["solver_mesh"]["format"] == SOLVER_MESH_FORMAT
+    assert result["solver_mesh_audit"]["clean"], result["solver_mesh_audit"]
+    assert len(result["solver_mesh"]["surface_regions"]) == 2
+    assert len(result["solver_mesh"]["bar_regions"]) >= 1
+    assert len(result["solver_mesh"]["shell_elements"]) == result["mesh"]["triangle_count"]
+    assert len(result["solver_mesh"]["bar_elements"]) == result["mesh"]["bar_count"]
+    assert not result["surface_ownership_conflicts"]
+    assert not result["curve_ownership_conflicts"]
+    assert any(
+        group["dimension"] == 1 and group["stiffness"] == 50
+        for group in result["physical_groups"]
+    )
+    assert result["backend_ready"], result["blockers"]
+
+    # Pure healing regression: only the pre-existing multi-surface junction node
+    # is allowed to absorb the two adjacent parasitic nodes.
+    coords = {
+        1: (0.0, 0.0, 0.0),
+        2: (0.00004, 0.0, 0.0),
+        3: (0.0, 0.00008, 0.0),
+        4: (1.0, 0.0, 0.0),
+        5: (0.0, 1.0, 0.0),
+        6: (0.0, 0.0, 1.0),
+        7: (0.0, 1.0, 1.0),
+    }
+    triangles = [
+        {"nodes": (1, 2, 4), "source_surface": 0, "output_surface": 1, "stiffness": 10},
+        {"nodes": (1, 4, 5), "source_surface": 0, "output_surface": 1, "stiffness": 10},
+        {"nodes": (1, 3, 6), "source_surface": 1, "output_surface": 2, "stiffness": 20},
+        {"nodes": (1, 6, 7), "source_surface": 1, "output_surface": 2, "stiffness": 20},
+    ]
+    healed, mapping, report = heal_micro_edges(coords, triangles, 0.001, 1e-8)
+    assert report["collapsed_component_count"] == 1
+    assert report["unresolved_component_count"] == 0
+    assert report["maximum_node_movement"] < 0.001
+    assert mapping == {2: 1, 3: 1}
+    assert all(1 in triangle["nodes"] for triangle in healed)
+
+    fake_data = {"contacts": [{"kind": "point", "point": list(coords[2])}]}
+    raw_audit = {
+        "details": [
+            {
+                "contact": 0,
+                "kind": "point",
+                "mesh_conforming": True,
+                "topologically_shared": True,
+                "shared_node": 2,
+                "distance": 0.0,
+            }
+        ]
+    }
+    strict_audit = {
+        "details": [
+            {
+                "contact": 0,
+                "kind": "point",
+                "mesh_conforming": False,
+                "topologically_shared": True,
+                "shared_node": 1,
+                "distance": distance(coords[1], coords[2]),
+            }
+        ]
+    }
+    reconciled = reconcile_moved_contact_audit(
+        fake_data, raw_audit, strict_audit, [report], 1e-8
+    )
+    assert reconciled["failed_contact_count"] == 0
+    assert reconciled["accepted_by_repair_provenance_count"] == 1
+    assert reconciled["details"][0]["conformity"] == "micro_edge_healing"
+
+    unsupported = audit_semantic_shared_nodes(
+        {
+            "surfaces": [],
+            "axes": [
+                {
+                    "endpoints": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+                    "anchors": [{"source_node": 1, "point": [0.0, 0.0, 0.0]}],
+                },
+                {
+                    "endpoints": [[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                    "anchors": [{"source_node": 2, "point": [0.0, 0.0, 0.0]}],
+                },
+            ],
+            "contacts": [],
+        },
+        {1: (0.0, 0.0, 0.0), 2: (1.0, 0.0, 0.0), 3: (0.0, 1.0, 0.0)},
+        [],
+        [
+            {"nodes": (1, 2), "axis": 0},
+            {"nodes": (1, 3), "axis": 1},
+        ],
+        1e-8,
+    )
+    assert unsupported["unintended_shared_node_count"] == 1
+    assert unsupported["unsupported_axis_axis_shared_node_count"] == 1
+
+    # Near-vertex regularization regression. Node 1 is an explicit source
+    # corner only 10 mm from exact multi-surface OCC junction node 2. The
+    # source corner may move to the exact junction because the short edge
+    # creates a severe sliver and is not an original source boundary edge.
+    regularization_data = {
+        "surfaces": [
+            {
+                "rings": [[
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.02, 0.0],
+                    [0.0, 1.0, 0.0],
+                ]],
+                "ring_source_nodes": [[10, 11, 12]],
+            },
+            {
+                "rings": [[
+                    [0.01, 1.0, 0.0],
+                    [0.01, 0.0, 1.0],
+                    [0.01, 1.0, 1.0],
+                ]],
+                "ring_source_nodes": [[20, 21, 22]],
+            },
+        ]
+    }
+    regularization_coords = {
+        1: (0.0, 0.0, 0.0),
+        2: (0.01, 0.0, 0.0),
+        3: (1.0, 0.02, 0.0),
+        4: (0.0, 1.0, 0.0),
+        5: (0.01, 1.0, 0.0),
+        6: (0.01, 0.0, 1.0),
+        7: (0.01, 1.0, 1.0),
+    }
+    regularization_triangles = [
+        {"nodes": (1, 2, 3), "source_surface": 0, "output_surface": 1, "stiffness": 10},
+        {"nodes": (1, 3, 4), "source_surface": 0, "output_surface": 1, "stiffness": 10},
+        {"nodes": (2, 5, 6), "source_surface": 1, "output_surface": 2, "stiffness": 20},
+        {"nodes": (2, 6, 7), "source_surface": 1, "output_surface": 2, "stiffness": 20},
+    ]
+    (
+        regularized_coords,
+        regularized_triangles,
+        regularized_bars,
+        regularization_report,
+    ) = regularize_near_vertex_junctions(
+        regularization_data,
+        regularization_coords,
+        regularization_triangles,
+        [],
+        0.05,
+        0.001,
+        1e-8,
+    )
+    assert regularization_report["accepted_count"] == 1
+    assert regularization_report["moved_node_count"] == 1
+    assert regularization_report["maximum_node_movement"] < 0.05
+    assert len(regularized_triangles) == 3
+    assert regularized_bars == []
+    assert regularized_coords[2] == (0.01, 0.0, 0.0)
+
+    # An isolated geometric point coincidence with no common source node,
+    # shared surface edge or declared mixed-dimensional contact must be split
+    # by identity while preserving exactly the same coordinates.
+    point_data = {
+        "surfaces": [
+            {
+                "rings": [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
+                "ring_source_nodes": [[100, 101, 102]],
+            },
+            {
+                "rings": [[[0.0, 0.0, 1.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]]],
+                "ring_source_nodes": [[200, 201, 202]],
+            },
+        ],
+        "axes": [],
+        "contacts": [],
+    }
+    point_coords = {
+        1: (0.5, 0.5, 0.5),
+        2: (1.0, 0.0, 0.0),
+        3: (0.0, 1.0, 0.0),
+        4: (1.0, 0.0, 1.0),
+        5: (0.0, 1.0, 1.0),
+    }
+    point_triangles = [
+        {"nodes": (1, 2, 3), "source_surface": 0, "output_surface": 1, "stiffness": 10},
+        {"nodes": (1, 4, 5), "source_surface": 1, "output_surface": 2, "stiffness": 20},
+    ]
+    point_audit = audit_semantic_shared_nodes(
+        point_data, point_coords, point_triangles, [], 1e-8
+    )
+    assert point_audit["unintended_shared_node_count"] == 1
+    split_coords, split_triangles, split_bars, split_report = split_unintended_shared_nodes(
+        point_coords, point_triangles, [], point_audit
+    )
+    assert split_report["split_shared_node_count"] == 1
+    assert split_report["created_duplicate_node_count"] == 1
+    assert split_bars == []
+    assert len(split_coords) == len(point_coords) + 1
+    assert split_coords[1] in split_coords.values()
+    assert audit_semantic_shared_nodes(
+        point_data, split_coords, split_triangles, split_bars, 1e-8
+    )["unintended_shared_node_count"] == 0
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", nargs="?", type=Path)
+    parser.add_argument("--output", type=Path, help="summary/full backend JSON")
+    parser.add_argument(
+        "--solver-mesh-output",
+        type=Path,
+        help="write only the backend-neutral topo-reconstruct-solver-mesh-v1 package",
+    )
+    parser.add_argument("--msh", type=Path)
+    parser.add_argument("--mesh-size", type=float)
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+
+    gmsh.initialize()
+    try:
+        if args.self_test:
+            result = self_test()
+        else:
+            if args.input is None:
+                parser.error("input is required unless --self-test is used")
+            result = run_backend(
+                json.loads(args.input.read_text()),
+                mesh_size_override=args.mesh_size,
+                write_msh=args.msh,
+            )
+        text = json.dumps(result, indent=2)
+        if args.output:
+            args.output.write_text(text)
+        if args.solver_mesh_output:
+            solver_mesh = result.get("solver_mesh")
+            audit = result.get("solver_mesh_audit", {})
+            if solver_mesh is None:
+                raise RuntimeError("backend result does not contain solver_mesh")
+            if audit.get("clean", False) and result.get("backend_ready", False):
+                args.solver_mesh_output.write_text(json.dumps(solver_mesh, indent=2))
+            else:
+                # Keep the diagnostic --output available while refusing a
+                # solver artifact on any backend blocker.
+                print(
+                    "refusing to write solver mesh because backend is not ready",
+                    file=__import__("sys").stderr,
+                )
+        print(text)
+        return 0 if result.get("backend_ready", False) else 2
+    finally:
+        gmsh.finalize()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

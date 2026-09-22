@@ -23,14 +23,15 @@ An interior opening can be closed only when all checks pass:
   the property region. A large opening collapsed by a bad solve is not accepted.
 - The remaining surface passes the normal transactional contour validator.
 
-Ordinary narrow openings that remain numerically valid are not closed. No
+Meaningful openings that remain numerically valid are retained. A
+sub-resolution micro-opening may be simplified when the transactional repair
+passes the local topology/geometry gates and records its provenance; it does
+not require preservation solely because it exists in the source. No
 model-specific IDs are used. Every applied change records source nodes/elements,
 source and candidate dimensions, and thresholds in `topology.simplified_holes`.
-No coordinates or material regions are deleted. Hole nodes remain mandatory
-interior mesh points; existing shared edges remain constraints. Axis contacts
-are assembled against the repaired surfaces. Missing points/constraints fail
-the trial topology check. The Python checker also verifies that all retained
-hole nodes occur in triangles of the repaired surface.
+Coordinates, material regions and structural ownership are otherwise preserved.
+Axis contacts are assembled against the repaired surfaces. Missing
+points/constraints fail the trial topology check.
 
 ## Full-model verification, 2026-09-19
 
