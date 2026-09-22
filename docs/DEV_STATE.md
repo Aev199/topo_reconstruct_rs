@@ -31,6 +31,12 @@ path.
    without moving their coordinates.
 8. Independent audits decide whether the result satisfies the geometry contract.
 
+Geotechnical policy: a sub-resolution micro-opening may be closed when the
+transactional repair remains valid, bounded and provenance-logged. Tiny
+openings do not require preservation solely because they exist in the source;
+meaningful openings and structural/material ownership still require the normal
+geometry gates.
+
 The old custom Rust mesher/junction implementation remains a fallback/reference
 until solver import is verified.
 

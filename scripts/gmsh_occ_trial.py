@@ -186,15 +186,30 @@ def normalize_input(data: dict, mesh_size_override: float | None) -> dict:
                 ),
                 "target_mesh_size": 0.75,
             },
+            # Coverage is an explicit readiness contract.  Older preview
+            # reports that omit either flag are incomplete until proven
+            # otherwise; silently treating an omitted flag as complete lets a
+            # partial legacy model reach the solver adapter.
             "source_coverage_complete": bool(
-                topology.get("all_surface_patches_built", True)
-                and axis_report.get("all_axes_built", True)
+                topology.get("all_surface_patches_built", False)
+                and axis_report.get("all_axes_built", False)
             ),
             "surfaces": surfaces,
             "axes": axes,
             "contacts": contacts,
             "blockers": [],
         }
+
+    # Keep the normalized object isolated from callers and make incomplete
+    # source coverage visible to the backend readiness gate for both input
+    # formats.  A diagnostic result is still useful, so this is a blocker
+    # rather than an input parsing error.
+    normalized = dict(normalized)
+    blockers = list(normalized.get("blockers", []))
+    if not bool(normalized.get("source_coverage_complete", False)):
+        if "incomplete_source_coverage" not in blockers:
+            blockers.append("incomplete_source_coverage")
+    normalized["blockers"] = blockers
 
     policy = normalized["policy"]
     if mesh_size_override is not None:
@@ -458,6 +473,224 @@ def node_source_owners(triangles: list[dict]) -> dict[int, set[int]]:
     return owners
 
 
+def _cross(a: Iterable[float], b: Iterable[float]) -> tuple[float, float, float]:
+    a = tuple(a)
+    b = tuple(b)
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+
+def _dot(a: Iterable[float], b: Iterable[float]) -> float:
+    return sum(x * y for x, y in zip(a, b))
+
+
+def _sub(a: Iterable[float], b: Iterable[float]) -> tuple[float, float, float]:
+    return tuple(x - y for x, y in zip(a, b))
+
+
+def _project_triangle(points: list[tuple[float, float, float]], drop: int) -> list[tuple[float, float]]:
+    axes = [index for index in range(3) if index != drop]
+    return [(point[axes[0]], point[axes[1]]) for point in points]
+
+
+def _polygon_area_2d(points: list[tuple[float, float]]) -> float:
+    return 0.5 * abs(sum(
+        points[index][0] * points[(index + 1) % len(points)][1]
+        - points[(index + 1) % len(points)][0] * points[index][1]
+        for index in range(len(points))
+    )) if points else 0.0
+
+
+def _clip_polygon_2d(
+    subject: list[tuple[float, float]],
+    start: tuple[float, float],
+    end: tuple[float, float],
+    orientation: float,
+    tolerance: float,
+) -> list[tuple[float, float]]:
+    if not subject:
+        return []
+
+    def signed(point: tuple[float, float]) -> float:
+        return orientation * (
+            (end[0] - start[0]) * (point[1] - start[1])
+            - (end[1] - start[1]) * (point[0] - start[0])
+        )
+
+    result = []
+    previous = subject[-1]
+    previous_inside = signed(previous) >= -tolerance
+    for current in subject:
+        current_inside = signed(current) >= -tolerance
+        if current_inside != previous_inside:
+            previous_value = signed(previous)
+            current_value = signed(current)
+            denominator = previous_value - current_value
+            fraction = previous_value / denominator if abs(denominator) > 0.0 else 0.0
+            result.append(
+                (
+                    previous[0] + fraction * (current[0] - previous[0]),
+                    previous[1] + fraction * (current[1] - previous[1]),
+                )
+            )
+        if current_inside:
+            result.append(current)
+        previous = current
+        previous_inside = current_inside
+    return result
+
+
+def _coplanar_triangle_overlap(
+    left: list[tuple[float, float, float]],
+    right: list[tuple[float, float, float]],
+    tolerance: float,
+) -> bool:
+    normal = _cross(_sub(left[1], left[0]), _sub(left[2], left[0]))
+    magnitude = math.sqrt(_dot(normal, normal))
+    if magnitude <= tolerance * tolerance:
+        return False
+    other_normal = _cross(_sub(right[1], right[0]), _sub(right[2], right[0]))
+    other_magnitude = math.sqrt(_dot(other_normal, other_normal))
+    if other_magnitude <= tolerance * tolerance:
+        return False
+    angular_tolerance = 1e-8
+    if math.sqrt(_dot(_cross(normal, other_normal), _cross(normal, other_normal))) > (
+        angular_tolerance * magnitude * other_magnitude
+    ):
+        return False
+    unit_normal = tuple(component / magnitude for component in normal)
+    if abs(_dot(unit_normal, _sub(right[0], left[0]))) > tolerance:
+        return False
+
+    drop = max(range(3), key=lambda index: abs(normal[index]))
+    left_2d = _project_triangle(left, drop)
+    right_2d = _project_triangle(right, drop)
+    orientation = (
+        (left_2d[1][0] - left_2d[0][0]) * (left_2d[2][1] - left_2d[0][1])
+        - (left_2d[1][1] - left_2d[0][1]) * (left_2d[2][0] - left_2d[0][0])
+    )
+    if abs(orientation) <= tolerance:
+        return False
+    clipped = right_2d
+    for index in range(3):
+        clipped = _clip_polygon_2d(
+            clipped,
+            left_2d[index],
+            left_2d[(index + 1) % 3],
+            1.0 if orientation > 0.0 else -1.0,
+            tolerance,
+        )
+    return _polygon_area_2d(clipped) > tolerance * tolerance
+
+
+def _repair_candidate_valid(
+    before_coords: dict[int, tuple[float, float, float]],
+    before_triangles: list[dict],
+    candidate_coords: dict[int, tuple[float, float, float]],
+    candidate_triangles: list[dict],
+    changed_nodes: set[int],
+    precision: float,
+) -> tuple[bool, str]:
+    """Validate one local repair transaction before committing its mapping.
+
+    The orientation check compares every affected surviving face with its
+    pre-operation normal.  A small AABB neighborhood supplies nearby faces for
+    duplicate-edge and coplanar-overlap checks; this avoids a quadratic
+    all-mesh comparison for every candidate while still catching the local
+    inversion from the review regression.
+    """
+    before_by_key = {
+        (tuple(item["nodes"]), index): item for index, item in enumerate(before_triangles)
+    }
+    before_by_nodes = defaultdict(list)
+    for index, item in enumerate(before_triangles):
+        before_by_nodes[tuple(item["nodes"])].append(index)
+    affected = [
+        index for index, item in enumerate(before_triangles)
+        if set(item["nodes"]) & changed_nodes
+    ]
+    if not affected:
+        return True, "unchanged"
+
+    remapped = []
+    for index, item in enumerate(candidate_triangles):
+        if len(set(item["nodes"])) < 3:
+            continue
+        remapped.append((index, item))
+    # Preserve the source surface's local manifold and reject duplicate faces.
+    local_faces: dict[tuple[int, tuple[int, ...]], int] = {}
+    local_edges: dict[tuple[int, tuple[int, int]], int] = defaultdict(int)
+    affected_candidate = []
+    for index, item in remapped:
+        nodes = tuple(item["nodes"])
+        key = (int(item["source_surface"]), tuple(sorted(nodes)))
+        if key in local_faces:
+            return False, "duplicate_surviving_face"
+        local_faces[key] = index
+        edges = (
+            tuple(sorted((nodes[0], nodes[1]))),
+            tuple(sorted((nodes[1], nodes[2]))),
+            tuple(sorted((nodes[2], nodes[0]))),
+        )
+        for edge in edges:
+            edge_key = (int(item["source_surface"]), edge)
+            local_edges[edge_key] += 1
+            if local_edges[edge_key] > 2:
+                return False, "non_manifold_local_edge"
+        if index < len(before_triangles) and set(before_triangles[index]["nodes"]) & changed_nodes:
+            affected_candidate.append((index, item))
+
+    # Compare the candidate normal with the current normal, so multiple safe
+    # transactions can be applied without relying on a global winding rule.
+    for index, item in affected_candidate:
+        old = before_triangles[index]
+        old_points = [before_coords[node] for node in old["nodes"]]
+        new_points = [candidate_coords[node] for node in item["nodes"]]
+        old_normal = _cross(_sub(old_points[1], old_points[0]), _sub(old_points[2], old_points[0]))
+        new_normal = _cross(_sub(new_points[1], new_points[0]), _sub(new_points[2], new_points[0]))
+        old_size = math.sqrt(_dot(old_normal, old_normal))
+        new_size = math.sqrt(_dot(new_normal, new_normal))
+        if old_size <= precision * precision or new_size <= precision * precision:
+            return False, "degenerate_surviving_face"
+        if _dot(old_normal, new_normal) <= 0.0:
+            return False, "inverted_surviving_face"
+
+    # Build a local AABB neighborhood around changed faces.  This is O(N) to
+    # gather candidates and O(k^2) only for the small local neighborhood.
+    candidate_faces = [item for _index, item in remapped]
+    changed_faces = [item for _index, item in affected_candidate]
+    if not changed_faces:
+        return True, "unchanged"
+    boxes = []
+    for item in changed_faces:
+        points = [candidate_coords[node] for node in item["nodes"]]
+        boxes.append((
+            tuple(min(point[axis] for point in points) - precision for axis in range(3)),
+            tuple(max(point[axis] for point in points) + precision for axis in range(3)),
+        ))
+    neighborhood = []
+    for item in candidate_faces:
+        points = [candidate_coords[node] for node in item["nodes"]]
+        low = tuple(min(point[axis] for point in points) for axis in range(3))
+        high = tuple(max(point[axis] for point in points) for axis in range(3))
+        if any(all(low[axis] <= box_high[axis] and high[axis] >= box_low[axis] for axis in range(3)) for box_low, box_high in boxes):
+            neighborhood.append(item)
+    for left_index, left in enumerate(changed_faces):
+        left_points = [candidate_coords[node] for node in left["nodes"]]
+        for right in neighborhood:
+            if left is right or left["nodes"] == right["nodes"]:
+                continue
+            if int(left["source_surface"]) != int(right["source_surface"]):
+                continue
+            right_points = [candidate_coords[node] for node in right["nodes"]]
+            if _coplanar_triangle_overlap(left_points, right_points, precision):
+                return False, "positive_local_overlap"
+    return True, "valid"
+
+
 def heal_micro_edges(
     coords: dict[int, tuple[float, float, float]],
     triangles: list[dict],
@@ -553,6 +786,37 @@ def heal_micro_edges(
                         "movement_kind": "micro_edge_healing",
                     }
                 )
+        # Apply one component transactionally.  A collapse that inverts,
+        # degenerates or overlaps a surviving local face is rejected while
+        # later independent components remain eligible.
+        tentative_mapping = dict(mapping)
+        tentative_mapping.update({node: representative for node in nodes if node != representative})
+        tentative_triangles = [
+            {**triangle, "nodes": tuple(tentative_mapping.get(node, node) for node in triangle["nodes"])}
+            for triangle in triangles
+        ]
+        valid, reason = _repair_candidate_valid(
+            {node: coords[node] for node in coords},
+            [
+                {**triangle, "nodes": tuple(mapping.get(node, node) for node in triangle["nodes"])}
+                for triangle in triangles
+            ],
+            coords,
+            tentative_triangles,
+            {node for node in nodes if node != representative},
+            precision,
+        )
+        if not valid:
+            diagnostics.append({
+                "nodes": sorted(nodes),
+                "representative": representative,
+                "status": "rejected_local_validity",
+                "reason": reason,
+                "maximum_movement": component_max,
+            })
+            unresolved += 1
+            continue
+        mapping = tentative_mapping
         maximum_movement = max(maximum_movement, component_max)
         diagnostics.append(
             {
@@ -767,6 +1031,9 @@ def regularize_near_vertex_junctions(
             skipped.append({**candidate, "status": "overlapping_candidate"})
             continue
 
+        prior_mapping = dict(mapping)
+        prior_coords = dict(result_coords)
+
         source_a = candidate["source_a"]
         source_b = candidate["source_b"]
         moves = []
@@ -872,6 +1139,28 @@ def regularize_near_vertex_junctions(
                     )
                 status = "two_weak_source_vertices_to_shared_midpoint"
         else:
+            continue
+
+        candidate_triangles = [
+            {**triangle, "nodes": tuple(mapping.get(node, node) for node in triangle["nodes"])}
+            for triangle in triangles
+        ]
+        before_triangles = [
+            {**triangle, "nodes": tuple(prior_mapping.get(node, node) for node in triangle["nodes"])}
+            for triangle in triangles
+        ]
+        valid, reason = _repair_candidate_valid(
+            prior_coords,
+            before_triangles,
+            result_coords,
+            candidate_triangles,
+            {int(move["from"]) for move in moves},
+            precision,
+        )
+        if not valid:
+            mapping = prior_mapping
+            result_coords = prior_coords
+            skipped.append({**candidate, "status": "rejected_local_validity", "reason": reason})
             continue
 
         used_nodes.update((a, b))
@@ -2052,6 +2341,56 @@ def build_solver_mesh_package(
     return package, audit
 
 
+def write_solver_mesh_msh(path: Path, solver_mesh: dict) -> None:
+    """Write the repaired solver package as a self-contained MSH 2 file.
+
+    This deliberately uses the compact solver vertices and elements rather
+    than the still-RAW OCC model.  Vertex indices remain distinct even when
+    coordinates coincide, preserving semantic identity after point splitting.
+    Physical groups encode source regions and stiffness for downstream import.
+    """
+    surface_groups = {
+        int(region["region"]): index + 1
+        for index, region in enumerate(solver_mesh.get("surface_regions", []))
+    }
+    bar_groups = {
+        int(region["region"]): index + 1 + len(surface_groups)
+        for index, region in enumerate(solver_mesh.get("bar_regions", []))
+    }
+    physical_names = []
+    for region in solver_mesh.get("surface_regions", []):
+        tag = surface_groups[int(region["region"])]
+        physical_names.append((2, tag, f"surface_region_{region['region']}_k{region['stiffness']}"))
+    for region in solver_mesh.get("bar_regions", []):
+        tag = bar_groups[int(region["region"])]
+        physical_names.append((1, tag, f"bar_region_{region['region']}_k{region['stiffness']}"))
+
+    lines = ["$MeshFormat", "2.2 0 8", "$EndMeshFormat", "$PhysicalNames", str(len(physical_names))]
+    lines.extend(f'{dimension} {tag} "{name}"' for dimension, tag, name in physical_names)
+    lines.extend(["$EndPhysicalNames", "$Nodes", str(len(solver_mesh.get("vertices", [])))])
+    for index, point in enumerate(solver_mesh.get("vertices", []), 1):
+        lines.append(f"{index} {float(point[0]):.17g} {float(point[1]):.17g} {float(point[2]):.17g}")
+    lines.extend(["$EndNodes", "$Elements"])
+    shell_elements = solver_mesh.get("shell_elements", [])
+    bar_elements = solver_mesh.get("bar_elements", [])
+    lines.append(str(len(shell_elements) + len(bar_elements)))
+    element_id = 1
+    for element in shell_elements:
+        region = int(element["region"])
+        physical = surface_groups[region]
+        nodes = " ".join(str(int(vertex) + 1) for vertex in element["vertices"])
+        lines.append(f"{element_id} 2 2 {physical} {physical} {nodes}")
+        element_id += 1
+    for element in bar_elements:
+        region = int(element["region"])
+        physical = bar_groups[region]
+        nodes = " ".join(str(int(vertex) + 1) for vertex in element["vertices"])
+        lines.append(f"{element_id} 1 2 {physical} {physical} {nodes}")
+        element_id += 1
+    lines.extend(["$EndElements", ""])
+    path.write_text("\n".join(lines))
+
+
 def run_backend(
     data: dict,
     mesh_size_override: float | None = None,
@@ -2323,6 +2662,8 @@ def run_backend(
     )
 
     blockers = list(data.get("blockers", []))
+    if not bool(data.get("source_coverage_complete", False)):
+        blockers.append("incomplete_source_coverage")
     blockers.extend(fragmentation.axis_build_blockers)
     blockers.extend(contact_embedding["blockers"])
     if surface_ownership_conflicts:
@@ -2350,8 +2691,8 @@ def run_backend(
     if not solver_mesh_audit["clean"]:
         blockers.append("solver_mesh_coverage_failure")
 
-    if write_msh:
-        gmsh.write(str(write_msh))
+    if write_msh and not blockers:
+        write_solver_mesh_msh(write_msh, solver_mesh)
 
     return {
         "format": RESULT_FORMAT,
@@ -2744,15 +3085,17 @@ def main() -> int:
             audit = result.get("solver_mesh_audit", {})
             if solver_mesh is None:
                 raise RuntimeError("backend result does not contain solver_mesh")
-            if not audit.get("clean", False):
-                raise RuntimeError(
-                    "refusing to write solver mesh because solver_mesh_audit is not clean"
+            if audit.get("clean", False) and result.get("backend_ready", False):
+                args.solver_mesh_output.write_text(json.dumps(solver_mesh, indent=2))
+            else:
+                # Keep the diagnostic --output available while refusing a
+                # solver artifact on any backend blocker.
+                print(
+                    "refusing to write solver mesh because backend is not ready",
+                    file=__import__("sys").stderr,
                 )
-            args.solver_mesh_output.write_text(
-                json.dumps(solver_mesh, indent=2)
-            )
         print(text)
-        return 0
+        return 0 if result.get("backend_ready", False) else 2
     finally:
         gmsh.finalize()
 
