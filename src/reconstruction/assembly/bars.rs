@@ -12,13 +12,13 @@ use std::collections::{BTreeMap, BTreeSet};
 mod repair;
 pub use repair::{Change as BoundaryChange, Repair as BoundaryRepair};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Anchor {
     pub source_node: u32,
     pub vertex: usize,
     pub t: f64,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Axis {
     pub source_axis: usize,
     pub endpoints: [usize; 2],
@@ -31,7 +31,7 @@ pub enum Location {
     Boundary,
     Interior,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Contact {
     Point {

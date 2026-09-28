@@ -462,3 +462,38 @@ Tests: duplicated nodes merge into one shared edge and are idempotent;
 duplicated bar anchors are kept; a wall end 30 mm short of a slab corner that
 is 10 mm off the wall axis merges into the moved corner; all under three
 scales, rigid transforms and reversed normals.
+
+## Axis-aware vertex merging, 2026-09-28
+
+Merges may now involve bar anchors. A bar anchor moves only as the end of its
+axes: the other end stays, and every other anchor is re-placed at its own
+parameter on the new straight line, keeping all planes of its surfaces
+(`Model::move_vertex` validates each). An interior anchor, an anchor shared
+with another axis, a move beyond the tolerance, or a merge of two vertices of
+one axis is rejected with its reason. After a merge the axes' endpoints and
+anchors and the point contacts refer to the kept vertex; parameters and spans
+are unchanged. Retained nodes of closed openings never move. The assembly
+checker treats a dropped source node as the node it was merged into.
+
+Private fixtures, all with the global surface audit **passing**:
+
+| | скала1 | типовая секция | тест 5 |
+|---|---:|---:|---:|
+| Coincident merges (rejected) | 3 (0) | 0 | 0 |
+| Wall-end merges | 0 | 0 | 6 |
+| Unrepresented junction segments | 0 | 0 | 0 |
+| Junction diagnostics | 0 | 0 | 0 |
+| Triangles below 20° / minimum angle | 73 / 2.39° | 0 / 20.21° | 28 / 6.98° |
+
+скала1 merges: two duplicated nodes (0 and 0.2 µm, the latter both bar ends)
+and a bar end 91 µm from a wall corner, moved 36 µm onto the wall plane with
+its bar. Surface/axis counts, source coverage, trial topology and the
+external-mesher gate are unchanged; reconciliation reports no problem. Debug
+and release outputs are identical.
+
+The implemented surface audit is complete for its scope; bar-bar
+intersections, isolated point contacts, non-parallel near misses, load and
+property transfer, and an actual MIDAS/PLAXIS import remain unverified.
+
+Tests: duplicated bar ends merge and both bars stay straight with the contact
+following the kept vertex; a bar passing through a duplicate is not bent.

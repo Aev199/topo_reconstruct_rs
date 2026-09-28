@@ -735,7 +735,7 @@ fn assemble_impl(
             }),
         }
     }
-    let axis_assembly = bars::assemble(
+    let mut axis_assembly = bars::assemble(
         mesh,
         source,
         &mut model,
@@ -748,41 +748,63 @@ fn assemble_impl(
         maximum_closure_movement.max(axis_assembly.maximum_additional_movement);
     // After axis repairs, which may still move boundary anchors: junctions
     // are derived from final coordinates and never move a vertex.
-    let mut interior = vec![BTreeSet::new(); model.surfaces.len()];
-    for contact in &axis_assembly.contacts {
-        if let bars::Contact::Point {
-            surface, vertex, ..
-        } = *contact
-        {
-            interior[surface].insert(vertex);
-        }
-    }
-    for hole in &simplified_holes {
-        for (s, surface) in model.surfaces.iter().enumerate() {
-            if surface.source_elements != hole.source_elements {
-                continue;
+    // Mandatory interior nodes per surface, the vertices that must stay
+    // (all bar vertices and retained nodes), and the retained nodes that no
+    // merge may move. Recomputed after merges, which renumber vertices.
+    let hole_nodes: Vec<(usize, Vec<usize>)> = simplified_holes
+        .iter()
+        .flat_map(|hole| {
+            let nodes: Vec<usize> = hole
+                .source_nodes
+                .iter()
+                .filter_map(|n| vertex_source_nodes.iter().position(|m| m == n))
+                .collect();
+            model
+                .surfaces
+                .iter()
+                .enumerate()
+                .filter(|(_, surface)| surface.source_elements == hole.source_elements)
+                .map(|(s, _)| (s, nodes.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let protected = |model: &Model, axis_assembly: &bars::Report| {
+        let mut interior = vec![BTreeSet::new(); model.surfaces.len()];
+        for contact in &axis_assembly.contacts {
+            if let bars::Contact::Point {
+                surface, vertex, ..
+            } = *contact
+            {
+                interior[surface].insert(vertex);
             }
-            for n in &hole.source_nodes {
-                if let Some(v) = vertex_source_nodes.iter().position(|m| m == n) {
-                    interior[s].insert(v);
-                }
-            }
         }
-    }
-    let mut locked: BTreeSet<usize> = interior.iter().flatten().copied().collect();
-    for axis in &axis_assembly.axes {
-        locked.extend(axis.endpoints);
-        locked.extend(axis.anchors.iter().map(|a| a.vertex));
-    }
+        let mut fixed = BTreeSet::new();
+        for (s, nodes) in &hole_nodes {
+            interior[*s].extend(nodes.iter().copied());
+            fixed.extend(nodes.iter().copied());
+        }
+        let mut locked: BTreeSet<usize> = interior.iter().flatten().copied().collect();
+        for axis in &axis_assembly.axes {
+            locked.extend(axis.endpoints);
+            locked.extend(axis.anchors.iter().map(|a| a.vertex));
+        }
+        (interior, locked, fixed)
+    };
+    let (_, _, fixed) = protected(&model, &axis_assembly);
     let coincident = match features {
         Some(_) => cleanup::merge_coincident(
             &mut model,
+            &mut cleanup::Bars {
+                axes: &mut axis_assembly.axes,
+                contacts: &mut axis_assembly.contacts,
+            },
             policy.minimum_edge,
-            &locked,
+            &fixed,
             &vertex_source_nodes,
         ),
         None => cleanup::MergeReport::default(),
     };
+    let (interior, locked, fixed) = protected(&model, &axis_assembly);
     let junctions = junctions::insert(
         &mut model,
         &junctions::Context {
@@ -794,12 +816,17 @@ fn assemble_impl(
     let wall_ends = match features {
         Some(features) if features.maximum_wall_end_snap > 0. => cleanup::merge_wall_ends(
             &mut model,
+            &mut cleanup::Bars {
+                axes: &mut axis_assembly.axes,
+                contacts: &mut axis_assembly.contacts,
+            },
             features.maximum_wall_end_snap,
-            &locked,
+            &fixed,
             &vertex_source_nodes,
         ),
         _ => cleanup::MergeReport::default(),
     };
+    let (interior, locked, _) = protected(&model, &axis_assembly);
     // A wall end left open by the junction pass may be closed by a merge;
     // its near-touch diagnostic is then obsolete.
     let mut junctions = junctions;

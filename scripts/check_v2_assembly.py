@@ -201,6 +201,21 @@ def check(data, baseline=None):
             for v in model["edges"][edge]:
                 assert abs(distance(surface, vertices[v])) <= epsilon
 
+    # Geotechnical merges give a dropped source node the kept vertex; both
+    # nodes then share one identity (the kept node).
+    merged = {}
+    for key in ("coincident_vertices", "wall_ends"):
+        for m in topology.get(key, {}).get("merged", []):
+            if m["dropped_source_node"] is not None and m["kept_source_node"] is not None:
+                merged[m["dropped_source_node"]] = m["kept_source_node"]
+
+    def identity(node):
+        seen = set()
+        while node in merged and node not in seen:
+            seen.add(node)
+            node = merged[node]
+        return node
+
     expected_bars = [s["element"] for a in frame["axes"] for s in a["spans"]]
     actual_bars = [s["element"] for a in bars["axes"] for s in a["spans"]]
     actual_bars += [e for i in bars["issues"] for e in i["source_elements"]]
@@ -213,10 +228,11 @@ def check(data, baseline=None):
         assert len(axis["endpoints"]) == 2
         a, b = (vertices[v] for v in axis["endpoints"])
         assert math.dist(a, b) > epsilon
-        assert [source_nodes[v] for v in axis["endpoints"]] == [frame["node_ids"][i] for i in original["endpoints"]]
+        assert [identity(n) for n in (source_nodes[v] for v in axis["endpoints"])] == [
+            identity(frame["node_ids"][i]) for i in original["endpoints"]]
         parameters = {}
         for anchor in axis["anchors"]:
-            assert source_nodes[anchor["vertex"]] == anchor["source_node"]
+            assert identity(source_nodes[anchor["vertex"]]) == identity(anchor["source_node"])
             assert 0 <= anchor["t"] <= 1
             interpolated = [x + (y - x) * anchor["t"] for x, y in zip(a, b)]
             assert math.dist(interpolated, vertices[anchor["vertex"]]) <= epsilon

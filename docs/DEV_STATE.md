@@ -31,9 +31,9 @@ subdivision of every junction edge. Verified on all three private models:
 
 | Global surface audit | скала1 | типовая секция | тест 5 |
 |---|---:|---:|---:|
-| Unrepresented junction segments (before → after) | 520 → 5 | 400 → 0 | 2194 → 0 |
-| Segments lacking shared mesh edges | 455 → 5 | 292 → 0 | 2194 → 0 |
-| Audit passed | no | yes | yes |
+| Unrepresented junction segments (before → after) | 520 → 0 | 400 → 0 | 2194 → 0 |
+| Segments lacking shared mesh edges | 455 → 0 | 292 → 0 | 2194 → 0 |
+| Audit passed | yes | yes | yes |
 
 Everywhere: 0 invalid surfaces, 0 coplanar overlaps, 0 unresolved source
 elements, trial topology and external-mesher gate pass, surface/axis counts
@@ -46,8 +46,8 @@ aligns stacked walls to the axis of the wall below within 50 mm
 redundant collinear vertices at short edges within 50 mm
 (`assembly::cleanup`), audit still passing. Tolerances are CLI options:
 `--v2-stack-offset`, `--v2-wall-end-snap`, `--v2-console-width`.
-Duplicated vertices and wall ends next to contour corners are merged
-(`assembly::cleanup`, `Model::merge_vertices`).
+Duplicated vertices and wall ends next to contour corners are merged,
+carrying bar axes along (`assembly::cleanup`, `Model::merge_vertices`).
 
 Mesh quality (below 20°): скала1 163 → 73 (min 2.39°), типовая секция 0,
 тест 5 28 (min 6.98°, none below 5°). The тест 5 baseline (53) was not comparable: its
@@ -55,27 +55,25 @@ slab meshes ignored 2194 junction segments.
 
 ## Current blockers
 
-1. скала1: one surface pair (5 segments) remains unrepresented. A bar anchor
-   lies 36 µm off the plane of a wall whose corner is 0.09 mm away; two other
-   duplicated nodes are both bar anchors. Merging them requires moving bar
-   anchors together with their axes (axis re-solve after a merge).
-2. тест 5: 28 triangles below 20° (minimum 6.98°); no unrepresented
-   junctions.
+No failing item in the implemented surface audit. Remaining quality: тест 5
+has 28 triangles below 20° (minimum 6.98°), скала1 73 (minimum 2.39°); the
+user accepted this level for a trial MIDAS import.
 
 ## Next coherent development batch
 
 ### Goal
 
-Axis-aware vertex merging, so bar anchors can join merges within the
-tolerances, and the global surface audit passes on all three fixtures.
+Close the audit scope and verify the handoff: bar-bar intersections, isolated
+point contacts, non-parallel near misses, and load/property transfer; then an
+actual MIDAS/PLAXIS import of one fixture.
 
 ### Required approach
 
-- Merge a bar anchor only by moving its whole axis consistently (all anchors
-  stay on one straight line, spans and parameters preserved), within the
-  existing axis movement budgets.
-- Extend the independent audit to near misses and bar-bar intersections.
-- Regression cases with transforms and idempotence.
+- Extend the independent auditor to the missing classes first, with analytic
+  regression cases, and measure all three fixtures.
+- Repair only what the audit shows, under the existing tolerances and
+  provenance rules.
+- Keep `export_ready` false until an import is demonstrated.
 
 ### Also pending
 
