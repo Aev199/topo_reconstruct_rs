@@ -31,8 +31,8 @@ subdivision of every junction edge. Verified on all three private models:
 
 | Global surface audit | скала1 | типовая секция | тест 5 |
 |---|---:|---:|---:|
-| Unrepresented junction segments (before → after) | 520 → 7 | 400 → 0 | 2194 → 0 |
-| Segments lacking shared mesh edges | 455 → 7 | 292 → 0 | 2194 → 0 |
+| Unrepresented junction segments (before → after) | 520 → 5 | 400 → 0 | 2194 → 0 |
+| Segments lacking shared mesh edges | 455 → 5 | 292 → 0 | 2194 → 0 |
 | Audit passed | no | yes | yes |
 
 Everywhere: 0 invalid surfaces, 0 coplanar overlaps, 0 unresolved source
