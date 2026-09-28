@@ -658,3 +658,21 @@ angle 0.00 -> 0.24 degrees. Two junction diagnostics remain (a 19.6 mm near
 touch left open, one crossing split refused as a short edge); the audit
 confirms the geometry they concern is connected. скала1, типовая секция,
 тест 5: output byte-identical; debug and release outputs identical.
+
+## Short edges between needed corners, 2026-09-28
+
+All ten triangles below 1 degree on тест 6 sat at model edges of 1-9 mm
+between two needed corners (for example the ends of a lower and an upper
+wall 3 mm apart on one slab line), which no earlier rule touched: redundant
+collinear vertices are removed and wall ends snap to contour corners, but
+two corners stay. `cleanup::collapse_short_edges` (`--v2-edge-collapse`,
+default 0.01 m) merges the ends of a surface edge shorter than the
+tolerance into the vertex of more surfaces, shortest first, keeping every
+plane; a bar node on such an edge is not merged (`bar_node_on_collapsed_edge`).
+Merges are reported in `topology.short_edge_merges`.
+
+тест 6: 29 edges collapsed (up to 9.4 mm); minimum angle 0.24 -> 3.33
+degrees, triangles below 1/5/20 degrees 10/36/326 -> 0/6/271; strict audit
+still passing. тест 5: 2 edges (6.7 mm), mesh metrics unchanged. скала1 and
+типовая секция: no such edge, unchanged. A 20 mm step between wall ends is
+kept (test).

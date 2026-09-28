@@ -172,7 +172,18 @@ fn merge(
     }
     let mut trial = model.clone();
     move_with_axes(&mut trial, bars.axes, keep, target, limit)?;
-    move_with_axes(&mut trial, bars.axes, drop, target, limit)?;
+    // Ends of one edge: the edge collapses in the merge itself.
+    if model.edge_between(drop, keep).is_some() {
+        if bars
+            .axes
+            .iter()
+            .any(|a| a.endpoints.contains(&drop) || a.anchors.iter().any(|x| x.vertex == drop))
+        {
+            return Err("bar_node_on_collapsed_edge".into());
+        }
+    } else {
+        move_with_axes(&mut trial, bars.axes, drop, target, limit)?;
+    }
     trial
         .merge_vertices(drop, keep)
         .map_err(|e| format!("merge_{e:?}"))?;
@@ -290,6 +301,80 @@ pub fn merge_coincident(
         }
     }
     report
+}
+
+/// Collapse surface edges shorter than `tolerance` whose two ends are both
+/// needed corners (for example the ends of a lower and an upper wall a few
+/// millimetres apart on one slab line): the ends merge into one vertex,
+/// shortest edge first, keeping every plane and never bending a bar. Such
+/// an edge cannot hold elements of any useful size.
+pub fn collapse_short_edges(
+    model: &mut Model,
+    bars: &mut Bars<'_>,
+    tolerance: f64,
+    fixed: &BTreeSet<usize>,
+    source_nodes: &[u32],
+) -> MergeReport {
+    let mut report = MergeReport {
+        tolerance,
+        ..Default::default()
+    };
+    let mut tried = BTreeSet::new();
+    loop {
+        let used: BTreeSet<usize> = (0..model.surfaces.len())
+            .flat_map(|s| model.surface_edges(s).collect::<Vec<_>>())
+            .collect();
+        let shortest = used
+            .iter()
+            .map(|&e| {
+                let [a, b] = model.edges[e];
+                let d = DVec3::from_array(model.vertices[a])
+                    .distance(DVec3::from_array(model.vertices[b]));
+                (d, a.min(b), a.max(b))
+            })
+            .filter(|&(d, a, b)| d < tolerance && !tried.contains(&(a, b)))
+            .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
+        let Some((d, a, b)) = shortest else {
+            return report;
+        };
+        tried.insert((a, b));
+        // Keep the vertex of more surfaces.
+        let (drop, keep) = if users(model, a).len() > users(model, b).len() {
+            (b, a)
+        } else {
+            (a, b)
+        };
+        let surfaces = {
+            let mut s = users(model, drop);
+            s.extend(users(model, keep));
+            s.sort_unstable();
+            s.dedup();
+            s
+        };
+        let kept_from = model.vertices[keep];
+        match merge(model, bars, drop, keep, tolerance, fixed) {
+            Ok(movement) => report.merged.push(MergedVertex {
+                kind: "short_edge".into(),
+                dropped: drop,
+                kept: keep,
+                dropped_source_node: source_nodes.get(drop).copied(),
+                kept_source_node: source_nodes.get(keep).copied(),
+                distance: d,
+                kept_movement: movement,
+                kept_from,
+                surfaces,
+            }),
+            Err(reason) => report.rejected.push(RejectedMerge {
+                vertices: [drop, keep],
+                source_nodes: [
+                    source_nodes.get(drop).copied(),
+                    source_nodes.get(keep).copied(),
+                ],
+                distance: d,
+                reason,
+            }),
+        }
+    }
 }
 
 /// Merge the free end of a junction line (a wall end inside a surface) into
@@ -927,6 +1012,48 @@ mod tests {
                 &[],
             );
             assert!(again.merged.is_empty() && again.rejected.is_empty());
+        }
+    }
+
+    #[test]
+    fn wall_ends_millimetres_apart_on_a_slab_collapse_but_a_step_stays() {
+        for place in Placement::all() {
+            for (upper_end, merged) in [(2.997, 1), (2.98, 0)] {
+                // Lower and upper walls in one plane end 3 mm (or 20 mm)
+                // apart on the slab line.
+                let mut m = build(
+                    &place,
+                    &[
+                        slab(0., 4.),
+                        wall(1., 3., -2., 0.),
+                        wall(1., upper_end, 0., 2.),
+                    ],
+                );
+                let j = run(&mut m);
+                assert!(j.issues.is_empty(), "{:?}", j.issues);
+                let tolerance = 0.01 * place.scale;
+                let r =
+                    collapse_short_edges(&mut m, &mut no_bars(), tolerance, &BTreeSet::new(), &[]);
+                assert_eq!(r.merged.len(), merged, "{:?}", r.rejected);
+                let shortest = (0..m.surfaces.len())
+                    .flat_map(|s| m.surface_edges(s).collect::<Vec<_>>())
+                    .map(|e| {
+                        let [a, b] = m.edges[e];
+                        DVec3::from_array(m.vertices[a]).distance(DVec3::from_array(m.vertices[b]))
+                    })
+                    .fold(f64::INFINITY, f64::min);
+                if merged == 1 {
+                    assert!(shortest >= tolerance);
+                    // Every surface stays planar and valid; the lower wall
+                    // corner is unchanged (it has more surfaces).
+                    let corner = place.point([3., 2., 0.]);
+                    assert!(m.vertices.iter().any(|&v| DVec3::from_array(v)
+                        .distance(DVec3::from_array(corner))
+                        < 1e-9 * place.scale.max(1.)));
+                } else {
+                    assert!((shortest - 0.02 * place.scale).abs() < 1e-6 * place.scale);
+                }
+            }
         }
     }
 

@@ -60,8 +60,8 @@ mesh-level connectivity and missing-property checks (2026-09-28). `тест 6`
 (69 MB, 490k elements, converted mesh) assembles completely in about 80 s.
 Remaining on тест 6:
 
-1. trial mesh quality: 10 triangles below 1 degree (minimum 0.24), 326
-   below 20 degrees of 403200;
+1. trial mesh quality: minimum angle 3.33 degrees, 6 triangles below 5
+   and 271 below 20 degrees of 402963 (after collapsing short edges);
 2. 203 surface near misses (review items, not inspected individually);
 3. two junction diagnostics: a 19.6 mm near touch left open and one
    crossing split refused as a short edge.

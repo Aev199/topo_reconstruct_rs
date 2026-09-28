@@ -28,6 +28,9 @@ pub struct FeaturePolicy {
     /// that is treated as a crack of the source mesh and left out of the
     /// region contour (model units, default 0.01 m; 0 disables).
     pub maximum_crack_width: f64,
+    /// Surface edges shorter than this whose ends are both needed corners
+    /// collapse into one vertex (model units, default 0.01 m; 0 disables).
+    pub maximum_collapsed_edge: f64,
 }
 impl Default for FeaturePolicy {
     fn default() -> Self {
@@ -38,6 +41,7 @@ impl Default for FeaturePolicy {
             maximum_stack_offset: 0.05,
             maximum_wall_end_snap: 0.05,
             maximum_crack_width: 0.01,
+            maximum_collapsed_edge: 0.01,
         }
     }
 }

@@ -72,6 +72,8 @@ pub struct Report {
     pub bar_ends: cleanup::MergeReport,
     /// Surface vertices identified with nearly coincident bar nodes.
     pub bar_anchors: cleanup::MergeReport,
+    /// Short edges between needed corners collapsed into one vertex.
+    pub short_edge_merges: cleanup::MergeReport,
     /// Region contours rebuilt across cracks of the source mesh.
     pub cracks: Vec<cracks::Closure>,
     pub issues: Vec<Issue>,
@@ -497,6 +499,8 @@ pub fn assemble_geotechnical(
         || features.maximum_wall_end_snap < 0.
         || !features.maximum_crack_width.is_finite()
         || features.maximum_crack_width < 0.
+        || !features.maximum_collapsed_edge.is_finite()
+        || features.maximum_collapsed_edge < 0.
     {
         return Err("invalid feature simplification policy");
     }
@@ -979,6 +983,22 @@ fn assemble_impl(
         ),
         _ => cleanup::MergeReport::default(),
     };
+    let short_edge_merges = match features {
+        Some(features) if features.maximum_collapsed_edge > 0. => {
+            let (_, _, fixed) = protected(&model, &axis_assembly);
+            cleanup::collapse_short_edges(
+                &mut model,
+                &mut cleanup::Bars {
+                    axes: &mut axis_assembly.axes,
+                    contacts: &mut axis_assembly.contacts,
+                },
+                features.maximum_collapsed_edge,
+                &fixed,
+                &vertex_source_nodes,
+            )
+        }
+        _ => cleanup::MergeReport::default(),
+    };
     let (interior, locked, _) = protected(&model, &axis_assembly);
     // A wall end left open by the junction pass may be closed by a merge;
     // its near-touch diagnostic is then obsolete.
@@ -1040,6 +1060,7 @@ fn assemble_impl(
         wall_ends,
         bar_ends,
         bar_anchors,
+        short_edge_merges,
         cracks,
         issues,
         maximum_closure_movement,
