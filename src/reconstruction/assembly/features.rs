@@ -20,6 +20,10 @@ pub struct FeaturePolicy {
     /// units). The default, 0.05 m, equals the default junction movement
     /// limit that bounds every closing vertex.
     pub maximum_stack_offset: f64,
+    /// Largest move closing a wall end onto the axis of another wall, and
+    /// the edge length below which redundant collinear vertices are removed
+    /// (model units, default 0.05 m).
+    pub maximum_wall_end_snap: f64,
 }
 impl Default for FeaturePolicy {
     fn default() -> Self {
@@ -28,6 +32,7 @@ impl Default for FeaturePolicy {
             maximum_filled_area_ratio: 0.001,
             maximum_console_width: 0.25,
             maximum_stack_offset: 0.05,
+            maximum_wall_end_snap: 0.05,
         }
     }
 }
@@ -227,6 +232,7 @@ mod tests {
             maximum_filled_area_ratio: 0.000001,
             maximum_console_width: 0.,
             maximum_stack_offset: 0.,
+            maximum_wall_end_snap: 0.,
             ..FeaturePolicy::default()
         };
         assert!(simplify(&mut loops, &mesh, &points, &plane, 1e-7, &policy, 0, &[12]).is_empty());

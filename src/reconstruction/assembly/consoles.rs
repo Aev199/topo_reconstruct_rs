@@ -562,6 +562,7 @@ mod tests {
             &junctions::Context {
                 interior: &interior,
                 locked: &locked,
+                wall_end_tolerance: 0.,
             },
         );
         assert!(j.issues.is_empty(), "{:?}", j.issues);

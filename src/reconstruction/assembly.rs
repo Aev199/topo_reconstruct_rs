@@ -1,6 +1,7 @@
 //! Surface topology preview. Engineering closure tolerance is distinct from
 //! numerical planarity. Mechanical ties and mesh readiness are not inferred.
 pub mod bars;
+pub mod cleanup;
 pub mod consoles;
 mod features;
 mod holes;
@@ -60,6 +61,8 @@ pub struct Report {
     pub consoles: consoles::Report,
     /// Walls aligned to the plane of the wall carrying them (geotechnical).
     pub stacked_walls: stacking::Report,
+    /// Redundant collinear vertices removed at short edges (geotechnical).
+    pub short_edges: cleanup::Report,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -416,6 +419,8 @@ pub fn assemble_geotechnical(
         || features.maximum_console_width < 0.
         || !features.maximum_stack_offset.is_finite()
         || features.maximum_stack_offset < 0.
+        || !features.maximum_wall_end_snap.is_finite()
+        || features.maximum_wall_end_snap < 0.
     {
         return Err("invalid feature simplification policy");
     }
@@ -770,6 +775,7 @@ fn assemble_impl(
         &junctions::Context {
             interior: &interior,
             locked: &locked,
+            wall_end_tolerance: features.map_or(0., |f| f.maximum_wall_end_snap),
         },
     );
     let consoles = match features {
@@ -784,6 +790,15 @@ fn assemble_impl(
             },
         ),
         None => consoles::Report::default(),
+    };
+    let short_edges = match features {
+        Some(features) if features.maximum_wall_end_snap > 0. => cleanup::remove_short_edges(
+            &mut model,
+            features.maximum_wall_end_snap,
+            &locked,
+            &vertex_source_nodes,
+        ),
+        _ => cleanup::Report::default(),
     };
     Ok(Report {
         policy: policy.clone(),
@@ -801,6 +816,7 @@ fn assemble_impl(
         junctions,
         consoles,
         stacked_walls,
+        short_edges,
         issues,
         maximum_closure_movement,
         rejected_vertices,

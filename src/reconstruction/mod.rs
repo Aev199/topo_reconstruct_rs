@@ -225,6 +225,118 @@ impl Model {
             .collect()
     }
 
+    /// Remove a vertex joining exactly two collinear edges, replacing them
+    /// with one edge in every surface that uses them. The vertex must lie on
+    /// the joined segment within `max(precision, deviation)`; contours change
+    /// by at most that distance. Fails if the vertex has another edge, the
+    /// edges have different users, or a resulting contour is invalid. The
+    /// model is unchanged on error.
+    pub fn remove_vertex(&mut self, vertex: usize, deviation: f64) -> Result<usize, Error> {
+        let incident: Vec<usize> = (0..self.edges.len())
+            .filter(|&e| {
+                self.edges[e].contains(&vertex)
+                    && (0..self.surfaces.len()).any(|s| self.surface_edges(s).any(|x| x == e))
+            })
+            .collect();
+        let [e1, e2] = incident[..] else {
+            return Err(Error::InvalidVertex);
+        };
+        let other = |e: usize| {
+            let [a, b] = self.edges[e];
+            if a == vertex {
+                b
+            } else {
+                a
+            }
+        };
+        let (p, q) = (other(e1), other(e2));
+        let users = |e: usize| -> Vec<usize> {
+            (0..self.surfaces.len())
+                .filter(|&s| self.surface_edges(s).any(|x| x == e))
+                .collect()
+        };
+        let surfaces = users(e1);
+        if surfaces != users(e2) || p == q {
+            return Err(Error::InvalidVertex);
+        }
+        let (pp, pq, pv) = (
+            DVec3::from_array(self.vertices[p]),
+            DVec3::from_array(self.vertices[q]),
+            DVec3::from_array(self.vertices[vertex]),
+        );
+        let d = pq - pp;
+        let t = (pv - pp).dot(d) / d.length_squared();
+        if !(t > 0. && t < 1.) || pv.distance(pp + d * t) > self.precision.max(deviation) {
+            return Err(Error::NonPlanar);
+        }
+        for &s in &surfaces {
+            let embedded = &self.surfaces[s].embedded_edges;
+            if embedded.contains(&e1) != embedded.contains(&e2) {
+                return Err(Error::InvalidRing);
+            }
+        }
+        let key = [p.min(q), p.max(q)];
+        if let Some(&existing) = self.edge_index.get(&key) {
+            if surfaces
+                .iter()
+                .any(|&s| self.surface_edges(s).any(|x| x == existing))
+            {
+                return Err(Error::InvalidRing);
+            }
+        }
+        // Validate all new contours before mutation.
+        let mut updates = vec![];
+        for &s in &surfaces {
+            let surface = &self.surfaces[s];
+            let mut rings = vec![];
+            let mut ring_changed = false;
+            for ring in &surface.boundaries {
+                let ids: Vec<usize> = ring
+                    .iter()
+                    .map(|e| {
+                        let [a, b] = self.edges[e.edge];
+                        if e.reversed {
+                            b
+                        } else {
+                            a
+                        }
+                    })
+                    .filter(|&v| {
+                        let keep = v != vertex;
+                        ring_changed |= !keep;
+                        keep
+                    })
+                    .collect();
+                rings.push(ids);
+            }
+            let contours = self.contours(surface.plane, &rings)?;
+            updates.push((s, rings, contours, ring_changed));
+        }
+        let merged = *self.edge_index.entry(key).or_insert_with(|| {
+            self.edges.push(key);
+            self.edges.len() - 1
+        });
+        for (s, rings, contours, ring_changed) in updates {
+            if ring_changed {
+                let boundaries = self.intern(&rings);
+                let surface = &mut self.surfaces[s];
+                surface.boundaries = boundaries;
+                surface.contours = contours;
+            }
+            let surface = &mut self.surfaces[s];
+            if surface.embedded_edges.contains(&e1) {
+                surface.embedded_edges.retain(|&e| e != e1 && e != e2);
+                surface.embedded_edges.push(merged);
+            }
+        }
+        for e in [e1, e2] {
+            if !self.orphaned_edges.contains(&e) {
+                self.orphaned_edges.push(e);
+            }
+        }
+        Ok(merged)
+    }
+
     /// Replace the material domain of a surface: new rings (exterior first)
     /// and embedded edges, validated like a new surface. Plane and source
     /// provenance are kept. Edges no longer used by any surface are recorded

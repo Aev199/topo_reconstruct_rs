@@ -42,10 +42,13 @@ unchanged, 0 reconciliation problems. Debug and release outputs are identical.
 Geotechnical assembly trims thin consoles beyond junction lines
 (`assembly::consoles`; тест 5: 26.61 m² of 0.10–0.19 m slab consoles) and
 aligns stacked walls to the axis of the wall below within 50 mm
-(`assembly::stacking`; тест 5: 8 walls, 25 mm), audit still passing.
+(`assembly::stacking`; тест 5: 8 walls, 25 mm), closes wall ends and removes
+redundant collinear vertices at short edges within 50 mm
+(`assembly::cleanup`), audit still passing. Tolerances are CLI options:
+`--v2-stack-offset`, `--v2-wall-end-snap`, `--v2-console-width`.
 
 Mesh quality (below 20°): скала1 163 → 73 (min 2.39°), типовая секция 0,
-тест 5 131 (min 1.59°). The тест 5 baseline (53) was not comparable: its
+тест 5 37 (min 6.98°, none below 5°). The тест 5 baseline (53) was not comparable: its
 slab meshes ignored 2194 junction segments.
 
 ## Current blockers
@@ -56,27 +59,25 @@ slab meshes ignored 2194 junction segments.
    vertex that anchors a bar (`junction_vertex_near_edge_end`). Both need an
    explicit vertex-identity rule (merge with provenance, or a declared seam),
    never coordinate welding.
-2. тест 5: wall ends 5–30 mm short of, or beyond, the axis of a
-   perpendicular wall leave short edges on junction chains and the remaining
-   acute triangles. Needs an evidence-based wall-end snap tolerance (above
-   the current 1 mm); a decision for the user.
+2. тест 5: six wall ends stop 43–49 mm from a slab corner lying 11 mm off
+   the wall axis; five short edges remain. Closing them needs vertex merging
+   with a moved corner (a vertex-identity decision).
 
 ## Next coherent development batch
 
 ### Goal
 
-Wall-end snapping to perpendicular wall axes and vertex identity with
-provenance, so millimetre offsets stop forcing tiny elements and the global
-audit passes on all three fixtures.
+Vertex identity with provenance: coincident distinct source vertices
+(скала1) and near-coincident vertices left after wall-end closure (тест 5),
+so the global audit passes on all three fixtures.
 
 ### Required approach
 
-- Wall end (vertical contour edge) within an agreed tolerance of a parallel
-  junction line of a perpendicular wall: move the end onto that axis only
-  when every plane of its vertices is kept; record each move.
-- Classify coincident distinct source vertices: same support planes and no
+- Coincident distinct source vertices with the same support planes and no
   release/hinge information → merge identity with provenance; otherwise a
   declared seam the auditor accepts explicitly.
+- A wall end near a contour corner: merge only if the corner can move onto
+  the wall axis within the wall-end tolerance, keeping all its planes.
 - Extend the independent audit to near misses.
 - Regression cases with transforms and idempotence.
 

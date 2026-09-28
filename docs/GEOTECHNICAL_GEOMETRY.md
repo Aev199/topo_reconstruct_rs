@@ -373,3 +373,51 @@ Tests: an FE-to-mesh case (upper wall 25 mm off, resting on the slab without
 shared nodes) under three scales and rigid transforms checks the alignment,
 seven identified nodes, full mesh quality and one shared junction line for
 both walls and the slab; conservative assembly leaves the walls unchanged.
+
+## Wall ends, redundant vertices and CLI tolerances, 2026-09-28
+
+User decision: close wall-end offsets up to 50 mm, and make the tolerances
+configurable. The remaining acute triangles on тест 5 had two causes:
+
+- A source node left on a straight contour or junction line a few
+  millimetres from a wall end (typically the slab node where a wall stood
+  before stacked alignment). `assembly::cleanup` removes a vertex joining
+  exactly two edges with identical users when it bounds an edge shorter than
+  the wall-end tolerance, is not a bar anchor or retained node, and lies within
+  1/1000 of the tolerance of the straight line of its neighbours (50 µm at
+  50 mm). Contours change by at most that deviation, which is reported per
+  vertex; real corners are never removed.
+- The free end of a junction line (a wall end inside a slab) short of another
+  line of the same surface. The in-surface near-touch rule now moves such an
+  end up to the wall-end tolerance (other vertices still less than the minimum
+  edge). The target is the intersection of every plane of the vertex with the
+  planes of the target edge, so the wall keeps its plane; an oblique target
+  requiring a longer move is rejected and reported (`embedded_near_touch`).
+
+Command-line options (model units; 0 disables the rule):
+
+| Option | Default | Controls |
+|---|---:|---|
+| `--v2-stack-offset` | 0.05 | stacked-wall alignment tolerance; the vertex closure movement limit is raised to at least this value |
+| `--v2-wall-end-snap` | 0.05 | wall-end closure and redundant-vertex short-edge threshold |
+| `--v2-console-width` | 0.25 | maximum trimmed console width |
+
+They apply to geotechnical assembly only; `--v2-preserve-details` ignores
+them.
+
+тест 5 (private), after stacked alignment → after this batch: redundant
+vertices removed 16 (maximum deviation 10.8 µm), wall ends closed 8 (largest
+move 0.2 mm; the rest were already within the minimum edge), triangles 36780 →
+36513, below 20° 131 → 37, below 5° 25 → 0, minimum angle 1.59° → 6.98°.
+The global surface audit still passes. скала1 and типовая секция are unchanged.
+Debug and release outputs are identical.
+
+Six wall ends on тест 5 (three walls on two levels) stop 43–49 mm from a slab
+contour corner that itself lies 11 mm off the wall axis. Closing them requires
+merging two vertices and moving the corner, i.e. a vertex-identity decision;
+they are reported, not repaired. Five short edges remain.
+
+Tests: a wall end 30 mm short of a perpendicular wall axis closes with a
+50 mm tolerance and stays open without it; a stray collinear contour node is
+removed while a locked one and a real 12 mm notch are kept; all under three
+scales, rigid transforms and reversed normals.

@@ -73,6 +73,30 @@ struct Args {
     /// Сохранить даже вырожденные отверстия вместо геотехнического упрощения
     #[arg(long)]
     v2_preserve_details: bool,
+
+    /// v2, геотехнический режим: допуск сведения стены на ось нижней несущей
+    /// стены (смещение осей стен по этажам), в единицах модели. 0 — отключить.
+    /// Предел перемещения вершин при замыкании поднимается до этого значения.
+    #[arg(long, default_value_t = 0.05)]
+    v2_stack_offset: f64,
+
+    /// v2, геотехнический режим: допуск притяжки торца стены к оси другой
+    /// стены и порог удаления лишних коллинеарных вершин у коротких рёбер,
+    /// в единицах модели. 0 — отключить.
+    #[arg(long, default_value_t = 0.05)]
+    v2_wall_end_snap: f64,
+
+    /// v2, геотехнический режим: максимальная ширина обрезаемой консоли за
+    /// линией стыка, в единицах модели. 0 — не обрезать.
+    #[arg(long, default_value_t = 0.25)]
+    v2_console_width: f64,
+}
+
+/// Geotechnical simplification tolerances of the v2 pipeline (model units).
+struct V2Tolerances {
+    stack_offset: f64,
+    wall_end_snap: f64,
+    console_width: f64,
 }
 
 fn run_v2_preview(
@@ -81,6 +105,7 @@ fn run_v2_preview(
     iterations: usize,
     include_mesh: bool,
     preserve_details: bool,
+    tolerances: &V2Tolerances,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use topo_reconstruct_rs::{
         parsers::LiraParser as V2LiraParser,
@@ -124,9 +149,19 @@ fn run_v2_preview(
         },
         3,
     )?;
+    for (name, value) in [
+        ("--v2-stack-offset", tolerances.stack_offset),
+        ("--v2-wall-end-snap", tolerances.wall_end_snap),
+        ("--v2-console-width", tolerances.console_width),
+    ] {
+        if !value.is_finite() || value < 0. {
+            return Err(format!("{name} must be a finite non-negative length").into());
+        }
+    }
     let assembly_policy = assembly::Policy {
         closure_tolerance: 0.001,
-        junction_movement_limit: 0.05,
+        // A stacked wall moves by its offset when closing onto the lower axis.
+        junction_movement_limit: tolerances.stack_offset.max(0.05),
         precision: 1e-7,
         minimum_edge: 0.001,
     };
@@ -137,7 +172,12 @@ fn run_v2_preview(
             &mesh,
             &result,
             &assembly_policy,
-            &assembly::FeaturePolicy::default(),
+            &assembly::FeaturePolicy {
+                maximum_console_width: tolerances.console_width,
+                maximum_stack_offset: tolerances.stack_offset,
+                maximum_wall_end_snap: tolerances.wall_end_snap,
+                ..Default::default()
+            },
         )?
     };
     let reconciliation =
@@ -181,6 +221,11 @@ fn run_v2_preview(
 
 fn main() {
     let args = Args::parse();
+    let tolerances = V2Tolerances {
+        stack_offset: args.v2_stack_offset,
+        wall_end_snap: args.v2_wall_end_snap,
+        console_width: args.v2_console_width,
+    };
     let mut config = ReconstructionConfig::default();
     for value in [
         args.weld_tol,
@@ -207,6 +252,7 @@ fn main() {
             args.v2_iterations,
             false,
             args.v2_preserve_details,
+            &tolerances,
         ) {
             eprintln!("[V2 PREVIEW ERROR] {error}");
             std::process::exit(1);
@@ -221,6 +267,7 @@ fn main() {
             args.v2_iterations,
             true,
             args.v2_preserve_details,
+            &tolerances,
         ) {
             eprintln!("[V2 MESH PREVIEW ERROR] {error}");
             std::process::exit(1);

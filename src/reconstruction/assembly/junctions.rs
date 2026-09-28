@@ -8,7 +8,7 @@
 use crate::reconstruction::{closed_contains, Model, PlaneFrame};
 use glam::DVec3;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Planes whose normals differ less than this sine are treated as parallel.
 const PARALLEL_SINE: f64 = 1e-8;
@@ -249,6 +249,10 @@ pub struct Context<'a> {
     pub interior: &'a [BTreeSet<usize>],
     /// Vertices that must not move (bar anchors and interior nodes).
     pub locked: &'a BTreeSet<usize>,
+    /// Largest move closing the free end of a junction line (a wall end)
+    /// onto another line of the same surface. Other vertices move less than
+    /// the minimum edge length.
+    pub wall_end_tolerance: f64,
 }
 
 /// Move an existing vertex that lies within the minimum edge length of a
@@ -628,6 +632,7 @@ enum Contact {
         vertex: usize,
         edge: usize,
         distance: f64,
+        limit: f64,
     },
     /// Two edges cross at an interior point of both.
     Cross { edges: [usize; 2], point: DVec3 },
@@ -639,11 +644,27 @@ fn find_contact(
     model: &Model,
     s: usize,
     tol: f64,
+    wall_end: f64,
     skip: &BTreeSet<(usize, usize)>,
 ) -> Option<Contact> {
     let plane = &model.planes[model.surfaces[s].plane];
     let all: Vec<usize> = model.surface_edges(s).collect();
+    // Free ends of junction lines: vertices with a single edge in the
+    // surface, that edge embedded.
+    let mut degree = BTreeMap::<usize, usize>::new();
+    for &e in &all {
+        for v in model.edges[e] {
+            *degree.entry(v).or_default() += 1;
+        }
+    }
+    let free: BTreeSet<usize> = model.surfaces[s]
+        .embedded_edges
+        .iter()
+        .flat_map(|&e| model.edges[e])
+        .filter(|v| degree[v] == 1)
+        .collect();
     let mut near: Option<Contact> = None;
+    let mut nearest = f64::INFINITY;
     for &e in &model.surfaces[s].embedded_edges {
         let [i, j] = model.edges[e];
         let (pi, pj) = (p3(model.vertices[i]), p3(model.vertices[j]));
@@ -673,11 +694,18 @@ fn find_contact(
                         edge: target,
                     });
                 }
-                if d < model.minimum_edge && near.is_none() && !skip.contains(&(v, target)) {
+                let limit = if free.contains(&v) {
+                    wall_end.max(model.minimum_edge)
+                } else {
+                    model.minimum_edge
+                };
+                if d < limit && d < nearest && !skip.contains(&(v, target)) {
+                    nearest = d;
                     near = Some(Contact::NearTouch {
                         vertex: v,
                         edge: target,
                         distance: d,
+                        limit,
                     });
                 }
             }
@@ -711,14 +739,16 @@ fn find_contact(
 /// wall ends a few micrometres short of a slab edge. The latter is closed by
 /// moving the vertex onto the edge (less than the minimum edge length, on
 /// every plane it lies on) instead of leaving a parasitic gap.
-fn resolve_crossings(model: &mut Model, locked: &BTreeSet<usize>, tol: f64, report: &mut Report) {
+fn resolve_crossings(model: &mut Model, context: &Context<'_>, tol: f64, report: &mut Report) {
+    let locked = context.locked;
     for s in 0..model.surfaces.len() {
         let mut skip = BTreeSet::new();
         for _ in 0..256 {
             if model.surfaces[s].embedded_edges.is_empty() {
                 break;
             }
-            let Some(contact) = find_contact(model, s, tol, &skip) else {
+            let Some(contact) = find_contact(model, s, tol, context.wall_end_tolerance, &skip)
+            else {
                 break;
             };
             let unresolved = |model: &Model, report: &mut Report, edge: usize, reason: String| {
@@ -760,6 +790,7 @@ fn resolve_crossings(model: &mut Model, locked: &BTreeSet<usize>, tol: f64, repo
                     vertex,
                     edge,
                     distance,
+                    limit,
                 } => {
                     skip.insert((vertex, edge));
                     let from = p3(model.vertices[vertex]);
@@ -775,7 +806,7 @@ fn resolve_crossings(model: &mut Model, locked: &BTreeSet<usize>, tol: f64, repo
                     let foot = c + (d - c) * ((from - c).dot(d - c) / (d - c).length_squared());
                     let refs: Vec<&PlaneFrame> = planes.iter().collect();
                     let target = super::intersection(foot, &refs, model.precision)
-                        .filter(|q| q.distance(from) < model.minimum_edge);
+                        .filter(|q| q.distance(from) < limit);
                     planes.clear();
                     let moved = !locked.contains(&vertex)
                         && target.is_some_and(|q| model.move_vertex(vertex, q.to_array()).is_ok());
@@ -847,7 +878,7 @@ pub fn insert(model: &mut Model, context: &Context<'_>) -> Report {
             }
         }
     }
-    resolve_crossings(model, context.locked, tol, &mut report);
+    resolve_crossings(model, context, tol, &mut report);
     report
 }
 
@@ -938,6 +969,9 @@ pub(crate) mod tests {
         vec![BTreeSet::new(); model.surfaces.len()]
     }
     pub(crate) fn run(model: &mut Model) -> Report {
+        run_with(model, 0.)
+    }
+    pub(crate) fn run_with(model: &mut Model, wall_end_tolerance: f64) -> Report {
         let interior = no_interior(model);
         let locked = BTreeSet::new();
         insert(
@@ -945,6 +979,7 @@ pub(crate) mod tests {
             &Context {
                 interior: &interior,
                 locked: &locked,
+                wall_end_tolerance,
             },
         )
     }
@@ -1187,6 +1222,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn wall_end_short_of_a_perpendicular_wall_axis_is_closed_within_tolerance() {
+        for place in Placement::all() {
+            // Wall A on the slab along y = 2; wall B along x = 3 ends 30 mm
+            // short of A's axis. Both stand on the slab.
+            let b = (
+                vec![vec![
+                    [3., 2.03, 0.],
+                    [3., 3.5, 0.],
+                    [3., 3.5, 2.],
+                    [3., 2.03, 2.],
+                ]],
+                [1., 0., 0.],
+            );
+            let panels = [slab(0., 4.), wall(1., 3.5, 0., 2.), b];
+            // Without a wall-end tolerance the 30 mm gap stays.
+            let mut m = build(&place, &panels);
+            let r = run(&mut m);
+            assert!(r.snapped_vertices.is_empty());
+            // With 50 mm the base corner of B closes onto A's axis; its top
+            // corner is not on the slab and stays, so B's end leans slightly.
+            let mut m = build(&place, &panels);
+            let r = run_with(&mut m, 0.05 * place.scale);
+            assert!(r.issues.is_empty(), "{:?}", r.issues);
+            assert_eq!(r.snapped_vertices.len(), 1);
+            let snap = &r.snapped_vertices[0];
+            assert!((snap.distance - 0.03 * place.scale).abs() < 1e-9 * place.scale);
+            assert!(p3(snap.to).distance(p3(place.point([3., 2., 0.]))) <= m.precision * 10.);
+            shared_cover(&m, &place, 0, 2, [3., 2., 0.], [3., 3.5, 0.]);
+            shared_cover(&m, &place, 0, 1, [1., 2., 0.], [3.5, 2., 0.]);
+        }
+    }
+
+    #[test]
     fn coincident_distinct_vertices_are_reported_not_merged() {
         for place in Placement::all() {
             // Two coplanar panels meeting along x = 2 with separate vertices
@@ -1223,6 +1291,7 @@ pub(crate) mod tests {
                 &Context {
                     interior: &interior,
                     locked: &locked,
+                    wall_end_tolerance: 0.,
                 },
             );
             assert!(r.issues.is_empty(), "{:?}", r.issues);
