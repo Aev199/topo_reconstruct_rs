@@ -331,3 +331,45 @@ the edge, retained node, opening plus floating line, perimeter annulus,
 corner consoles with wall stubs) under three scales, rigid transforms and
 reversed normals, and an FE-to-mesh test verifying trim width/area, full mesh
 quality and shared slab/wall mesh edges.
+
+## Stacked wall alignment, 2026-09-28
+
+User decision: a wall standing on a slab adopts the axis of the wall carrying
+it (the lower, bearing wall), with a 50 mm tolerance. Geotechnical assembly
+only (`assembly::stacking`, `FeaturePolicy::maximum_stack_offset`, default
+0.05 model units = the default junction movement limit).
+
+A pair qualifies when both patches are vertical and parallel (frame angle
+tolerance), lie on opposite sides of one horizontal slab, are in line contact
+with it and overlap along the contact, and the upper patch lies within the
+tolerance of the lower plane. Contact is geometric: a wall resting on a slab
+often shares no source node with it; a node counts when it lies on the slab
+plane within the closure tolerance and within three median node spacings of a
+slab node. Stacks are processed bottom-up, so every wall adopts the plane of
+the lowest wall of its stack, and the offset to that plane is checked again.
+
+The upper patch receives the lower support (`support_representatives`); every
+vertex then closes through the ordinary support intersection. Before
+committing a pair, every affected vertex is checked against the junction
+movement limit and its cumulative movement budget; a failing pair is kept and
+reported. After alignment, upper and lower junction nodes lie on one line;
+one-to-one pairs less than the minimum edge length apart along it share one
+vertex (`stacked_walls.identified`, bar anchors excluded, movement rechecked).
+This identity is justified by the alignment itself; coincident source nodes
+elsewhere are still only reported.
+
+тест 5 (private): 8 walls aligned (offset 25 mm each), 56 node pairs
+identified (at most 18 µm apart), global surface audit passes, triangles
+41975 → 36780, below 20° 241 → 131, below 5° 33 → 25, minimum angle 1.59°.
+скала1 and типовая секция have no stacked offsets and are unchanged. Debug and
+release outputs are identical.
+
+Remaining acute triangles on тест 5 come from wall ends 5–30 mm short of, or
+beyond, the axis of a perpendicular wall (a 12 mm node spacing on the junction
+chain next to a 0.4 m element). Closing them needs a larger, evidence-based
+snap tolerance for wall ends than the 1 mm used now.
+
+Tests: an FE-to-mesh case (upper wall 25 mm off, resting on the slab without
+shared nodes) under three scales and rigid transforms checks the alignment,
+seven identified nodes, full mesh quality and one shared junction line for
+both walls and the slab; conservative assembly leaves the walls unchanged.

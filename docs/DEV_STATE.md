@@ -40,11 +40,12 @@ elements, trial topology and external-mesher gate pass, surface/axis counts
 unchanged, 0 reconciliation problems. Debug and release outputs are identical.
 
 Geotechnical assembly trims thin consoles beyond junction lines
-(`assembly::consoles`): тест 5 loses 26.61 m² of 0.10–0.19 m slab consoles,
-audit still passing.
+(`assembly::consoles`; тест 5: 26.61 m² of 0.10–0.19 m slab consoles) and
+aligns stacked walls to the axis of the wall below within 50 mm
+(`assembly::stacking`; тест 5: 8 walls, 25 mm), audit still passing.
 
 Mesh quality (below 20°): скала1 163 → 73 (min 2.39°), типовая секция 0,
-тест 5 241 (min 1.93°). The тест 5 baseline (53) was not comparable: its
+тест 5 131 (min 1.59°). The тест 5 baseline (53) was not comparable: its
 slab meshes ignored 2194 junction segments.
 
 ## Current blockers
@@ -55,31 +56,29 @@ slab meshes ignored 2194 junction segments.
    vertex that anchors a bar (`junction_vertex_near_edge_end`). Both need an
    explicit vertex-identity rule (merge with provenance, or a declared seam),
    never coordinate welding.
-2. тест 5: walls above and below one slab with axes 25–30 mm apart (aligned
-   outer faces, different thicknesses), often short piers near the edge,
-   produce two junction lines millimetres apart and the remaining small and
-   acute elements. Needs an explicit stacked-wall axis alignment rule
-   (moves a wall plane; awaiting the user's decision on tolerance).
+2. тест 5: wall ends 5–30 mm short of, or beyond, the axis of a
+   perpendicular wall leave short edges on junction chains and the remaining
+   acute triangles. Needs an evidence-based wall-end snap tolerance (above
+   the current 1 mm); a decision for the user.
 
 ## Next coherent development batch
 
 ### Goal
 
-Stacked-wall axis alignment and vertex identity with provenance, so small
-offsets stop forcing tiny elements and the global audit passes on all three
-fixtures.
+Wall-end snapping to perpendicular wall axes and vertex identity with
+provenance, so millimetre offsets stop forcing tiny elements and the global
+audit passes on all three fixtures.
 
 ### Required approach
 
-- Classify coincident distinct vertices: same support planes and no source
-  release/hinge information → merge identity with provenance; otherwise keep
-  as a declared seam that the auditor accepts explicitly.
-- Near-miss vertex/edge pairs inside a surface within an adaptive tolerance
-  (local feature size, not a global constant): move onto the edge only when
-  every plane of the vertex is kept and the move is recorded; bar anchors move
-  only with their axis.
-- Extend the independent audit to near misses (the current audit ignores them).
-- Regression cases before/with the fix, with transforms and idempotence.
+- Wall end (vertical contour edge) within an agreed tolerance of a parallel
+  junction line of a perpendicular wall: move the end onto that axis only
+  when every plane of its vertices is kept; record each move.
+- Classify coincident distinct source vertices: same support planes and no
+  release/hinge information → merge identity with provenance; otherwise a
+  declared seam the auditor accepts explicitly.
+- Extend the independent audit to near misses.
+- Regression cases with transforms and idempotence.
 
 ### Also pending
 

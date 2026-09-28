@@ -15,6 +15,11 @@ pub struct FeaturePolicy {
     /// trimmed (model units). The default, 0.25 m, is half the default mesh
     /// spacing: such a strip cannot hold elements of the target size.
     pub maximum_console_width: f64,
+    /// Maximum offset between parallel walls on opposite sides of one slab
+    /// for the upper wall to adopt the plane of the wall carrying it (model
+    /// units). The default, 0.05 m, equals the default junction movement
+    /// limit that bounds every closing vertex.
+    pub maximum_stack_offset: f64,
 }
 impl Default for FeaturePolicy {
     fn default() -> Self {
@@ -22,6 +27,7 @@ impl Default for FeaturePolicy {
             maximum_source_width: 0.05,
             maximum_filled_area_ratio: 0.001,
             maximum_console_width: 0.25,
+            maximum_stack_offset: 0.05,
         }
     }
 }
@@ -220,6 +226,7 @@ mod tests {
         let policy = FeaturePolicy {
             maximum_filled_area_ratio: 0.000001,
             maximum_console_width: 0.,
+            maximum_stack_offset: 0.,
             ..FeaturePolicy::default()
         };
         assert!(simplify(&mut loops, &mesh, &points, &plane, 1e-7, &policy, 0, &[12]).is_empty());

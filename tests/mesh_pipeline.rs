@@ -316,6 +316,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         axis_assembly: assembly::bars::Report::default(),
         junctions: assembly::junctions::Report::default(),
         consoles: assembly::consoles::Report::default(),
+        stacked_walls: assembly::stacking::Report::default(),
         issues: vec![],
         maximum_closure_movement: 0.,
         rejected_vertices: BTreeMap::new(),
@@ -652,4 +653,110 @@ fn geotechnical_assembly_trims_slab_console_to_wall_axis() {
             assert_eq!(slab.len(), 30);
         }
     }
+}
+
+/// A wall below and a wall above one slab, axes 25 mm apart (aligned outer
+/// faces, different thicknesses). The upper wall rests on the slab without
+/// shared source nodes. Coordinates are in 25 mm units.
+fn stacked_source() -> topo_reconstruct_rs::input::MeshData {
+    use topo_reconstruct_rs::input::{ElementData, MeshData};
+    let mut mesh = MeshData::default();
+    let mut nodes = BTreeMap::new();
+    let mut add = |coordinates: [(i32, i32, i32); 4], stiffness| {
+        let ids = coordinates
+            .into_iter()
+            .map(|p| {
+                *nodes.entry(p).or_insert_with(|| {
+                    let id = mesh.nodes.len() as u32 + 1;
+                    mesh.nodes
+                        .insert(id, DVec3::new(p.0 as f64, p.1 as f64, p.2 as f64) * 0.025);
+                    id
+                })
+            })
+            .collect();
+        mesh.elements.push(ElementData {
+            id: mesh.elements.len() as u32 + 1,
+            elem_type: 44,
+            stiff_id: stiffness,
+            nodes: ids,
+        });
+    };
+    for x in (0..240).step_by(40) {
+        for y in (0..160).step_by(40) {
+            add(
+                [
+                    (x, y, 0),
+                    (x + 40, y, 0),
+                    (x + 40, y + 40, 0),
+                    (x, y + 40, 0),
+                ],
+                10,
+            );
+        }
+        for z in [-80, -40] {
+            add(
+                [
+                    (x, 80, z),
+                    (x + 40, 80, z),
+                    (x + 40, 80, z + 40),
+                    (x, 80, z + 40),
+                ],
+                20,
+            );
+        }
+        for z in [0, 40] {
+            add(
+                [
+                    (x, 81, z),
+                    (x + 40, 81, z),
+                    (x + 40, 81, z + 40),
+                    (x, 81, z + 40),
+                ],
+                30,
+            );
+        }
+    }
+    mesh
+}
+
+#[test]
+fn stacked_wall_adopts_axis_of_the_wall_below() {
+    for scale in [0.1, 1., 10.] {
+        for rotated in [false, true] {
+            let features = assembly::FeaturePolicy {
+                maximum_console_width: 0.25 * scale,
+                maximum_stack_offset: 0.05 * scale,
+                ..Default::default()
+            };
+            let (topology, mesh) = run_with(stacked_source(), scale, rotated, Some(features));
+            let stacked = &topology.stacked_walls;
+            assert_eq!(stacked.aligned.len(), 1, "{:?}", stacked.kept);
+            assert!((stacked.aligned[0].offset - 0.025 * scale).abs() < 1e-6 * scale);
+            // Seven upper-wall base nodes take the lower wall's vertices.
+            assert_eq!(stacked.identified.len(), 7);
+            assert!(topology.issues.is_empty() && topology.junctions.issues.is_empty());
+            assert!(
+                mesh.topology_valid && mesh.quality_passed,
+                "scale={scale} rotated={rotated}: {:?}",
+                mesh.blockers
+            );
+            // One junction line: both walls and the slab share its mesh edges.
+            let mut edges = BTreeMap::<u32, BTreeSet<[usize; 2]>>::new();
+            for t in &mesh.triangles {
+                for i in 0..3 {
+                    let (a, b) = (t.vertices[i], t.vertices[(i + 1) % 3]);
+                    edges
+                        .entry(t.stiffness)
+                        .or_default()
+                        .insert([a.min(b), a.max(b)]);
+                }
+            }
+            let line: BTreeSet<_> = edges[&20].intersection(&edges[&30]).copied().collect();
+            assert!(line.len() >= 12, "wall/wall shared edges {}", line.len());
+            assert!(line.is_subset(&edges[&10]));
+        }
+    }
+    // The conservative assembly keeps both walls where the source put them.
+    let (topology, _) = run_input(stacked_source(), 1., false);
+    assert!(topology.stacked_walls.aligned.is_empty());
 }

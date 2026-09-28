@@ -5,6 +5,7 @@ pub mod consoles;
 mod features;
 mod holes;
 pub mod junctions;
+pub mod stacking;
 use super::{frame, planes, Model, PlaneFrame};
 use crate::input::MeshData;
 pub use features::{FeaturePolicy, SimplifiedHole};
@@ -57,6 +58,8 @@ pub struct Report {
     pub junctions: junctions::Report,
     /// Thin consoles beyond junction lines trimmed in geotechnical assembly.
     pub consoles: consoles::Report,
+    /// Walls aligned to the plane of the wall carrying them (geotechnical).
+    pub stacked_walls: stacking::Report,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -411,6 +414,8 @@ pub fn assemble_geotechnical(
         || features.maximum_filled_area_ratio >= 1.
         || !features.maximum_console_width.is_finite()
         || features.maximum_console_width < 0.
+        || !features.maximum_stack_offset.is_finite()
+        || features.maximum_stack_offset < 0.
     {
         return Err("invalid feature simplification policy");
     }
@@ -526,6 +531,26 @@ fn assemble_impl(
             }
         }
     }
+    let mut stacked_walls = match features {
+        Some(features) if features.maximum_stack_offset > 0. => stacking::align(
+            mesh,
+            source,
+            policy,
+            &owners,
+            &mut support_representatives,
+            features.maximum_stack_offset,
+        ),
+        _ => stacking::Report::default(),
+    };
+    // Candidate points of an aligned wall are intentionally off its support.
+    let aligned: BTreeSet<usize> = (0..source.surfaces.len())
+        .filter(|&i| {
+            stacked_walls
+                .aligned
+                .iter()
+                .any(|w| support_representatives[w.upper] == support_representatives[i])
+        })
+        .collect();
     let junctions: Vec<Vec<usize>> = owners
         .values()
         .map(|ids| {
@@ -538,12 +563,13 @@ fn assemble_impl(
         .collect();
     let proposal = concurrent_supports(&source.candidate_planes, &junctions);
     let support_offsets_adjusted = source.surfaces.iter().enumerate().all(|(i, s)| {
-        s.nodes.iter().all(|&n| {
-            proposal[support_representatives[i]]
-                .distance(source.candidate_points[n])
-                .abs()
-                <= policy.closure_tolerance
-        })
+        aligned.contains(&i)
+            || s.nodes.iter().all(|&n| {
+                proposal[support_representatives[i]]
+                    .distance(source.candidate_points[n])
+                    .abs()
+                    <= policy.closure_tolerance
+            })
     });
     let closed_supports = if support_offsets_adjusted {
         proposal
@@ -597,7 +623,35 @@ fn assemble_impl(
     let mut vertices = BTreeMap::new();
     let mut vertex_source_nodes = vec![];
     let mut maximum_closure_movement = 0.0_f64;
+    // Identified stacked-wall nodes share the lower node's vertex, if that
+    // position is within the upper node's own movement limits.
+    let mut identified = BTreeMap::new();
+    for pair in &stacked_walls.identified {
+        let (Some(&q), Some(&i)) = (
+            closed_points.get(&pair.lower_node),
+            lookup.get(&pair.upper_node),
+        ) else {
+            continue;
+        };
+        if !closed_points.contains_key(&pair.upper_node) {
+            continue;
+        }
+        let p = DVec3::from_array(source.candidate_points[i]);
+        let reference = *mesh
+            .nodes
+            .get(&pair.upper_node)
+            .ok_or("missing reference node")?;
+        if p.distance(q) <= policy.junction_movement_limit
+            && q.distance(reference) <= movement_budget(mesh, source, i) + policy.precision
+        {
+            identified.insert(pair.upper_node, pair.lower_node);
+            closed_points.insert(pair.upper_node, q);
+        }
+    }
     for (&id, &q) in &closed_points {
+        if identified.contains_key(&id) {
+            continue;
+        }
         maximum_closure_movement = maximum_closure_movement
             .max(q.distance(DVec3::from_array(source.candidate_points[lookup[&id]])));
         vertices.insert(
@@ -608,6 +662,12 @@ fn assemble_impl(
         );
         vertex_source_nodes.push(id);
     }
+    for (&upper, lower) in &identified {
+        vertices.insert(upper, vertices[lower]);
+    }
+    stacked_walls
+        .identified
+        .retain(|pair| identified.contains_key(&pair.upper_node));
     let mut surface_source_patches = vec![];
     let mut surface_stiffness = vec![];
     let mut simplified_holes = vec![];
@@ -740,6 +800,7 @@ fn assemble_impl(
         axis_assembly,
         junctions,
         consoles,
+        stacked_walls,
         issues,
         maximum_closure_movement,
         rejected_vertices,
