@@ -702,11 +702,9 @@ pub fn refresh_contacts(model: &Model, axes: &[Axis], contacts: &mut Vec<Contact
         let plane = &model.planes[surface.plane];
         for anchor in &axis.anchors {
             let p = model.vertices[anchor.vertex];
-            let owned = owners.get(&anchor.vertex).is_some_and(|o| o.contains(&s));
-            if !owned
-                && !previous.contains(&(i, s, anchor.vertex))
-                && plane.distance(p).abs() > precision
-            {
+            // Geometry decides: a node off the plane is no contact, whatever
+            // an earlier record or ownership said.
+            if plane.distance(p).abs() > precision {
                 continue;
             }
             if let Some(location) = location(plane.project(p), &surface.contours, precision) {

@@ -1058,6 +1058,29 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_contact_of_a_node_moved_off_the_plane_is_dropped() {
+        use super::super::bars::{refresh_contacts, Location};
+        for place in Placement::all() {
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let lo = m.add_vertex(place.point([2., 1., -3.])).unwrap();
+            let mid = m.add_vertex(place.point([2., 1., 0.])).unwrap();
+            let hi = m.add_vertex(place.point([2., 1., 3.])).unwrap();
+            let axes = vec![bar([lo, hi], Some(mid))];
+            let mut contacts = vec![Contact::Point {
+                axis: 0,
+                surface: 0,
+                vertex: mid,
+                t: 0.5,
+                location: Location::Interior,
+            }];
+            // The node leaves the slab plane (1 mm): the record is stale.
+            m.move_vertex(mid, place.point([2., 1., 0.001])).unwrap();
+            refresh_contacts(&m, &axes, &mut contacts);
+            assert!(contacts.is_empty(), "{contacts:?}");
+        }
+    }
+
+    #[test]
     fn column_through_a_slab_without_a_shared_node_gets_a_point_contact() {
         use super::super::bars::{refresh_contacts, Location};
         for place in Placement::all() {

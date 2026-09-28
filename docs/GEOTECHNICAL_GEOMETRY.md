@@ -676,3 +676,24 @@ degrees, triangles below 1/5/20 degrees 10/36/326 -> 0/6/271; strict audit
 still passing. тест 5: 2 edges (6.7 mm), mesh metrics unchanged. скала1 and
 типовая секция: no such edge, unchanged. A 20 mm step between wall ends is
 kept (test).
+
+## Review fixes: plane check of refreshed contacts, whole crack chords, 2026-09-28
+
+An external code review found two gaps, neither observed on the fixtures
+(all four outputs byte-identical after the fix):
+
+- `bars::refresh_contacts` accepted a point contact from an earlier record
+  or ownership without checking that the node still lies on the surface
+  plane; the mesh would then have attached an off-plane node to the panel.
+  The plane check is now mandatory for every point contact.
+- the crack chord test only checked its midpoint; a chord could cross an
+  element near one end. The whole chord is now clipped against every
+  element (convex pieces; a nonconvex quadrilateral as the two triangles of
+  its inner diagonal) and rejected if any part lies strictly inside, more
+  than the precision from the boundary; running along element edges (a
+  zero-width crack) is not crossing.
+
+Tests: a node moved 1 mm off the slab loses its stale contact; a chord with
+its midpoint in the void but crossing an element corner near one end is
+rejected, a chord along an edge or through a corner is not, and the notch
+of a nonconvex quadrilateral is void.

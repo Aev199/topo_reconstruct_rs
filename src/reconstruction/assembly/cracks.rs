@@ -19,7 +19,6 @@
 //! the contour keep no contour vertex; every change is reported with its
 //! source nodes.
 use super::{planes, MeshData, PlaneFrame};
-use geo::{Contains, Coord, LineString, Point, Polygon};
 use glam::DVec2;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,7 +62,8 @@ fn excursion(points: &[DVec2], i: usize, j: usize) -> (f64, f64, usize) {
     (length, signed_area(&path), count)
 }
 
-type MaterialIndex = (BTreeMap<(i64, i64), Vec<u32>>, BTreeMap<u32, Polygon<f64>>);
+/// Element pieces (convex polygons) in a grid of cells four crack widths wide.
+type MaterialIndex = (BTreeMap<(i64, i64), Vec<usize>>, Vec<Vec<DVec2>>);
 
 /// Contour rings of one region rebuilt without cracks, or `None` when the
 /// region has no crack. `rings` are the source boundary rings of the region.
@@ -193,21 +193,9 @@ pub fn close(
                     }) {
                         continue;
                     }
-                    // The chord must not cross an element.
-                    let (cells, polygons) =
-                        material.get_or_insert_with(|| index(&facets, mesh, plane, width));
-                    let m = (p[i] + p[j]) / 2.;
-                    let point = Point::new(m.x, m.y);
-                    let k = (
-                        (m.x / (4. * width)).floor() as i64,
-                        (m.y / (4. * width)).floor() as i64,
-                    );
-                    if cells
-                        .get(&k)
-                        .into_iter()
-                        .flatten()
-                        .any(|id| polygons[id].contains(&point))
-                    {
+                    // No part of the chord may run inside an element.
+                    let index = material.get_or_insert_with(|| index(&facets, mesh, plane, width));
+                    if crosses_material(p[i], p[j], index, width, precision) {
                         continue;
                     }
                     best = Some((length, d, r, i, j));
@@ -301,48 +289,134 @@ fn index(
 ) -> MaterialIndex {
     let cell = 4. * width;
     let key = |p: DVec2| ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64);
-    let mut grid = BTreeMap::<(i64, i64), Vec<u32>>::new();
-    let mut polygons = BTreeMap::new();
-    for (&id, ns) in facets {
+    let mut grid = BTreeMap::<(i64, i64), Vec<usize>>::new();
+    let mut pieces = vec![];
+    for ns in facets.values() {
         let p: Vec<DVec2> = ns
             .iter()
             .map(|n| DVec2::from_array(plane.project(mesh.nodes[n].to_array())))
             .collect();
-        let (lo, hi) = p.iter().fold(
-            (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)),
-            |(lo, hi), &q| (lo.min(q), hi.max(q)),
-        );
-        let (k0, k1) = (key(lo), key(hi));
-        let mut cells = BTreeSet::new();
-        if (k1.0 - k0.0 + 1) * (k1.1 - k0.1 + 1) <= 4096 {
-            for x in k0.0..=k1.0 {
-                for y in k0.1..=k1.1 {
-                    cells.insert((x, y));
-                }
-            }
-        } else {
-            // A chord midpoint lies within a crack width of contour nodes,
-            // hence near the edges of any element containing it.
-            for i in 0..p.len() {
-                let (a, b) = (p[i], p[(i + 1) % p.len()]);
-                let steps = ((a.distance(b) / cell).ceil() as usize).max(1);
-                for s in 0..=steps {
-                    let c = key(a.lerp(b, s as f64 / steps as f64));
-                    for dx in -1..=1 {
-                        for dy in -1..=1 {
-                            cells.insert((c.0 + dx, c.1 + dy));
-                        }
+        for piece in convex_pieces(p) {
+            let (lo, hi) = piece.iter().fold(
+                (DVec2::splat(f64::INFINITY), DVec2::splat(f64::NEG_INFINITY)),
+                |(lo, hi), &q| (lo.min(q), hi.max(q)),
+            );
+            let (k0, k1) = (key(lo), key(hi));
+            let mut cells = BTreeSet::new();
+            if (k1.0 - k0.0 + 1) * (k1.1 - k0.1 + 1) <= 4096 {
+                for x in k0.0..=k1.0 {
+                    for y in k0.1..=k1.1 {
+                        cells.insert((x, y));
                     }
                 }
+            } else {
+                // A chord entering a large element crosses one of its edges:
+                // the cells along the edges suffice.
+                for i in 0..piece.len() {
+                    cells.extend(cells_along(
+                        piece[i],
+                        piece[(i + 1) % piece.len()],
+                        cell,
+                        key,
+                    ));
+                }
+            }
+            for c in cells {
+                grid.entry(c).or_default().push(pieces.len());
+            }
+            pieces.push(piece);
+        }
+    }
+    (grid, pieces)
+}
+
+/// A shell facet as convex pieces: itself, or a nonconvex quadrilateral as
+/// the two triangles of its inner diagonal.
+fn convex_pieces(p: Vec<DVec2>) -> Vec<Vec<DVec2>> {
+    let n = p.len();
+    let turn = |i: usize| (p[i] - p[(i + n - 1) % n]).perp_dot(p[(i + 1) % n] - p[i]);
+    let sign = signed_area(&p).signum();
+    let reflex: Vec<usize> = (0..n).filter(|&i| turn(i) * sign < 0.).collect();
+    match (n, reflex.as_slice()) {
+        (_, []) => vec![p],
+        (4, [r]) => {
+            let r = *r;
+            let (a, b, c) = (p[(r + 1) % 4], p[(r + 2) % 4], p[(r + 3) % 4]);
+            vec![vec![p[r], a, b], vec![p[r], b, c]]
+        }
+        // Not a valid shell facet; its triangle fan is a conservative cover.
+        _ => (1..n - 1).map(|i| vec![p[0], p[i], p[i + 1]]).collect(),
+    }
+}
+
+/// Whether some part of segment a-b lies strictly inside an element, more
+/// than `tolerance` from its boundary. Touching edges or vertices (a crack
+/// of zero width runs along element edges) is not crossing.
+fn crosses_material(
+    a: DVec2,
+    b: DVec2,
+    (grid, pieces): &MaterialIndex,
+    width: f64,
+    tolerance: f64,
+) -> bool {
+    let cell = 4. * width;
+    let key = |p: DVec2| ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64);
+    let mut candidates = BTreeSet::<usize>::new();
+    for c in cells_along(a, b, cell, key) {
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                candidates.extend(grid.get(&(c.0 + dx, c.1 + dy)).into_iter().flatten());
             }
         }
-        for c in cells {
-            grid.entry(c).or_default().push(id);
-        }
-        let ring: Vec<Coord<f64>> = p.iter().map(|q| Coord { x: q.x, y: q.y }).collect();
-        polygons.insert(id, Polygon::new(LineString::from(ring), vec![]));
     }
-    (grid, polygons)
+    let d = b - a;
+    candidates.into_iter().any(|k| {
+        let piece = &pieces[k];
+        let sign = signed_area(piece).signum();
+        // Clip the segment by every edge's inner half-plane, inset by the
+        // tolerance (Cyrus-Beck).
+        let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+        for i in 0..piece.len() {
+            let (p, q) = (piece[i], piece[(i + 1) % piece.len()]);
+            let e = q - p;
+            let length = e.length();
+            if length == 0. {
+                continue;
+            }
+            // Signed distance inside the edge: positive towards the interior.
+            let inside = |x: DVec2| sign * e.perp_dot(x - p) / length - tolerance;
+            let (fa, fd) = (inside(a), sign * e.perp_dot(d) / length);
+            if fd.abs() < f64::EPSILON * length {
+                if fa <= 0. {
+                    return false;
+                }
+                continue;
+            }
+            let t = -fa / fd;
+            if fd > 0. {
+                t0 = t0.max(t);
+            } else {
+                t1 = t1.min(t);
+            }
+            if t0 >= t1 {
+                return false;
+            }
+        }
+        (t1 - t0) * d.length() > tolerance
+    })
+}
+
+/// Grid cells visited by a segment, sampled at most one cell apart.
+fn cells_along(
+    a: DVec2,
+    b: DVec2,
+    cell: f64,
+    key: impl Fn(DVec2) -> (i64, i64),
+) -> BTreeSet<(i64, i64)> {
+    let steps = ((a.distance(b) / cell).ceil() as usize).max(1);
+    (0..=steps)
+        .map(|k| key(a.lerp(b, k as f64 / steps as f64)))
+        .collect()
 }
 
 /// Contour rings with zero-width cracks removed, and the number of removed
@@ -607,6 +681,65 @@ mod tests {
             assert_eq!(rings.len(), 1);
             assert!((a[0] - 7.).abs() < 1e-6, "{a:?}");
         }
+    }
+
+    fn material(pieces: Vec<Vec<DVec2>>, width: f64) -> MaterialIndex {
+        let cell = 4. * width;
+        let key = |p: DVec2| ((p.x / cell).floor() as i64, (p.y / cell).floor() as i64);
+        let mut grid = BTreeMap::<(i64, i64), Vec<usize>>::new();
+        let pieces: Vec<Vec<DVec2>> = pieces.into_iter().flat_map(convex_pieces).collect();
+        for (k, piece) in pieces.iter().enumerate() {
+            let mut cells = BTreeSet::new();
+            for i in 0..piece.len() {
+                cells.extend(cells_along(
+                    piece[i],
+                    piece[(i + 1) % piece.len()],
+                    cell,
+                    key,
+                ));
+            }
+            for c in cells {
+                grid.entry(c).or_default().push(k);
+            }
+        }
+        (grid, pieces)
+    }
+
+    #[test]
+    fn a_chord_crossing_an_element_away_from_its_midpoint_is_rejected() {
+        let v = |x: f64, y: f64| DVec2::new(x, y);
+        for scale in [0.01, 1., 40.] {
+            let width = 0.01 * scale;
+            let tol = 1e-7 * scale;
+            // A 2 mm element corner pokes into the gap near one chord end;
+            // the chord midpoint is in the void.
+            let index = material(
+                vec![vec![
+                    v(0.007, -0.001),
+                    v(0.009, -0.001),
+                    v(0.009, 0.001),
+                    v(0.007, 0.001),
+                ]
+                .into_iter()
+                .map(|p| p * scale)
+                .collect()],
+                width,
+            );
+            let (a, b) = (v(0., 0.) * scale, v(0.01, 0.) * scale);
+            assert!(crosses_material(a, b, &index, width, tol));
+            assert!(crosses_material(b, a, &index, width, tol));
+            // Along an element edge or through a corner only: not crossing.
+            let (c, d) = (v(0.005, 0.001) * scale, v(0.012, 0.001) * scale);
+            assert!(!crosses_material(c, d, &index, width, tol));
+            let (e, f) = (v(0.007, 0.003) * scale, v(0.011, -0.001) * scale);
+            assert!(!crosses_material(e, f, &index, width, tol));
+        }
+        // A nonconvex quadrilateral is covered exactly by its two triangles:
+        // its notch is void.
+        let dart = vec![v(0., 0.), v(4., 2.), v(0., 4.), v(1., 2.)];
+        let index = material(vec![dart], 0.5);
+        assert!(!crosses_material(v(0.1, 2.), v(0.9, 2.), &index, 0.5, 1e-7));
+        assert!(crosses_material(v(1.5, 1.), v(1.5, 3.), &index, 0.5, 1e-7));
     }
 
     #[test]
