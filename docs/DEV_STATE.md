@@ -62,7 +62,16 @@ Remaining on тест 6:
 
 1. trial mesh quality: minimum angle 3.33 degrees, 6 triangles below 5
    and 271 below 20 degrees of 402963 (after collapsing short edges);
-2. 203 surface near misses (review items, not inspected individually);
+2. 194 surface near misses on 67 surface pairs (review items), classified
+   2026-09-28 against the source geometry: 189 have a source node; for all
+   but 12 the gap equals the source gap (median difference 0), typically
+   25-26 mm and 50 mm, i.e. systematic offsets or joints of the source
+   model, never closed automatically (policy decision pending with the
+   user). Made worse by the reconstruction: stacked-wall alignment moved
+   upper walls 139/140/145 by 25 mm onto the walls below, and the small roof
+   slab 164 resting on them (3 mm from them in the source, unconnected)
+   stayed, so the gap grew to 28-38 mm (10 items). One wall end moved 5.3 mm
+   closer (24.9 -> 19.6 mm, 5 items);
 3. two junction diagnostics: a 19.6 mm near touch left open and one
    crossing split refused as a short edge.
 
