@@ -324,6 +324,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         bar_anchors: assembly::cleanup::MergeReport::default(),
         cracks: vec![],
         short_edge_merges: assembly::cleanup::MergeReport::default(),
+        gaps: assembly::gaps::Report::default(),
         issues: vec![],
         maximum_closure_movement: 0.,
         rejected_vertices: BTreeMap::new(),
@@ -626,6 +627,8 @@ fn geotechnical_assembly_trims_slab_console_to_wall_axis() {
         for rotated in [false, true] {
             let features = assembly::FeaturePolicy {
                 maximum_console_width: 0.25 * scale,
+                maximum_gap: 0.05 * scale,
+                maximum_collapsed_edge: 0.05 * scale,
                 ..Default::default()
             };
             let (topology, mesh) = run_with(console_source(), scale, rotated, Some(features));

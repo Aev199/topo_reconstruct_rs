@@ -5,6 +5,7 @@ pub mod cleanup;
 pub mod consoles;
 pub mod cracks;
 mod features;
+pub mod gaps;
 mod holes;
 pub mod junctions;
 pub mod stacking;
@@ -74,6 +75,8 @@ pub struct Report {
     pub bar_anchors: cleanup::MergeReport,
     /// Short edges between needed corners collapsed into one vertex.
     pub short_edge_merges: cleanup::MergeReport,
+    /// Gaps between structures closed for PLAXIS.
+    pub gaps: gaps::Report,
     /// Region contours rebuilt across cracks of the source mesh.
     pub cracks: Vec<cracks::Closure>,
     pub issues: Vec<Issue>,
@@ -501,6 +504,8 @@ pub fn assemble_geotechnical(
         || features.maximum_crack_width < 0.
         || !features.maximum_collapsed_edge.is_finite()
         || features.maximum_collapsed_edge < 0.
+        || !features.maximum_gap.is_finite()
+        || features.maximum_gap < 0.
     {
         return Err("invalid feature simplification policy");
     }
@@ -959,8 +964,40 @@ fn assemble_impl(
         ),
         None => cleanup::MergeReport::default(),
     };
-    let (interior, locked, fixed) = protected(&model, &axis_assembly);
+    let (_, _, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
+    let gaps = match features {
+        Some(features) if features.maximum_gap > 0. => gaps::close(
+            &mut model,
+            &mut cleanup::Bars {
+                axes: &mut axis_assembly.axes,
+                contacts: &mut axis_assembly.contacts,
+            },
+            features.maximum_gap,
+            &fixed,
+            &vertex_source_nodes,
+        ),
+        _ => gaps::Report::default(),
+    };
+    // A closed gap can bring a vertex onto another one.
+    let mut coincident = coincident;
+    if !gaps.closed.is_empty() {
+        let (_, _, fixed) = protected(&model, &axis_assembly);
+        let again = cleanup::merge_coincident(
+            &mut model,
+            &mut cleanup::Bars {
+                axes: &mut axis_assembly.axes,
+                contacts: &mut axis_assembly.contacts,
+            },
+            policy.minimum_edge,
+            &fixed,
+            &vertex_source_nodes,
+        );
+        coincident.merged.extend(again.merged);
+        coincident.rejected.extend(again.rejected);
+    }
+    let (interior, locked, fixed) = protected(&model, &axis_assembly);
+    timer.lap("gaps");
     let junctions = junctions::insert(
         &mut model,
         &junctions::Context {
@@ -1061,6 +1098,7 @@ fn assemble_impl(
         bar_ends,
         bar_anchors,
         short_edge_merges,
+        gaps,
         cracks,
         issues,
         maximum_closure_movement,

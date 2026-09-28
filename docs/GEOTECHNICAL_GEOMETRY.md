@@ -697,3 +697,45 @@ Tests: a node moved 1 mm off the slab loses its stale contact; a chord with
 its midpoint in the void but crossing an element corner near one end is
 rejected, a chord along an edge or through a corner is not, and the notch
 of a nonconvex quadrilateral is void.
+
+## PLAXIS profile, 2026-09-28
+
+Reconstruction now targets PLAXIS 3D's sensitivity. PLAXIS intersects the
+imported geometry itself (parametric geometry only since 2016; its snap
+tolerance defaults to 1 mm); small gaps or overlaps break the intersection
+or force a very fine mesh, triangles below its tolerance are dropped, and it
+warns about edges many times smaller than the target element. PSI/LIRA
+practice recommends elements of at least 0.5 m.
+
+`scripts/check_plaxis_profile.py` measures the geometry against a target
+element size h (default 0.5 m): short surface edges and bar pieces (< h/10),
+sharp contour corners (< 10 degrees), narrow faces (a contour vertex within
+h/10 of a non-neighbouring contour edge of its surface) and gaps (a surface
+vertex or bar node within h/10 of another surface without being one of its
+vertices). Five analytic tests.
+
+New rules, both at h/10 = 0.05 m by default:
+
+- `assembly::gaps` (`--v2-gap-closure`, 0 keeps every gap, e.g. real
+  joints): a vertex within the tolerance of another surface moves onto its
+  plane keeping its own planes; if still outside it merges into a contour
+  vertex, slides along its planes onto a contour edge (split there), or the
+  edge bends through it. Sub-millimetre touches stay with junction
+  insertion; coincident vertices are merged again afterwards
+  (`topology.gaps`);
+- `--v2-edge-collapse` default raised from 0.01 to 0.05 m.
+
+| PLAXIS profile | скала1 | типовая секция | тест 5 | тест 6 |
+|---|---:|---:|---:|---:|
+| Short edges before -> after | 0 -> 0 | 0 -> 0 | 3 -> 0 | 20 -> 4 |
+| Gaps < 50 mm before -> after | 0 -> 0 | 0 -> 0 | 2 -> 0 | 117 -> 49 |
+| Short bar pieces | 7 | 0 | 0 | 0 |
+| Sharp corners | 1 (8 degrees) | 0 | 0 | 0 |
+
+The strict global audit passes on all four fixtures; скала1 and типовая
+секция geometry and mesh are unchanged; debug and release outputs are
+identical. The 49 remaining gaps on тест 6 need a whole surface to move or
+rotate (e.g. an oblique wall end lying in the plane of another wall 26 mm
+beyond its end, which is held by a third wall; slabs 25 mm apart in height),
+or are near-parallel surfaces; they are reported in `topology.gaps.rejected`.
+The short bar pieces of скала1 are source bars (7-28 mm) joining beams.

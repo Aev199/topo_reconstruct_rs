@@ -100,10 +100,18 @@ struct Args {
 
     /// v2, геотехнический режим: рёбра короче этого значения между двумя
     /// нужными углами (например, торцы нижней и верхней стен в нескольких
-    /// миллиметрах друг от друга) схлопываются в одну вершину. В единицах
-    /// модели, 0 — отключить.
-    #[arg(long, default_value_t = 0.01)]
+    /// миллиметрах друг от друга) схлопываются в одну вершину. По умолчанию
+    /// 0,05 = 1/10 элемента PLAXIS 0,5 м. В единицах модели, 0 — отключить.
+    #[arg(long, default_value_t = 0.05)]
     v2_edge_collapse: f64,
+
+    /// v2, геотехнический режим (под PLAXIS): зазоры уже этого значения между
+    /// вершиной одной конструкции и другой конструкцией закрываются (вершина
+    /// переносится на плоскость и контур другой конструкции). По умолчанию
+    /// 0,05 = 1/10 элемента PLAXIS 0,5 м. В единицах модели, 0 — сохранить
+    /// все зазоры (например, настоящие деформационные швы).
+    #[arg(long, default_value_t = 0.05)]
+    v2_gap_closure: f64,
 }
 
 /// Geotechnical simplification tolerances of the v2 pipeline (model units).
@@ -113,6 +121,7 @@ struct V2Tolerances {
     console_width: f64,
     crack_width: f64,
     edge_collapse: f64,
+    gap_closure: f64,
 }
 
 fn run_v2_preview(
@@ -137,6 +146,7 @@ fn run_v2_preview(
         ("--v2-console-width", tolerances.console_width),
         ("--v2-crack-width", tolerances.crack_width),
         ("--v2-edge-collapse", tolerances.edge_collapse),
+        ("--v2-gap-closure", tolerances.gap_closure),
     ] {
         if !value.is_finite() || value < 0. {
             return Err(format!("{name} must be a finite non-negative length").into());
@@ -209,6 +219,7 @@ fn run_v2_preview(
                 maximum_wall_end_snap: tolerances.wall_end_snap,
                 maximum_crack_width: tolerances.crack_width,
                 maximum_collapsed_edge: tolerances.edge_collapse,
+                maximum_gap: tolerances.gap_closure,
                 ..Default::default()
             },
         )?
@@ -270,6 +281,7 @@ fn main() {
         console_width: args.v2_console_width,
         crack_width: args.v2_crack_width,
         edge_collapse: args.v2_edge_collapse,
+        gap_closure: args.v2_gap_closure,
     };
     let mut config = ReconstructionConfig::default();
     for value in [

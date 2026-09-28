@@ -56,24 +56,21 @@ slab meshes ignored 2194 junction segments.
 ## Current blockers
 
 All four private fixtures pass the strict extended audit, including the
-mesh-level connectivity and missing-property checks (2026-09-28). `тест 6`
-(69 MB, 490k elements, converted mesh) assembles completely in about 80 s.
-Remaining on тест 6:
+mesh-level connectivity and missing-property checks. Reconstruction targets
+PLAXIS (`docs/GEOTECHNICAL_GEOMETRY.md`, "PLAXIS profile"):
+`scripts/check_plaxis_profile.py` is the readiness gate at a target element
+size of 0.5 m. типовая секция and тест 5 pass it. Remaining:
 
-1. trial mesh quality: minimum angle 3.33 degrees, 6 triangles below 5
-   and 271 below 20 degrees of 402963 (after collapsing short edges);
-2. 194 surface near misses on 67 surface pairs (review items), classified
-   2026-09-28 against the source geometry: 189 have a source node; for all
-   but 12 the gap equals the source gap (median difference 0), typically
-   25-26 mm and 50 mm, i.e. systematic offsets or joints of the source
-   model, never closed automatically (policy decision pending with the
-   user). Made worse by the reconstruction: stacked-wall alignment moved
-   upper walls 139/140/145 by 25 mm onto the walls below, and the small roof
-   slab 164 resting on them (3 mm from them in the source, unconnected)
-   stayed, so the gap grew to 28-38 mm (10 items). One wall end moved 5.3 mm
-   closer (24.9 -> 19.6 mm, 5 items);
-3. two junction diagnostics: a 19.6 mm near touch left open and one
-   crossing split refused as a short edge.
+1. тест 6: 49 gaps below 50 mm that need a whole surface to move or rotate
+   (plane-level alignment, like stacked walls), 4 short edges; 194 source
+   near misses of 25-50 mm were classified earlier (policy pending: joints
+   versus modelling offsets; `--v2-gap-closure 0` keeps all gaps);
+2. скала1: 7 short source bars (7-28 mm) joining beams, 1 contour corner of
+   8 degrees;
+3. trial mesh quality on тест 6 (minimum 3.33 degrees); the final mesh
+   should come from Gmsh or the target program (`docs/PRIOR_ART.md`);
+4. two junction diagnostics on тест 6 (a 19.6 mm near touch, one refused
+   crossing split).
 
 Fixed after тест 6: junction ends micrometres from existing vertices or
 surface edges, near-planar wall tops, crack mouths shared across a patch,

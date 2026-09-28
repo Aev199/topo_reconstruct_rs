@@ -61,7 +61,7 @@ pub struct RejectedMerge {
     pub reason: String,
 }
 
-fn users(model: &Model, v: usize) -> Vec<usize> {
+pub(super) fn users(model: &Model, v: usize) -> Vec<usize> {
     (0..model.surfaces.len())
         .filter(|&s| model.surface_edges(s).any(|e| model.edges[e].contains(&v)))
         .collect()
@@ -77,7 +77,7 @@ pub struct Bars<'a> {
 /// other end stays and every other anchor is re-placed at its parameter on
 /// the new straight line, keeping all its planes. An interior anchor, or an
 /// anchor shared with another axis, would bend a bar and is rejected.
-fn move_with_axes(
+pub(super) fn move_with_axes(
     model: &mut Model,
     axes: &[Axis],
     v: usize,
@@ -127,7 +127,7 @@ fn move_with_axes(
 
 /// Move both vertices onto the planes of every surface of either (within
 /// `limit`), then merge `drop` into `keep`, carrying bar axes along.
-fn merge(
+pub(super) fn merge(
     model: &mut Model,
     bars: &mut Bars<'_>,
     drop: usize,

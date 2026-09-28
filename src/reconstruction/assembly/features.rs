@@ -29,8 +29,13 @@ pub struct FeaturePolicy {
     /// region contour (model units, default 0.01 m; 0 disables).
     pub maximum_crack_width: f64,
     /// Surface edges shorter than this whose ends are both needed corners
-    /// collapse into one vertex (model units, default 0.01 m; 0 disables).
+    /// collapse into one vertex (model units, default 0.05 m: a tenth of a
+    /// 0.5 m PLAXIS element; 0 disables).
     pub maximum_collapsed_edge: f64,
+    /// Widest gap between a surface vertex (or bar node) and another surface
+    /// that is closed onto it (model units, default 0.05 m: a tenth of a
+    /// 0.5 m PLAXIS element; 0 keeps every gap, e.g. for real joints).
+    pub maximum_gap: f64,
 }
 impl Default for FeaturePolicy {
     fn default() -> Self {
@@ -41,7 +46,8 @@ impl Default for FeaturePolicy {
             maximum_stack_offset: 0.05,
             maximum_wall_end_snap: 0.05,
             maximum_crack_width: 0.01,
-            maximum_collapsed_edge: 0.01,
+            maximum_collapsed_edge: 0.05,
+            maximum_gap: 0.05,
         }
     }
 }
