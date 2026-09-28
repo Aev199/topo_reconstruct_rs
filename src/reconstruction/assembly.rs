@@ -63,6 +63,10 @@ pub struct Report {
     pub stacked_walls: stacking::Report,
     /// Redundant collinear vertices removed at short edges (geotechnical).
     pub short_edges: cleanup::Report,
+    /// Duplicated vertices merged before junction insertion (geotechnical).
+    pub coincident_vertices: cleanup::MergeReport,
+    /// Wall ends merged into nearby vertices (geotechnical).
+    pub wall_ends: cleanup::MergeReport,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -770,6 +774,15 @@ fn assemble_impl(
         locked.extend(axis.endpoints);
         locked.extend(axis.anchors.iter().map(|a| a.vertex));
     }
+    let coincident = match features {
+        Some(_) => cleanup::merge_coincident(
+            &mut model,
+            policy.minimum_edge,
+            &locked,
+            &vertex_source_nodes,
+        ),
+        None => cleanup::MergeReport::default(),
+    };
     let junctions = junctions::insert(
         &mut model,
         &junctions::Context {
@@ -778,6 +791,27 @@ fn assemble_impl(
             wall_end_tolerance: features.map_or(0., |f| f.maximum_wall_end_snap),
         },
     );
+    let wall_ends = match features {
+        Some(features) if features.maximum_wall_end_snap > 0. => cleanup::merge_wall_ends(
+            &mut model,
+            features.maximum_wall_end_snap,
+            &locked,
+            &vertex_source_nodes,
+        ),
+        _ => cleanup::MergeReport::default(),
+    };
+    // A wall end left open by the junction pass may be closed by a merge;
+    // its near-touch diagnostic is then obsolete.
+    let mut junctions = junctions;
+    junctions.issues.retain(|issue| {
+        !issue.reason.starts_with("embedded_near_touch")
+            || !wall_ends.merged.iter().any(|m| {
+                [issue.start, issue.end].iter().any(|p| {
+                    DVec3::from_array(*p).distance(DVec3::from_array(m.kept_from))
+                        <= policy.precision
+                })
+            })
+    });
     let consoles = match features {
         Some(features) => consoles::trim(
             &mut model,
@@ -817,6 +851,8 @@ fn assemble_impl(
         consoles,
         stacked_walls,
         short_edges,
+        coincident_vertices: coincident,
+        wall_ends,
         issues,
         maximum_closure_movement,
         rejected_vertices,

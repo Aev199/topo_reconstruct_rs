@@ -225,6 +225,72 @@ impl Model {
             .collect()
     }
 
+    /// Merge vertex `drop` into `keep`: every edge and contour using `drop`
+    /// uses `keep` instead. `keep` must lie on the plane of every surface
+    /// using either vertex. Edges collapsing to a point or duplicating
+    /// another edge are merged; each affected surface is revalidated. The
+    /// model is unchanged on error.
+    pub fn merge_vertices(&mut self, drop: usize, keep: usize) -> Result<(), Error> {
+        if drop == keep || drop >= self.vertices.len() || keep >= self.vertices.len() {
+            return Err(Error::InvalidVertex);
+        }
+        let target = self.vertices[keep];
+        let users: Vec<usize> = (0..self.surfaces.len())
+            .filter(|&s| self.surface_edges(s).any(|e| self.edges[e].contains(&drop)))
+            .collect();
+        let mut trial = self.clone();
+        for &s in &users {
+            let surface = &trial.surfaces[s];
+            if trial.planes[surface.plane].distance(target).abs() > trial.precision {
+                return Err(Error::NonPlanar);
+            }
+            let map = |v: usize| if v == drop { keep } else { v };
+            let mut rings = vec![];
+            for ring in &surface.boundaries {
+                let mut ids: Vec<usize> = ring
+                    .iter()
+                    .map(|e| {
+                        let [a, b] = trial.edges[e.edge];
+                        map(if e.reversed { b } else { a })
+                    })
+                    .collect();
+                ids.dedup();
+                if ids.len() > 1 && ids.first() == ids.last() {
+                    ids.pop();
+                }
+                rings.push(ids);
+            }
+            let keys: BTreeSet<[usize; 2]> = surface
+                .embedded_edges
+                .iter()
+                .map(|&e| trial.edges[e].map(map))
+                .filter(|[a, b]| a != b)
+                .map(|[a, b]| [a.min(b), a.max(b)])
+                .collect();
+            let ring_keys: BTreeSet<[usize; 2]> = rings
+                .iter()
+                .flat_map(|r| {
+                    (0..r.len()).map(move |i| {
+                        let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                        [a.min(b), a.max(b)]
+                    })
+                })
+                .collect();
+            let embedded: Vec<usize> = keys
+                .difference(&ring_keys)
+                .map(|&key| {
+                    *trial.edge_index.entry(key).or_insert_with(|| {
+                        trial.edges.push(key);
+                        trial.edges.len() - 1
+                    })
+                })
+                .collect();
+            trial.rebuild_surface(s, rings, embedded)?;
+        }
+        *self = trial;
+        Ok(())
+    }
+
     /// Remove a vertex joining exactly two collinear edges, replacing them
     /// with one edge in every surface that uses them. The vertex must lie on
     /// the joined segment within `max(precision, deviation)`; contours change

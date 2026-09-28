@@ -421,3 +421,44 @@ Tests: a wall end 30 mm short of a perpendicular wall axis closes with a
 50 mm tolerance and stays open without it; a stray collinear contour node is
 removed while a locked one and a real 12 mm notch are kept; all under three
 scales, rigid transforms and reversed normals.
+
+## Vertex merging, 2026-09-28
+
+User decision: duplicated nodes are merged; the geotechnical model is meant
+to be simplified. Geotechnical assembly now merges (`assembly::cleanup`,
+`Model::merge_vertices`, transactional, every affected surface revalidated):
+
+- before junction insertion, distinct vertices closer than the minimum edge
+  length (duplicated source nodes), keeping a bar anchor if one is involved
+  (`topology.coincident_vertices`);
+- after junction insertion, the free end of a junction line (a wall end) into
+  the nearest vertex of the same surface within `--v2-wall-end-snap`, the kept
+  vertex moving onto the planes of both (`topology.wall_ends`).
+
+The kept vertex moves to the intersection of every plane of both vertices,
+within the tolerance; a bar anchor never moves and two bar anchors are never
+merged (their axes are not re-solved). Each merge records both vertices, their
+source nodes, the distance and the movement; each rejection records a reason.
+Near-touch diagnostics of the junction pass that a later merge resolves are
+dropped from `topology.junctions.issues`.
+
+Private fixtures:
+
+| | скала1 | типовая секция | тест 5 |
+|---|---:|---:|---:|
+| Duplicates merged / rejected | 1 / 2 | 0 / 0 | 0 / 0 |
+| Wall ends merged into corners | 0 | 0 | 6 (corner moved 11–19 mm) |
+| Unrepresented junction segments | 7 → 5 (1 pair) | 0 | 0 |
+| Triangles below 20° | 73 | 0 | 37 → 28 |
+| Minimum angle | 2.39° | 20.21° | 6.98° |
+
+скала1 rejections: two duplicated nodes that are both bar anchors (0.2 µm
+apart), and a bar anchor 36 µm off the plane of a wall whose corner lies next
+to it. The last remaining unrepresented pair comes from that anchor. Closing
+it needs moving a bar anchor with its axis, i.e. re-solving the axis after a
+merge. Debug and release outputs are identical.
+
+Tests: duplicated nodes merge into one shared edge and are idempotent;
+duplicated bar anchors are kept; a wall end 30 mm short of a slab corner that
+is 10 mm off the wall axis merges into the moved corner; all under three
+scales, rigid transforms and reversed normals.

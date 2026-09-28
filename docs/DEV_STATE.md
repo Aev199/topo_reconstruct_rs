@@ -46,39 +46,35 @@ aligns stacked walls to the axis of the wall below within 50 mm
 redundant collinear vertices at short edges within 50 mm
 (`assembly::cleanup`), audit still passing. Tolerances are CLI options:
 `--v2-stack-offset`, `--v2-wall-end-snap`, `--v2-console-width`.
+Duplicated vertices and wall ends next to contour corners are merged
+(`assembly::cleanup`, `Model::merge_vertices`).
 
 Mesh quality (below 20°): скала1 163 → 73 (min 2.39°), типовая секция 0,
-тест 5 37 (min 6.98°, none below 5°). The тест 5 baseline (53) was not comparable: its
+тест 5 28 (min 6.98°, none below 5°). The тест 5 baseline (53) was not comparable: its
 slab meshes ignored 2194 junction segments.
 
 ## Current blockers
 
-1. скала1 residual (7 segments, 3 pairs), reported, not repaired:
-   duplicated source nodes at identical positions joining coplanar panels
-   (`coincident_distinct_vertices`) and a wall corner 0.08 mm from a slab
-   vertex that anchors a bar (`junction_vertex_near_edge_end`). Both need an
-   explicit vertex-identity rule (merge with provenance, or a declared seam),
-   never coordinate welding.
-2. тест 5: six wall ends stop 43–49 mm from a slab corner lying 11 mm off
-   the wall axis; five short edges remain. Closing them needs vertex merging
-   with a moved corner (a vertex-identity decision).
+1. скала1: one surface pair (5 segments) remains unrepresented. A bar anchor
+   lies 36 µm off the plane of a wall whose corner is 0.09 mm away; two other
+   duplicated nodes are both bar anchors. Merging them requires moving bar
+   anchors together with their axes (axis re-solve after a merge).
+2. тест 5: 28 triangles below 20° (minimum 6.98°); no unrepresented
+   junctions.
 
 ## Next coherent development batch
 
 ### Goal
 
-Vertex identity with provenance: coincident distinct source vertices
-(скала1) and near-coincident vertices left after wall-end closure (тест 5),
-so the global audit passes on all three fixtures.
+Axis-aware vertex merging, so bar anchors can join merges within the
+tolerances, and the global surface audit passes on all three fixtures.
 
 ### Required approach
 
-- Coincident distinct source vertices with the same support planes and no
-  release/hinge information → merge identity with provenance; otherwise a
-  declared seam the auditor accepts explicitly.
-- A wall end near a contour corner: merge only if the corner can move onto
-  the wall axis within the wall-end tolerance, keeping all its planes.
-- Extend the independent audit to near misses.
+- Merge a bar anchor only by moving its whole axis consistently (all anchors
+  stay on one straight line, spans and parameters preserved), within the
+  existing axis movement budgets.
+- Extend the independent audit to near misses and bar-bar intersections.
 - Regression cases with transforms and idempotence.
 
 ### Also pending
