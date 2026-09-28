@@ -101,9 +101,102 @@ fn seed_material(
     }
 }
 
-// Spade's exclusion treats every constraint as a winding boundary. A dangling
-// beam can therefore hide valid material from its angle pass. Revisit only
-// material faces, with fixed constraints protected against encroachment.
+/// Fixed (constraint or hull) edges bucketed by midpoint for encroachment
+/// queries. A point encroaches an edge when it lies in its diametral disc.
+struct Fixed {
+    cell: f64,
+    buckets: BTreeMap<(i64, i64), Vec<[Point2<f64>; 2]>>,
+    long: Vec<[Point2<f64>; 2]>,
+}
+impl Fixed {
+    fn new(region: &Cdt, cell: f64) -> Self {
+        let mut buckets = BTreeMap::<_, Vec<_>>::new();
+        let mut long = vec![];
+        for e in region
+            .undirected_edges()
+            .filter(|e| e.is_constraint_edge() || e.is_part_of_convex_hull())
+        {
+            let [a, b] = e.positions();
+            if (a.x - b.x).hypot(a.y - b.y) > 2. * cell {
+                long.push([a, b]);
+            } else {
+                let key = (
+                    ((a.x + b.x) / 2. / cell).floor() as i64,
+                    ((a.y + b.y) / 2. / cell).floor() as i64,
+                );
+                buckets.entry(key).or_default().push([a, b]);
+            }
+        }
+        Self {
+            cell,
+            buckets,
+            long,
+        }
+    }
+    fn encroaches(&self, c: Point2<f64>) -> bool {
+        let inside =
+            |[a, b]: &[Point2<f64>; 2]| (c.x - a.x) * (c.x - b.x) + (c.y - a.y) * (c.y - b.y) <= 0.;
+        if self.long.iter().any(inside) {
+            return true;
+        }
+        let (i, j) = (
+            (c.x / self.cell).floor() as i64,
+            (c.y / self.cell).floor() as i64,
+        );
+        (i - 1..=i + 1).any(|x| {
+            (j - 1..=j + 1).any(|y| {
+                self.buckets
+                    .get(&(x, y))
+                    .is_some_and(|v| v.iter().any(inside))
+            })
+        })
+    }
+}
+
+fn minimum_angle(p: [Point2<f64>; 3]) -> f64 {
+    let mut angle = 180.0_f64;
+    for i in 0..3 {
+        let a = p[(i + 1) % 3];
+        let b = p[(i + 2) % 3];
+        let o = p[i];
+        let (ax, ay, bx, by) = (a.x - o.x, a.y - o.y, b.x - o.x, b.y - o.y);
+        angle = angle.min(
+            ((ax * bx + ay * by) / (ax.hypot(ay) * bx.hypot(by)))
+                .clamp(-1., 1.)
+                .acos()
+                .to_degrees(),
+        );
+    }
+    angle
+}
+
+/// Off-center of the shortest edge (Üngör): on the bisector towards the
+/// circumcenter, no farther than the apex giving the target angle. It is
+/// closer to the triangle than the circumcenter and encroaches less often.
+fn off_center(p: [Point2<f64>; 3], c: Point2<f64>, angle_degrees: f64) -> Point2<f64> {
+    let (mut a, mut b) = (p[0], p[1]);
+    for i in 0..3 {
+        let (u, v) = (p[i], p[(i + 1) % 3]);
+        if (u.x - v.x).hypot(u.y - v.y) < (a.x - b.x).hypot(a.y - b.y) {
+            (a, b) = (u, v);
+        }
+    }
+    let m = Point2::new((a.x + b.x) / 2., (a.y + b.y) / 2.);
+    let distance = (c.x - m.x).hypot(c.y - m.y);
+    let limit = (a.x - b.x).hypot(a.y - b.y) / 2. / (angle_degrees.to_radians() / 2.).tan();
+    if distance <= limit || distance == 0. {
+        return c;
+    }
+    let k = limit / distance;
+    Point2::new(m.x + (c.x - m.x) * k, m.y + (c.y - m.y) * k)
+}
+
+// Material-only quality pass. It repairs faces the library did not refine:
+// faces next to internal constraints restored after the library pass, and
+// faces the library excluded. Fixed constraints are never split; points in
+// their diametral discs are rejected, with an off-center fallback. Mutually
+// independent points (outside each other's circumcircles) are inserted
+// together, so the result does not depend on stale circumcenters.
 fn refine_material_angles(
     region: &mut Cdt,
     mapping: &BTreeMap<usize, usize>,
@@ -114,11 +207,18 @@ fn refine_material_angles(
     let before = region.num_vertices();
     loop {
         let inside = interior(region, mapping, boundary)?;
-        let fixed: Vec<_> = region
-            .undirected_edges()
-            .filter(|e| e.is_constraint_edge() || e.is_part_of_convex_hull())
-            .map(|e| e.positions())
-            .collect();
+        let fixed = Fixed::new(region, policy.boundary_spacing);
+        let in_material = |c: Point2<f64>| match region.locate(c) {
+            spade::PositionInTriangulation::OnFace(f) => inside.contains(&f.index()),
+            spade::PositionInTriangulation::OnEdge(e) => {
+                let e = region.directed_edge(e);
+                !e.is_constraint_edge()
+                    && [e.face(), e.rev().face()]
+                        .iter()
+                        .all(|f| inside.contains(&f.fix().index()))
+            }
+            _ => false,
+        };
         let mut candidates = vec![];
         for face in region
             .inner_faces()
@@ -132,43 +232,28 @@ fn refine_material_angles(
             if area < policy.maximum_area * MIN_REQUIRED_AREA_RATIO {
                 continue;
             }
-            let mut angle = 180.0_f64;
-            for i in 0..3 {
-                let a = p[(i + 1) % 3];
-                let b = p[(i + 2) % 3];
-                let o = p[i];
-                let (ax, ay, bx, by) = (a.x - o.x, a.y - o.y, b.x - o.x, b.y - o.y);
-                angle = angle.min(
-                    ((ax * bx + ay * by) / (ax.hypot(ay) * bx.hypot(by)))
-                        .clamp(-1., 1.)
-                        .acos()
-                        .to_degrees(),
-                );
-            }
-            if angle + 1e-7 >= policy.minimum_angle_degrees {
+            let angle = minimum_angle(p);
+            let too_large = area > policy.maximum_area;
+            if angle + 1e-7 >= policy.minimum_angle_degrees && !too_large {
                 continue;
             }
             let c = face.circumcenter();
             if !c.x.is_finite() || !c.y.is_finite() {
                 continue;
             }
-            let in_material = match region.locate(c) {
-                spade::PositionInTriangulation::OnFace(f) => inside.contains(&f.index()),
-                spade::PositionInTriangulation::OnEdge(e) => {
-                    let e = region.directed_edge(e);
-                    !e.is_constraint_edge()
-                        && [e.face(), e.rev().face()]
-                            .iter()
-                            .all(|f| inside.contains(&f.fix().index()))
-                }
-                _ => false,
-            };
-            if in_material
-                && !fixed
-                    .iter()
-                    .any(|[a, b]| (c.x - a.x) * (c.x - b.x) + (c.y - a.y) * (c.y - b.y) <= 0.)
+            let radius = (c.x - p[0].x).hypot(c.y - p[0].y);
+            let centroid = Point2::new(
+                (p[0].x + p[1].x + p[2].x) / 3.,
+                (p[0].y + p[1].y + p[2].y) / 3.,
+            );
+            let options = [c, off_center(p, c, policy.minimum_angle_degrees), centroid];
+            if let Some(&x) = options
+                .iter()
+                .find(|&&x| in_material(x) && !fixed.encroaches(x))
             {
-                candidates.push((angle, c));
+                // Size violations first, then the worst angles.
+                let priority = if too_large { -area } else { angle };
+                candidates.push((priority, x, c, radius));
             }
         }
         if candidates.is_empty() {
@@ -178,18 +263,26 @@ fn refine_material_angles(
             return Ok(false);
         }
         candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut accepted: Vec<(Point2<f64>, Point2<f64>, f64)> = vec![];
+        for (_, x, c, r) in candidates {
+            let independent = accepted.iter().all(|(y, d, s)| {
+                (x.x - d.x).hypot(x.y - d.y) > *s && (y.x - c.x).hypot(y.y - c.y) > r
+            });
+            if independent {
+                accepted.push((x, c, r));
+            }
+        }
         let previous = region.num_vertices();
-        // Circumcenters become stale after insertion. Recompute before the
-        // next point, otherwise neighboring candidates can form tiny edges.
-        for (_, p) in candidates.into_iter().take(1) {
+        let room = budget - (previous - before);
+        for (x, _, _) in accepted.into_iter().take(room) {
             if matches!(
-                region.locate(p),
+                region.locate(x),
                 spade::PositionInTriangulation::OnVertex(_)
             ) {
                 continue;
             }
             region
-                .insert(p)
+                .insert(x)
                 .map_err(|_| "invalid material angle vertex")?;
         }
         if previous == region.num_vertices() {
@@ -287,6 +380,15 @@ pub(super) fn refine(
             .iter()
             .filter_map(|(&e, &count)| (count == 1).then_some(e))
             .collect();
+        // Internal constraints (bars, junction lines) are not closed loops.
+        // The library classifies faces by constraint parity, so a dangling
+        // internal line would mark the whole region as exterior. Refine with
+        // the closed region boundary only, then restore internal constraints.
+        let internal: Vec<[usize; 2]> = counts
+            .keys()
+            .filter(|e| !region_boundary.contains(*e) && constraints.contains(*e))
+            .copied()
+            .collect();
         let construct_region = || -> Result<(Cdt, BTreeMap<usize, usize>), &'static str> {
             let mut region = Cdt::new();
             let mut handles = BTreeMap::new();
@@ -296,10 +398,7 @@ pub(super) fn refine(
                 handles.insert(n, h);
                 mapping.insert(h.index(), n);
             }
-            for edge in counts
-                .keys()
-                .filter(|e| region_boundary.contains(*e) || constraints.contains(*e))
-            {
+            for edge in &region_boundary {
                 if !region.can_add_constraint(handles[&edge[0]], handles[&edge[1]]) {
                     return Err("invalid region constraint");
                 }
@@ -307,6 +406,47 @@ pub(super) fn refine(
             }
             Ok((region, mapping))
         };
+        let restore_internal =
+            |region: &mut Cdt, mapping: &BTreeMap<usize, usize>| -> Result<(), &'static str> {
+                // Steiner points encroaching an internal constraint would split it
+                // or leave a sliver beside it; the constraint chain is global.
+                let segments: Vec<_> = internal.iter().map(|e| e.map(|n| uv[&n])).collect();
+                let encroaching: Vec<Point2<f64>> = region
+                    .vertices()
+                    .filter(|v| !mapping.contains_key(&v.fix().index()))
+                    .map(|v| v.position())
+                    .filter(|p| {
+                        segments.iter().any(|[a, b]| {
+                            (p.x - a.x) * (p.x - b.x) + (p.y - a.y) * (p.y - b.y) <= 0.
+                        })
+                    })
+                    .collect();
+                for p in encroaching {
+                    if let Some(v) = region.locate_vertex(p) {
+                        let v = v.fix();
+                        if mapping.contains_key(&v.index()) {
+                            return Err("internal constraint vertex was moved");
+                        }
+                        region.remove(v);
+                    }
+                }
+                // Original vertices were inserted first; removal of later Steiner
+                // points leaves their handles unchanged.
+                let handle: BTreeMap<usize, _> = region
+                    .vertices()
+                    .filter_map(|v| mapping.get(&v.fix().index()).map(|&n| (n, v.fix())))
+                    .collect();
+                for [a, b] in &internal {
+                    if !region.can_add_constraint(handle[a], handle[b]) {
+                        return Err("invalid region constraint");
+                    }
+                    region.add_constraint(handle[a], handle[b]);
+                    if !region.exists_constraint(handle[a], handle[b]) {
+                        return Err("internal constraint split by a vertex");
+                    }
+                }
+                Ok(())
+            };
         let refine_region = || {
             let (mut region, mapping) = construct_region()?;
             let before = region.num_vertices();
@@ -333,6 +473,7 @@ pub(super) fn refine(
                 region.refine(parameters)
             }))
             .map_err(|_| "CDT refinement panicked")?;
+            restore_internal(&mut region, &mapping)?;
             Ok((region, mapping, before, refined))
         };
         let (mut region, mut mapping, before, refined) = refine_region()?;

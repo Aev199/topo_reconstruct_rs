@@ -407,6 +407,15 @@ fn build_impl(
                 boundary.insert(key(pair[0].1, pair[1].1));
             }
         }
+        // Junction lines inside the material are shared constraints. Whether
+        // one separates refinement domains is decided with the bar intervals.
+        for &edge in &surface.embedded_edges {
+            for pair in edge_nodes[edge].windows(2) {
+                let segment = key(pair[0].1, pair[1].1);
+                constraints.insert(segment);
+                internal_constraint_edges.insert(segment);
+            }
+        }
         barriers.extend(&boundary);
         let boundary_nodes: BTreeSet<_> = boundary.iter().flatten().copied().collect();
         constraints.extend(&boundary);

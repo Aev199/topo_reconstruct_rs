@@ -305,6 +305,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         feature_policy: None,
         simplified_holes: vec![],
         axis_assembly: assembly::bars::Report::default(),
+        junctions: assembly::junctions::Report::default(),
         issues: vec![],
         maximum_closure_movement: 0.,
         rejected_vertices: BTreeMap::new(),
@@ -394,5 +395,154 @@ fn cantilever_keeps_topology_and_refines_around_open_constraint() {
             bar.vertices[0].max(bar.vertices[1]),
         ];
         assert_eq!(triangle_edges.get(&edge), Some(&2));
+    }
+}
+
+/// Slab with a wall standing on an interior line (T-junction with both wall
+/// ends inside the slab) and a second wall passing through the slab (interior
+/// crossing). Source FE nodes are shared along both lines.
+fn junction_source() -> topo_reconstruct_rs::input::MeshData {
+    use topo_reconstruct_rs::input::{ElementData, MeshData};
+    let mut mesh = MeshData::default();
+    let mut nodes = BTreeMap::new();
+    let mut add = |coordinates: [(i32, i32, i32); 4], stiffness| {
+        let ids = coordinates
+            .into_iter()
+            .map(|p| {
+                *nodes.entry(p).or_insert_with(|| {
+                    let id = mesh.nodes.len() as u32 + 1;
+                    mesh.nodes
+                        .insert(id, DVec3::new(p.0 as f64, p.1 as f64, p.2 as f64));
+                    id
+                })
+            })
+            .collect();
+        mesh.elements.push(ElementData {
+            id: mesh.elements.len() as u32 + 1,
+            elem_type: 44,
+            stiff_id: stiffness,
+            nodes: ids,
+        });
+    };
+    for x in 0..6 {
+        for y in 0..4 {
+            add(
+                [(x, y, 0), (x + 1, y, 0), (x + 1, y + 1, 0), (x, y + 1, 0)],
+                10,
+            );
+        }
+    }
+    for x in 1..3 {
+        for z in 0..2 {
+            add(
+                [(x, 2, z), (x + 1, 2, z), (x + 1, 2, z + 1), (x, 2, z + 1)],
+                20,
+            );
+        }
+    }
+    for y in 1..3 {
+        for z in -1..1 {
+            add(
+                [(5, y, z), (5, y + 1, z), (5, y + 1, z + 1), (5, y, z + 1)],
+                30,
+            );
+        }
+    }
+    mesh
+}
+
+/// Every model edge of a junction is represented by mesh edges used by the
+/// triangles of both surfaces: one shared subdivision, no overlaid meshes.
+fn assert_mesh_conforming(topology: &assembly::Report, mesh: &mesh::Report) {
+    let model = &topology.preview;
+    let vertices = &mesh.vertices;
+    let mut edges = vec![BTreeSet::new(); model.surfaces().len()];
+    for t in &mesh.triangles {
+        for i in 0..3 {
+            let (a, b) = (t.vertices[i], t.vertices[(i + 1) % 3]);
+            edges[t.surface].insert([a.min(b), a.max(b)]);
+        }
+    }
+    let point = |v: usize| DVec3::from_array(vertices[v]);
+    let eps = topology.policy.precision;
+    for junction in &topology.junctions.junctions {
+        let [s, r] = junction.surfaces;
+        for &e in &junction.edges {
+            let [a, b] = model.edges()[e];
+            let (pa, pb) = (point(a), point(b));
+            let d = pb - pa;
+            let mut on: Vec<(f64, usize)> = edges[s]
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter_map(|v| {
+                    let t = (point(v) - pa).dot(d) / d.length_squared();
+                    ((-1e-12..=1. + 1e-12).contains(&t) && point(v).distance(pa + d * t) <= eps)
+                        .then_some((t, v))
+                })
+                .collect();
+            on.sort_by(|x, y| x.0.total_cmp(&y.0));
+            assert!(on.len() >= 2 && on[0].1 == a && on[on.len() - 1].1 == b);
+            for w in on.windows(2) {
+                let key = [w[0].1.min(w[1].1), w[0].1.max(w[1].1)];
+                assert!(
+                    edges[s].contains(&key) && edges[r].contains(&key),
+                    "junction {:?} edge {e} not shared by both meshes",
+                    junction.surfaces
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn surface_junctions_are_shared_topology_and_conforming_mesh() {
+    for scale in [0.1, 1., 10.] {
+        for rotated in [false, true] {
+            let (topology, mesh) = run_input(junction_source(), scale, rotated);
+            let junctions = &topology.junctions;
+            assert!(junctions.issues.is_empty(), "{:?}", junctions.issues);
+            let kinds: BTreeSet<_> = junctions
+                .junctions
+                .iter()
+                .map(|j| format!("{:?}", j.kind))
+                .collect();
+            assert_eq!(
+                kinds,
+                BTreeSet::from(["Crossing".to_string(), "TJunction".to_string()]),
+                "scale={scale} rotated={rotated}"
+            );
+            // The crossing wall contour already carries the shared FE nodes at
+            // slab level, so no vertex is generated and none is moved.
+            assert!(junctions.generated_vertices.is_empty());
+            assert!(junctions.snapped_vertices.is_empty());
+            assert_eq!(
+                topology.preview.vertices().len(),
+                topology.vertex_source_nodes.len()
+            );
+            assert!(
+                mesh.topology_valid && mesh.quality_passed,
+                "scale={scale} rotated={rotated}: {:?} angle {}",
+                mesh.blockers,
+                mesh.minimum_angle_degrees
+            );
+            assert!(
+                mesh.external_mesher_ready,
+                "{:?}",
+                mesh.external_mesher_blockers
+            );
+            assert_mesh_conforming(&topology, &mesh);
+            // All three property regions keep their source provenance.
+            assert_eq!(
+                mesh.triangles
+                    .iter()
+                    .map(|t| t.stiffness)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([10, 20, 30])
+            );
+            assert!(!mesh.export_ready);
+        }
     }
 }

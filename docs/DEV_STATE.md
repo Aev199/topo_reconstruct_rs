@@ -1,7 +1,7 @@
 # Development state
 
-Updated: 2026-09-20
-Repository baseline reviewed through commit `2e1a9a2`.
+Updated: 2026-09-28
+Repository baseline reviewed through the surface-junction batch (see git log).
 
 This file is intentionally short. It is the entry point for the next development
 session; detailed rationale belongs in `docs/GEOTECHNICAL_GEOMETRY.md` and
@@ -17,124 +17,72 @@ Produce valid, connected structural geometry from imperfect FE input for:
 
 Exact reproduction of the source FE tessellation is not the objective.
 
+## Private fixtures
+
+Three private LIRA text models are used as the Tier C gate (never committed):
+`скала1` (right section, 388 surfaces / 581 axes), `типовая секция`
+(23 / 291) and `тест 5` (108 / 8).
+
 ## Current verified state
 
-The current geotechnical assembly preserves supported source coverage on the
-private full `скала1` fixture:
+Surface-surface junctions are explicit shared topology
+(`assembly::junctions`, surface `embedded_edges`), and both meshes use one
+subdivision of every junction edge. Verified on all three private models:
 
-- 388 assembled surfaces;
-- 581 assembled axes;
-- 0 unresolved supported surface source elements in the mesh;
-- 0 unresolved supported axis source elements in the mesh;
-- trial topology gate passes;
-- external-mesher trial gate passes;
-- no invalid individual surfaces in the current global surface audit;
-- maximum reported boundary planarity error: 3.795e-15 m;
-- no positive-area coplanar overlaps detected;
-- no parallel projected-overlap near-face findings within the implemented
-  50 mm audit check.
+| Global surface audit | скала1 | типовая секция | тест 5 |
+|---|---:|---:|---:|
+| Unrepresented junction segments (before → after) | 520 → 7 | 400 → 0 | 2194 → 0 |
+| Segments lacking shared mesh edges | 455 → 7 | 292 → 0 | 2194 → 0 |
+| Audit passed | no | yes | yes |
 
-Interior mesh refinement was repaired. On the last verified full-model run:
+Everywhere: 0 invalid surfaces, 0 coplanar overlaps, 0 unresolved source
+elements, trial topology and external-mesher gate pass, surface/axis counts
+unchanged, 0 reconciliation problems. Debug and release outputs are identical.
 
-- maximum triangle area: 0.399988 m²;
-- minimum triangle angle: 2.39098°;
-- triangles below 20°: 163;
-- 22,170 shell triangles;
-- 4,482 bar segments;
-- refinement cap is not reached.
+Mesh quality (below 20°): скала1 163 → 73 (min 2.39°), типовая секция 0,
+тест 5 261 (min 1.93°). The тест 5 baseline (53) was not comparable: its
+slab meshes ignored 2194 junction segments.
 
-The user accepted the present local triangle quality as adequate for the next
-MIDAS-oriented step. Do not spend the next batch chasing the 20° target unless a
-new solver/import failure shows it is necessary.
+## Current blockers
 
-## Current blocker
-
-The global surface-junction audit does **not** pass.
-
-Last verified audit:
-
-- 1,426 candidate surface pairs;
-- 830 conforming boundary-contact segments;
-- 520 unrepresented intersection segments;
-- 109 distinct affected surface pairs;
-- 498 T-junction segments requiring conformity;
-- 20 interior-crossing segments requiring conformity;
-- 2 boundary-junction segments requiring conformity;
-- 65 of those segments already conforming in the mesh;
-- 455 still lacking shared mesh-edge coverage.
-
-These are structural junctions to represent, not surfaces to delete.
+1. скала1 residual (7 segments, 3 pairs), reported, not repaired:
+   duplicated source nodes at identical positions joining coplanar panels
+   (`coincident_distinct_vertices`) and a wall corner 0.08 mm from a slab
+   vertex that anchors a bar (`junction_vertex_near_edge_end`). Both need an
+   explicit vertex-identity rule (merge with provenance, or a declared seam),
+   never coordinate welding.
+2. Near-miss features of 4.6–25 mm inside one surface (e.g. wall lines offset
+   by millimetres on a slab) force the remaining acute triangles in тест 5.
+   They exceed the 1 mm snap limit and need an evidence-based rule.
 
 ## Next coherent development batch
 
 ### Goal
 
-Make surface-surface junctions topologically explicit and mesh-conforming for
-the intersection classes already detected by the global auditor.
+Vertex identity and near-miss repair with provenance, so the global audit
+passes on all three fixtures and small offsets stop forcing acute triangles.
 
 ### Required approach
 
-- Derive intersection lines geometrically from the participating surfaces.
-- Insert the junction into the shared topology, not independently into two
-  coincident meshes.
-- Split affected surface regions as needed.
-- Synchronize mesh vertices/edges on both sides of the junction.
-- Preserve property/material regions and source provenance through the split.
-- Treat T-junctions, interior crossings and boundary contacts by geometry class,
-  not by source IDs.
-- Keep the global auditor independent/read-only.
+- Classify coincident distinct vertices: same support planes and no source
+  release/hinge information → merge identity with provenance; otherwise keep
+  as a declared seam that the auditor accepts explicitly.
+- Near-miss vertex/edge pairs inside a surface within an adaptive tolerance
+  (local feature size, not a global constant): move onto the edge only when
+  every plane of the vertex is kept and the move is recorded; bar anchors move
+  only with their axis.
+- Extend the independent audit to near misses (the current audit ignores them).
+- Regression cases before/with the fix, with transforms and idempotence.
 
-### Regression cases before/with implementation
+### Also pending
 
-At minimum cover:
-
-- a T-junction terminating in another panel interior;
-- two panels with an interior crossing;
-- a junction ending on an existing boundary vertex;
-- a junction that crosses a property-region boundary;
-- reversed surface orientation/normals;
-- translated/rotated geometry;
-- a nearby but non-intersecting surface pair that must remain separate.
-
-Where practical, verify idempotence: assembling an already conforming junction
-must not continue splitting or moving it.
-
-### Batch acceptance
-
-Tier A:
-
-```sh
-cargo test --offline
-```
-
-Relevant global-audit Python unit tests must also pass.
-
-Before the private full-model run, the synthetic cases must demonstrate shared
-model-edge identity and shared mesh-edge coverage along the whole expected
-junction.
-
-On the private full model, compare at least:
-
-- invalid surfaces;
-- coplanar overlaps;
-- unrepresented intersection segments;
-- affected surface pairs;
-- mesh-conforming intersection segments;
-- unresolved source-element coverage;
-- surface/axis counts;
-- triangle/bar-segment counts;
-- provenance/reconciliation failures.
-
-The batch must not trade fewer junction defects for new invalid faces,
-overlaps, lost provenance or missing source-element coverage.
-
-A useful target is to eliminate the currently implemented classes of
-unrepresented junctions. If some remain, classify the residual geometry and add
-a regression case instead of relaxing the audit.
+- Isolated point contacts, bar-bar intersections, load/property transfer.
+- Actual MIDAS/PLAXIS import verification.
+- `panic = "abort"` in release makes the Spade `catch_unwind` ineffective.
 
 ## Explicitly not complete yet
 
-Even if the next surface-junction batch passes, global readiness is not yet
+Even where the surface audit passes, global readiness is not yet
 proven. Remaining audit scope includes:
 
 - isolated point contacts;
@@ -165,9 +113,10 @@ The repository is public, so standard hosted-runner compute is currently free
 for public-repository Actions. Still avoid waste because artifact/cache storage,
 queue time and developer attention remain finite.
 
-Current `.github/workflows/build.yml` builds Windows and Ubuntu release
-binaries on pushes/PRs and can also be dispatched manually. During geometry
-iteration:
+Current `.github/workflows/build.yml` runs `cargo test --locked` on pushes and
+PRs to `main`/`master`; Windows/Linux release binaries are built only by a
+manual dispatch with `build_release`. Feature branches do not trigger CI.
+During geometry iteration:
 
 - use `[skip ci]` when a cross-platform release build adds no information;
 - do not use Actions for the private full-model loop;

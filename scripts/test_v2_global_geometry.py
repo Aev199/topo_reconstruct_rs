@@ -109,6 +109,34 @@ class GlobalAuditTests(unittest.TestCase):
         self.assertEqual(r['issues'][0]['contact_kind'], 'crossing')
         self.assertAlmostEqual(r['issues'][0]['length'], 1)
 
+    @staticmethod
+    def wall_edge(data, z):
+        preview = data['topology']['preview']
+        ids = [i for i, p in enumerate(preview['vertices'])
+               if abs(p[1]-.5) < 1e-12 and abs(p[2]-z) < 1e-12]
+        return preview['edges'].index(tuple(sorted(ids)))
+
+    def test_embedded_edge_represents_t_junction(self):
+        data = model([xy(), wall(y=.5)])
+        preview = data['topology']['preview']
+        preview['surfaces'][0]['embedded_edges'] = [self.wall_edge(data, 0)]
+        r = audit(data)
+        self.assertTrue(r['global_surface_checks_passed'], r['issues'])
+        self.assertEqual(r['contacts'][0]['kind'], 't_junction')
+        self.assertTrue(r['contacts'][0]['geometry_conforming'])
+
+    def test_embedded_edge_must_lie_inside_surface(self):
+        data = model([xy(), wall(y=.5)])
+        preview = data['topology']['preview']
+        # The wall top edge is off the slab plane and outside its material.
+        preview['surfaces'][0]['embedded_edges'] = [self.wall_edge(data, 1)]
+        r = audit(data)
+        self.assertFalse(r['global_surface_checks_passed'])
+        self.assertTrue(r['invalid_surfaces'])
+        # A boundary edge listed as embedded is also rejected.
+        preview['surfaces'][0]['embedded_edges'] = [preview['surfaces'][0]['boundaries'][0][0]['edge']]
+        self.assertEqual(audit(data)['invalid_surfaces'][0]['reason'], 'invalid embedded edges')
+
 
 if __name__ == '__main__':
     unittest.main()

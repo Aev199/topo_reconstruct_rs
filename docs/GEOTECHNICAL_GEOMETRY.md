@@ -176,3 +176,108 @@ coplanar overlaps, near faces, disjoint surfaces, holes, duplicated mesh node ID
 and translated/reversed-normal geometry. The full-model strict run exits 1 as
 expected and writes the complete diagnostic report before exiting. Private source
 coordinates and the full report are not committed.
+
+## Explicit surface junctions, 2026-09-28
+
+Surface-surface junctions are now shared topology. After axis assembly (the
+last stage that may move boundary anchors) `assembly::junctions::insert`:
+
+- intersects every pair of non-parallel surfaces (plane-plane line clipped by
+  both closed contours) and every pair of coplanar surfaces with overlapping
+  collinear boundary edges;
+- builds one ordered chain of vertices along each junction segment from the
+  existing vertices of both surfaces and their mandatory interior nodes (bar
+  contacts, retained nodes of closed openings);
+- creates a vertex only where a junction ends inside an edge, at the exact
+  intersection of that edge with the other plane, and splits the edge
+  globally, for every surface using it;
+- keeps a junction edge on a contour as a boundary edge and records it inside
+  the material as a surface `embedded_edges` entry with the same edge id.
+
+No property region is divided and no source element changes owner. Embedded
+edges are mesh constraints: the mesh of both surfaces uses one global
+subdivision of each junction edge. The pass is idempotent.
+
+Sub-millimetre source misalignments are closed rather than turned into
+parasitic edges. When a required junction vertex falls within the minimum
+edge length (1 mm by default) of an existing unlocked vertex, that vertex is
+moved onto the junction; likewise an embedded line ending within that
+distance of an edge of the same surface is extended onto it. A move is
+accepted only if the vertex stays on every plane it lies on and all affected
+contours revalidate; each move is recorded in `junctions.snapped_vertices`.
+Bar anchors and mandatory interior nodes never move. Distinct vertices at
+one location are reported (`coincident_distinct_vertices`) and never merged,
+since a duplicated source node may be an intentional seam or hinge.
+
+Mesh changes made necessary by embedded junction lines:
+
+- Spade classifies refinement faces by constraint parity. A dangling internal
+  line (a wall ending inside a slab) made it treat entire material regions as
+  exterior, so their angle refinement was skipped. Regions are now refined with
+  their closed boundary only; internal constraints are then restored after
+  removing Steiner points that encroach them, and a material-only pass
+  (circumcenter, off-center or centroid; independent points inserted in
+  batches) repairs angle and area near them.
+- Shared constraint edges are subdivided with density `1/size`, where size is
+  the distance to the nearest non-adjacent edge of any owning surface, capped
+  by the nominal spacing. Uniform subdivision is reproduced exactly when no
+  feature is nearby. Constraint chains stay global, so conformity is unchanged.
+
+JSON schema additions: `topology.junctions` (report), surface
+`embedded_edges`, `preview.orphaned_edges`. Vertices with index
+`>= vertex_source_nodes.len()` are generated junction vertices listed in
+`topology.junctions.generated_vertices`; they have no source node. The Python
+auditors accept embedded edges only after checking that each lies inside its
+surface and on its plane, and that none duplicates a contour edge.
+
+Private full-model verification (fixtures and reports not committed;
+unrepresented = audit segments lacking shared model edges):
+
+| Measurement | скала1 before | after | типовая секция before | after | тест 5 before | after |
+|---|---:|---:|---:|---:|---:|---:|
+| Surfaces / axes | 388 / 581 | 388 / 581 | 23 / 291 | 23 / 291 | 108 / 8 | 108 / 8 |
+| Invalid surfaces, coplanar overlaps | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 | 0, 0 |
+| Unrepresented junction segments | 520 | 7 | 400 | 0 | 2194 | 0 |
+| Affected surface pairs | 109 | 3 | 40 | 0 | 229 | 0 |
+| Segments lacking shared mesh edges | 455 | 7 | 292 | 0 | 2194 | 0 |
+| Global surface audit passed | no | no | no | yes | no | yes |
+| Unresolved surface / axis source elements | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| Trial topology valid, external-mesher gate | yes, yes | yes, yes | yes, yes | yes, yes | yes, yes | yes, yes |
+| Triangles | 22170 | 23196 | 14514 | 14346 | 34065 | 49485 |
+| Bar segments | 4482 | 4537 | 3032 | 3034 | 79 | 79 |
+| Minimum triangle angle | 2.391° | 2.391° | 20.17° | 20.21° | 9.67° | 1.93° |
+| Triangles below 20° | 163 | 73 | 0 | 0 | 53 | 261 |
+| Maximum triangle area, m² | 0.400 | 0.400 | 0.469 | 0.469 | 0.432 | 0.400 |
+| Reconciliation problems | 0 | 0 | 0 | 0 | 0 | 0 |
+
+The "before" meshes of тест 5 were locally better only because 2194 junction
+segments were not in the slab meshes at all; that mesh was not conforming.
+The remaining low angles there are driven by source features 4.6–25 mm apart
+(for example wall lines offset by a few millimetres on one slab), above the
+1 mm snap limit. They need an explicit near-miss rule with its own evidence,
+not a larger silent tolerance.
+
+The 7 скала1 residual segments are explained and reported: three coplanar
+panels of one slab meet with duplicated source nodes at identical positions
+(`coincident_distinct_vertices`), and one wall corner lies 0.08 mm from a slab
+vertex that anchors a bar and therefore may not move
+(`junction_vertex_near_edge_end`). Both need an explicit vertex-identity
+decision, not coordinate merging.
+
+Validation: 138 Rust tests pass, including 11 synthetic junction cases (T-junction,
+interior crossing, junction leaving a panel, ending on an existing vertex,
+crossing a property-region boundary, walls meeting on a slab, interior node on
+a junction, micro-offset corner, wall ending short of a slab edge, coincident
+vertices, nearby separate panels) under three scales, a rigid transform and
+reversed normals, all with an idempotence check; and an FE-to-mesh test with a
+T-shaped and a crossing wall verifying shared mesh edges on both sides and the
+full 20° / area quality profile. 12 Python audit tests pass. Debug and release
+outputs of all three private models were compared field by field.
+
+Toolchain note: with `lto = true` and one codegen unit, rustc 1.94.1 produced a
+wrong value for an `Option<DVec3>` returned by an inlined helper (reproduced only
+in release; debug and non-LTO release were correct). The helper was restructured
+and the three-model debug/release comparison is identical. Keep that comparison
+in the full-model gate. Separately, `panic = "abort"` in the release profile
+means the existing `catch_unwind` around Spade refinement cannot turn a library
+panic into a diagnostic in release builds.

@@ -112,6 +112,150 @@ fn validate_surface(surface: usize, model: &Model) -> Result<(), &'static str> {
         .ok_or("invalid contact surface")
 }
 
+/// Local feature size for shared constraint edges. A constraint vertex
+/// chain is fixed during surface refinement, so two nearby constraint lines
+/// subdivided at the nominal spacing would enclose unavoidable slivers. The
+/// size at a point is its distance to the nearest non-adjacent edge of any
+/// surface owning the constraint, capped by the nominal spacing. Every owner
+/// receives the same graded chain, so conformity is unchanged.
+struct Sizing {
+    segments: Vec<(usize, [usize; 2], DVec3, DVec3)>,
+    by_surface: Vec<Vec<usize>>,
+    spacing: f64,
+}
+
+impl Sizing {
+    fn new(model: &Model, vertices: &[[f64; 3]], spacing: f64) -> Self {
+        let segments = model
+            .edges
+            .iter()
+            .enumerate()
+            .map(|(e, &[a, b])| (e, [a, b], point(&vertices[a]), point(&vertices[b])))
+            .collect();
+        let by_surface = (0..model.surfaces.len())
+            .map(|s| model.surface_edges(s).collect())
+            .collect();
+        Self {
+            segments,
+            by_surface,
+            spacing,
+        }
+    }
+
+    /// Edges of the owning surfaces within the nominal spacing of `edge`.
+    fn features(&self, edge: usize, owners: &BTreeSet<usize>) -> Vec<(DVec3, DVec3)> {
+        let (_, ends, a, b) = self.segments[edge];
+        let low = a.min(b) - DVec3::splat(self.spacing);
+        let high = a.max(b) + DVec3::splat(self.spacing);
+        let mut seen = BTreeSet::new();
+        let mut out = vec![];
+        for &s in owners {
+            for &f in &self.by_surface[s] {
+                let (_, [c, d], pc, pd) = self.segments[f];
+                if f == edge || ends.contains(&c) || ends.contains(&d) || !seen.insert(f) {
+                    continue;
+                }
+                if pc.max(pd).cmplt(low).any() || pc.min(pd).cmpgt(high).any() {
+                    continue;
+                }
+                out.push((pc, pd));
+            }
+        }
+        out
+    }
+
+    fn size(&self, p: DVec3, features: &[(DVec3, DVec3)]) -> f64 {
+        let mut h = self.spacing;
+        for &(a, b) in features {
+            let d = b - a;
+            let t = ((p - a).dot(d) / d.length_squared()).clamp(0., 1.);
+            h = h.min(p.distance(a + d * t));
+        }
+        h.max(self.spacing * MINIMUM_SIZE_RATIO)
+    }
+}
+
+/// Lower bound of the graded size relative to the nominal spacing.
+const MINIMUM_SIZE_RATIO: f64 = 1e-3;
+
+/// Subdivide a chain with point density `1 / size`. For a constant size this
+/// is exactly the uniform subdivision; the placement depends only on the
+/// geometry of the edge, not on its orientation or vertex ids.
+fn graded(
+    chain: &[(f64, usize)],
+    vertices: &mut Vec<[f64; 3]>,
+    size: impl Fn(DVec3) -> f64,
+    spacing: f64,
+    limit: usize,
+    precision: f64,
+) -> Result<Vec<(f64, usize)>, &'static str> {
+    let mut out = vec![chain[0]];
+    for pair in chain.windows(2) {
+        let [(ta, a), (tb, b)] = [pair[0], pair[1]];
+        let pa = point(&vertices[a]);
+        let pb = point(&vertices[b]);
+        let length = pa.distance(pb);
+        // Sample the density; the size is 1-Lipschitz, so a quarter of the
+        // local size resolves it. Symmetric sampling keeps orientation
+        // independence.
+        let mut samples = vec![(0., 1. / size(pa))];
+        let mut s = 0.;
+        let mut uniform = samples[0].1 * spacing <= 1. + 1e-12;
+        while s < length {
+            let h = size(pa.lerp(pb, s / length));
+            s = (s + (h / 4.).max(precision)).min(length);
+            let density = 1. / size(pa.lerp(pb, s / length));
+            uniform &= density * spacing <= 1. + 1e-12;
+            samples.push((s, density));
+            if samples.len() > 16 * limit.max(1) {
+                return Err("constraint subdivision limit");
+            }
+        }
+        let count = if uniform {
+            ((length - precision) / spacing).ceil().max(1.)
+        } else {
+            let mut total = 0.;
+            let mut cumulative = vec![0.];
+            for w in samples.windows(2) {
+                total += (w[1].0 - w[0].0) * (w[0].1 + w[1].1) / 2.;
+                cumulative.push(total);
+            }
+            let count = (total - precision / spacing).ceil().max(1.);
+            if count.is_finite() && count <= limit as f64 {
+                let mut k = 0;
+                for i in 1..count as usize {
+                    let target = total * i as f64 / count;
+                    while cumulative[k + 1] < target {
+                        k += 1;
+                    }
+                    let (c0, c1) = (cumulative[k], cumulative[k + 1]);
+                    let x = samples[k].0
+                        + (samples[k + 1].0 - samples[k].0) * (target - c0) / (c1 - c0);
+                    let u = x / length;
+                    let id = vertices.len();
+                    vertices.push(pa.lerp(pb, u).to_array());
+                    out.push((ta + (tb - ta) * u, id));
+                }
+                out.push((tb, b));
+                continue;
+            }
+            count
+        };
+        if !count.is_finite() || count > limit as f64 {
+            return Err("constraint subdivision limit");
+        }
+        let count = count as usize;
+        for i in 1..count {
+            let u = i as f64 / count as f64;
+            let id = vertices.len();
+            vertices.push(pa.lerp(pb, u).to_array());
+            out.push((ta + (tb - ta) * u, id));
+        }
+        out.push((tb, b));
+    }
+    Ok(out)
+}
+
 pub(super) fn synchronize(
     model: &Model,
     axes: &[Axis],
@@ -229,15 +373,16 @@ pub(super) fn synchronize(
     }
 
     let mut owners = vec![BTreeSet::new(); model.edges.len()];
-    for (surface, item) in model.surfaces.iter().enumerate() {
-        for edge in item.boundaries.iter().flatten() {
+    for surface in 0..model.surfaces.len() {
+        for edge in model.surface_edges(surface) {
             let owner = owners
-                .get_mut(edge.edge)
+                .get_mut(edge)
                 .ok_or("invalid surface edge reference")?;
             owner.insert(surface);
         }
     }
     let shared_edge_count = owners.iter().filter(|owner| owner.len() > 1).count();
+    let sizing = Sizing::new(model, vertices, policy.boundary_spacing);
     let mut edge_nodes = Vec::with_capacity(model.edges.len());
     for (edge_id, &[a, b]) in model.edges.iter().enumerate() {
         let pa = point(vertices.get(a).ok_or("invalid model edge vertex")?);
@@ -273,9 +418,11 @@ pub(super) fn synchronize(
             }
         }
         sorted(&mut chain, vertices, precision)?;
-        edge_nodes.push(subdivide(
+        let features = sizing.features(edge_id, &owners[edge_id]);
+        edge_nodes.push(graded(
             &chain,
             vertices,
+            |p| sizing.size(p, &features),
             policy.boundary_spacing,
             policy.maximum_added_vertices_per_surface,
             precision,
@@ -297,8 +444,8 @@ pub(super) fn synchronize(
             continue;
         };
         let [a, b] = axes[axis].endpoints;
-        for edge_use in model.surfaces[surface].boundaries.iter().flatten() {
-            for &(_, vertex) in &edge_nodes[edge_use.edge] {
+        for edge in model.surface_edges(surface) {
+            for &(_, vertex) in &edge_nodes[edge] {
                 if let Some(t) = parameter(
                     point(&vertices[vertex]),
                     point(&vertices[a]),
@@ -452,7 +599,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(common_edge, vec![0, first[0].vertex, first[1].vertex, 1]);
         assert_eq!(synced.report.axis_node_count, 4);
-        assert_eq!(synced.report.edge_node_count, 16);
+        // The nominal spacing exceeds the panels. The 4 m outer edges are 2 m
+        // from the opposite shared edge, so graded sizing splits each once.
+        assert_eq!(synced.report.edge_node_count, 18);
     }
 
     #[test]

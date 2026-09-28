@@ -52,9 +52,16 @@ class Surface:
         self.rings = [self.lift(np.asarray(r)) for r in record["contours"]]
         self.points = np.concatenate(self.rings)
         self.low, self.high = self.points.min(axis=0), self.points.max(axis=0)
-        self.edge_ids = {e["edge"] for ring in record["boundaries"] for e in ring}
+        boundary = {e["edge"] for ring in record["boundaries"] for e in ring}
+        # Embedded edges are junction lines inside the material. They count as
+        # surface topology only if they are checked to lie in the surface.
+        self.embedded = set(record.get("embedded_edges", []))
+        self.edge_ids = boundary | self.embedded
         ids = {v for e in self.edge_ids for v in model["edges"][e]}
         self.planarity = float(np.max(np.abs((vertices[list(ids)] - self.o) @ self.n)))
+        self.embedded_on_boundary = sorted(self.embedded & boundary)
+        self.embedded_segments = [(e, LineString(self.project(vertices[list(model["edges"][e])])))
+                                  for e in sorted(self.embedded - boundary)]
 
     def project(self, points):
         d = points - self.o
@@ -78,6 +85,15 @@ def audit(data, near_distance=0.05):
     for s in surfaces:
         if not s.shape.is_valid or s.shape.area <= eps * eps or s.planarity > eps:
             invalid.append(dict(surface=s.index, reason=explain_validity(s.shape),
+                                planarity=s.planarity, area=s.shape.area))
+            continue
+        region = s.shape.buffer(eps)
+        outside = [e for e, line in s.embedded_segments
+                   if line.length <= eps or not region.covers(line)]
+        if outside or s.embedded_on_boundary:
+            invalid.append(dict(surface=s.index, reason="invalid embedded edges",
+                                embedded_outside=outside,
+                                embedded_on_boundary=s.embedded_on_boundary,
                                 planarity=s.planarity, area=s.shape.area))
     invalid_ids = {s["surface"] for s in invalid}
     mesh = data.get("mesh")

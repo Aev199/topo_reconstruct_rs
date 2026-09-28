@@ -123,7 +123,8 @@ def check_mesh(mesh, model, bars):
     bindings = synchronization["endpoint_bindings"]
     assert synchronization["synchronized_interval_endpoints"] == len(bindings)
     assert synchronization["axis_node_count"] <= len(vertices)
-    assert synchronization["edge_node_count"] <= len(vertices)
+    # Chain endpoints are counted once per edge; interior chain nodes are distinct.
+    assert synchronization["edge_node_count"] <= len(vertices) + 2 * len(model["edges"])
     assert synchronization["interval_contact_count"] <= len(bars["contacts"])
     for binding in bindings:
         _id(binding["axis"], axis_count)
@@ -151,7 +152,11 @@ def check(data, baseline=None):
     epsilon = topology["policy"]["precision"]
     vertices = model["vertices"]
     source_nodes = topology["vertex_source_nodes"]
-    assert len(vertices) == len(source_nodes) == len(set(source_nodes))
+    assert len(source_nodes) == len(set(source_nodes))
+    # Junction vertices are created at edge/plane intersections after all
+    # source vertices; they have no source node and are listed explicitly.
+    generated = topology.get("junctions", {}).get("generated_vertices", [])
+    assert sorted(generated) == list(range(len(source_nodes), len(vertices)))
     lookup = {n: i for i, n in enumerate(frame["node_ids"])}
     budget = {n: frame["policy"]["maximum_movement"] for n in source_nodes}
     for axis in frame["axes"]:
@@ -189,6 +194,12 @@ def check(data, baseline=None):
                 assert math.dist(lifted, vertices[start]) <= epsilon
                 for v in model["edges"][edge["edge"]]:
                     assert abs(distance(surface, vertices[v])) <= epsilon
+        boundary = {e["edge"] for ring in surface["boundaries"] for e in ring}
+        embedded = surface.get("embedded_edges", [])
+        assert len(embedded) == len(set(embedded)) and not boundary & set(embedded)
+        for edge in embedded:
+            for v in model["edges"][edge]:
+                assert abs(distance(surface, vertices[v])) <= epsilon
 
     expected_bars = [s["element"] for a in frame["axes"] for s in a["spans"]]
     actual_bars = [s["element"] for a in bars["axes"] for s in a["spans"]]

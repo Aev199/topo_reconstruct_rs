@@ -77,6 +77,10 @@ pub struct Surface {
     /// Exterior first, followed by holes. Geometry lives in plane coordinates.
     pub contours: Vec<Vec<[f64; 2]>>,
     pub boundaries: Vec<Vec<EdgeUse>>,
+    /// Model edges lying inside the material (not on a contour): explicit
+    /// junction lines shared with other surfaces. They impose topology on
+    /// the surface and its mesh without dividing its property region.
+    pub embedded_edges: Vec<usize>,
     pub source_elements: Vec<u32>,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +91,9 @@ pub struct Model {
     vertices: Vec<[f64; 3]>,
     edges: Vec<[usize; 2]>,
     surfaces: Vec<Surface>,
+    /// Edges replaced by two pre-existing pieces during a split. They are
+    /// referenced by no surface and kept only to preserve edge ids.
+    orphaned_edges: Vec<usize>,
     #[serde(skip)]
     edge_index: BTreeMap<[usize; 2], usize>,
 }
@@ -106,6 +113,7 @@ impl Model {
             vertices: vec![],
             edges: vec![],
             surfaces: vec![],
+            orphaned_edges: vec![],
             edge_index: BTreeMap::new(),
         })
     }
@@ -171,22 +179,7 @@ impl Model {
             validate_ring(&uv, self.precision)?;
             contours.push(uv);
         }
-        let polygon = |r: &Vec<[f64; 2]>| {
-            let points: Vec<_> = r.iter().chain(r.first()).map(|p| (p[0], p[1])).collect();
-            Polygon::new(LineString::from(points), vec![])
-        };
-        let outer = polygon(&contours[0]);
-        for i in 1..contours.len() {
-            let hole = polygon(&contours[i]);
-            if !outer.contains(&hole) || outer.exterior().intersects(hole.exterior()) {
-                return Err(Error::InvalidRing);
-            }
-            for previous in &contours[1..i] {
-                if polygon(previous).intersects(&hole) {
-                    return Err(Error::InvalidRing);
-                }
-            }
-        }
+        validate_holes(&contours)?;
         // All validation precedes mutation, including edge interning.
         let boundaries = rings
             .iter()
@@ -216,10 +209,319 @@ impl Model {
             plane,
             contours,
             boundaries,
+            embedded_edges: vec![],
             source_elements,
         });
         Ok(id)
     }
+    pub fn vertices(&self) -> &[[f64; 3]] {
+        &self.vertices
+    }
+    pub fn precision(&self) -> f64 {
+        self.precision
+    }
+    pub fn minimum_edge(&self) -> f64 {
+        self.minimum_edge
+    }
+    /// Boundary and embedded edges of a surface.
+    pub fn surface_edges(&self, surface: usize) -> impl Iterator<Item = usize> + '_ {
+        let s = &self.surfaces[surface];
+        s.boundaries
+            .iter()
+            .flatten()
+            .map(|e| e.edge)
+            .chain(s.embedded_edges.iter().copied())
+    }
+    pub fn edge_between(&self, a: usize, b: usize) -> Option<usize> {
+        self.edge_index.get(&[a.min(b), a.max(b)]).copied()
+    }
+
+    /// Split one global edge at an explicit vertex. Every surface using the
+    /// edge, as a boundary or embedded edge, receives the same two pieces, so
+    /// shared identity is preserved. Validation precedes mutation.
+    pub fn split_edge(&mut self, edge: usize, vertex: usize) -> Result<usize, Error> {
+        let [a, b] = *self.edges.get(edge).ok_or(Error::InvalidVertex)?;
+        let p = DVec3::from_array(*self.vertices.get(vertex).ok_or(Error::InvalidVertex)?);
+        if vertex == a || vertex == b {
+            return Err(Error::InvalidVertex);
+        }
+        let pa = DVec3::from_array(self.vertices[a]);
+        let pb = DVec3::from_array(self.vertices[b]);
+        let d = pb - pa;
+        let t = (p - pa).dot(d) / d.length_squared();
+        if !(t > 0. && t < 1.) || p.distance(pa + d * t) > self.precision {
+            return Err(Error::InvalidVertex);
+        }
+        if p.distance(pa) < self.minimum_edge || p.distance(pb) < self.minimum_edge {
+            return Err(Error::ShortEdge);
+        }
+        let users: Vec<usize> = (0..self.surfaces.len())
+            .filter(|&s| self.surface_edges(s).any(|e| e == edge))
+            .collect();
+        for &s in &users {
+            if self.planes[self.surfaces[s].plane]
+                .distance(p.to_array())
+                .abs()
+                > self.precision
+            {
+                return Err(Error::NonPlanar);
+            }
+        }
+        let first = [a.min(vertex), a.max(vertex)];
+        let second = [b.min(vertex), b.max(vertex)];
+        // A piece may already exist, e.g. when the vertex is joined to an end
+        // by another surface. Reuse it: one edge per vertex pair. The original
+        // edge keeps its id for the first new piece whenever possible.
+        let (existing_first, existing_second) = (
+            self.edge_index.get(&first).copied(),
+            self.edge_index.get(&second).copied(),
+        );
+        for (piece, users_of) in [(existing_first, &users), (existing_second, &users)] {
+            if let Some(piece) = piece {
+                if users_of
+                    .iter()
+                    .any(|&s| self.surface_edges(s).any(|e| e == piece))
+                {
+                    // The surface would use both the edge and its piece.
+                    return Err(Error::InvalidRing);
+                }
+            }
+        }
+        self.edge_index.remove(&[a, b]);
+        let e_first = match existing_first {
+            Some(id) => id,
+            None => {
+                self.edges[edge] = first;
+                self.edge_index.insert(first, edge);
+                edge
+            }
+        };
+        let e_second = match existing_second {
+            Some(id) => id,
+            None if e_first != edge => {
+                self.edges[edge] = second;
+                self.edge_index.insert(second, edge);
+                edge
+            }
+            None => {
+                self.edges.push(second);
+                self.edge_index.insert(second, self.edges.len() - 1);
+                self.edges.len() - 1
+            }
+        };
+        if e_first != edge && e_second != edge {
+            // Both pieces existed. The original id is left unreferenced with a
+            // key no other edge uses; it is no longer indexed.
+            self.orphaned_edges.push(edge);
+        }
+        for s in users {
+            let plane = self.planes[self.surfaces[s].plane].clone();
+            let uv = plane.project(p.to_array());
+            let surface = &mut self.surfaces[s];
+            for (ring, contour) in surface.boundaries.iter_mut().zip(&mut surface.contours) {
+                if let Some(k) = ring.iter().position(|e| e.edge == edge) {
+                    let reversed = ring[k].reversed;
+                    let (start, end) = if reversed { (b, a) } else { (a, b) };
+                    let piece = |from: usize, to: usize, id: usize| EdgeUse {
+                        edge: id,
+                        reversed: from > to,
+                    };
+                    let (e0, e1) = if reversed {
+                        (e_second, e_first)
+                    } else {
+                        (e_first, e_second)
+                    };
+                    ring[k] = piece(start, vertex, e0);
+                    ring.insert(k + 1, piece(vertex, end, e1));
+                    contour.insert(k + 1, uv);
+                }
+            }
+            if let Some(k) = surface.embedded_edges.iter().position(|&e| e == edge) {
+                surface.embedded_edges.remove(k);
+                surface.embedded_edges.extend([e_first, e_second]);
+            }
+        }
+        Ok(e_second)
+    }
+
+    /// Move a vertex, revalidating every surface that uses it: planarity,
+    /// minimum edge length, ring validity, holes and embedded edges. The
+    /// model is unchanged on error.
+    pub fn move_vertex(&mut self, vertex: usize, target: [f64; 3]) -> Result<(), Error> {
+        if vertex >= self.vertices.len() || !DVec3::from_array(target).is_finite() {
+            return Err(Error::InvalidVertex);
+        }
+        let users: Vec<usize> = (0..self.surfaces.len())
+            .filter(|&s| {
+                self.surface_edges(s)
+                    .any(|e| self.edges[e].contains(&vertex))
+            })
+            .collect();
+        let position = |v: usize| {
+            if v == vertex {
+                target
+            } else {
+                self.vertices[v]
+            }
+        };
+        let mut updates = vec![];
+        for &s in &users {
+            let surface = &self.surfaces[s];
+            let plane = &self.planes[surface.plane];
+            let mut contours = vec![];
+            for ring in &surface.boundaries {
+                let mut uv = vec![];
+                for e in ring {
+                    let [a, b] = self.edges[e.edge];
+                    let (from, to) = if e.reversed { (b, a) } else { (a, b) };
+                    let (p, q) = (position(from), position(to));
+                    if plane.distance(p).abs() > self.precision {
+                        return Err(Error::NonPlanar);
+                    }
+                    if DVec3::from_array(p).distance(DVec3::from_array(q)) < self.minimum_edge {
+                        return Err(Error::ShortEdge);
+                    }
+                    uv.push(plane.project(p));
+                }
+                validate_ring(&uv, self.precision)?;
+                contours.push(uv);
+            }
+            validate_holes(&contours)?;
+            for &e in &surface.embedded_edges {
+                let [a, b] = self.edges[e];
+                let (p, q) = (position(a), position(b));
+                if plane.distance(p).abs() > self.precision
+                    || plane.distance(q).abs() > self.precision
+                {
+                    return Err(Error::NonPlanar);
+                }
+                let (ua, ub) = (plane.project(p), plane.project(q));
+                if (ua[0] - ub[0]).hypot(ua[1] - ub[1]) < self.minimum_edge {
+                    return Err(Error::ShortEdge);
+                }
+                let mid = [(ua[0] + ub[0]) / 2., (ua[1] + ub[1]) / 2.];
+                if !closed_contains(&contours, mid, self.precision)
+                    || properly_crosses(&contours, ua, ub, self.precision)
+                {
+                    return Err(Error::InvalidRing);
+                }
+            }
+            updates.push((s, contours));
+        }
+        self.vertices[vertex] = target;
+        for (s, contours) in updates {
+            self.surfaces[s].contours = contours;
+        }
+        Ok(())
+    }
+
+    /// Record an existing or new edge as an interior junction line of a
+    /// surface. The edge must lie on the surface plane and inside its closed
+    /// material domain; boundary edges are left unchanged.
+    pub fn embed_edge(&mut self, surface: usize, a: usize, b: usize) -> Result<usize, Error> {
+        let s = self.surfaces.get(surface).ok_or(Error::InvalidRing)?;
+        let plane = &self.planes[s.plane];
+        let pa = *self.vertices.get(a).ok_or(Error::InvalidVertex)?;
+        let pb = *self.vertices.get(b).ok_or(Error::InvalidVertex)?;
+        if a == b {
+            return Err(Error::InvalidVertex);
+        }
+        if plane.distance(pa).abs() > self.precision || plane.distance(pb).abs() > self.precision {
+            return Err(Error::NonPlanar);
+        }
+        let (ua, ub) = (plane.project(pa), plane.project(pb));
+        if (ua[0] - ub[0]).hypot(ua[1] - ub[1]) < self.minimum_edge {
+            return Err(Error::ShortEdge);
+        }
+        let key = [a.min(b), a.max(b)];
+        if let Some(&edge) = self.edge_index.get(&key) {
+            if self.surface_edges(surface).any(|e| e == edge) {
+                return Ok(edge);
+            }
+        }
+        let mid = [(ua[0] + ub[0]) / 2., (ua[1] + ub[1]) / 2.];
+        if !closed_contains(&s.contours, mid, self.precision)
+            || properly_crosses(&s.contours, ua, ub, self.precision)
+        {
+            return Err(Error::InvalidRing);
+        }
+        let edge = *self.edge_index.entry(key).or_insert_with(|| {
+            self.edges.push(key);
+            self.edges.len() - 1
+        });
+        self.surfaces[surface].embedded_edges.push(edge);
+        Ok(edge)
+    }
+}
+
+/// Whether segment `a`-`b` crosses a contour segment at an interior point
+/// of both, beyond `eps`. Touching at a vertex or along a line is not a crossing.
+pub(crate) fn properly_crosses(
+    contours: &[Vec<[f64; 2]>],
+    a: [f64; 2],
+    b: [f64; 2],
+    eps: f64,
+) -> bool {
+    let side = |p: [f64; 2], q: [f64; 2], r: [f64; 2]| {
+        let (dx, dy) = (q[0] - p[0], q[1] - p[1]);
+        let length = dx.hypot(dy);
+        ((r[0] - p[0]) * dy - (r[1] - p[1]) * dx) / length
+    };
+    contours.iter().any(|ring| {
+        (0..ring.len()).any(|i| {
+            let c = ring[i];
+            let d = ring[(i + 1) % ring.len()];
+            let (s1, s2) = (side(a, b, c), side(a, b, d));
+            let (s3, s4) = (side(c, d, a), side(c, d, b));
+            ((s1 > eps && s2 < -eps) || (s1 < -eps && s2 > eps))
+                && ((s3 > eps && s4 < -eps) || (s3 < -eps && s4 > eps))
+        })
+    })
+}
+
+/// Point membership in a polygon with holes, boundary included within `eps`.
+pub(crate) fn closed_contains(contours: &[Vec<[f64; 2]>], p: [f64; 2], eps: f64) -> bool {
+    let mut inside = false;
+    for ring in contours {
+        for i in 0..ring.len() {
+            let a = ring[i];
+            let b = ring[(i + 1) % ring.len()];
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let l2 = dx * dx + dy * dy;
+            let t = if l2 > 0. {
+                (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0., 1.)
+            } else {
+                0.
+            };
+            if (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy) <= eps {
+                return true;
+            }
+            if (a[1] > p[1]) != (b[1] > p[1]) && p[0] < a[0] + (p[1] - a[1]) * dx / dy {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn validate_holes(contours: &[Vec<[f64; 2]>]) -> Result<(), Error> {
+    let polygon = |r: &Vec<[f64; 2]>| {
+        let points: Vec<_> = r.iter().chain(r.first()).map(|p| (p[0], p[1])).collect();
+        Polygon::new(LineString::from(points), vec![])
+    };
+    let outer = polygon(&contours[0]);
+    for i in 1..contours.len() {
+        let hole = polygon(&contours[i]);
+        if !outer.contains(&hole) || outer.exterior().intersects(hole.exterior()) {
+            return Err(Error::InvalidRing);
+        }
+        for previous in &contours[1..i] {
+            if polygon(previous).intersects(&hole) {
+                return Err(Error::InvalidRing);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_ring(points: &[[f64; 2]], epsilon: f64) -> Result<(), Error> {

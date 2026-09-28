@@ -3,6 +3,7 @@
 pub mod bars;
 mod features;
 mod holes;
+pub mod junctions;
 use super::{frame, planes, Model, PlaneFrame};
 use crate::input::MeshData;
 pub use features::{FeaturePolicy, SimplifiedHole};
@@ -50,6 +51,9 @@ pub struct Report {
     pub feature_policy: Option<FeaturePolicy>,
     pub simplified_holes: Vec<SimplifiedHole>,
     pub axis_assembly: bars::Report,
+    /// Surface-surface junction lines inserted as shared edges. Vertices with
+    /// index `>= vertex_source_nodes.len()` are generated junction vertices.
+    pub junctions: junctions::Report,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -668,6 +672,41 @@ fn assemble_impl(
     );
     maximum_closure_movement =
         maximum_closure_movement.max(axis_assembly.maximum_additional_movement);
+    // After axis repairs, which may still move boundary anchors: junctions
+    // are derived from final coordinates and never move a vertex.
+    let mut interior = vec![BTreeSet::new(); model.surfaces.len()];
+    for contact in &axis_assembly.contacts {
+        if let bars::Contact::Point {
+            surface, vertex, ..
+        } = *contact
+        {
+            interior[surface].insert(vertex);
+        }
+    }
+    for hole in &simplified_holes {
+        for (s, surface) in model.surfaces.iter().enumerate() {
+            if surface.source_elements != hole.source_elements {
+                continue;
+            }
+            for n in &hole.source_nodes {
+                if let Some(v) = vertex_source_nodes.iter().position(|m| m == n) {
+                    interior[s].insert(v);
+                }
+            }
+        }
+    }
+    let mut locked: BTreeSet<usize> = interior.iter().flatten().copied().collect();
+    for axis in &axis_assembly.axes {
+        locked.extend(axis.endpoints);
+        locked.extend(axis.anchors.iter().map(|a| a.vertex));
+    }
+    let junctions = junctions::insert(
+        &mut model,
+        &junctions::Context {
+            interior: &interior,
+            locked: &locked,
+        },
+    );
     Ok(Report {
         policy: policy.clone(),
         export_ready: false,
@@ -681,6 +720,7 @@ fn assemble_impl(
         feature_policy: features.cloned(),
         simplified_holes,
         axis_assembly,
+        junctions,
         issues,
         maximum_closure_movement,
         rejected_vertices,
