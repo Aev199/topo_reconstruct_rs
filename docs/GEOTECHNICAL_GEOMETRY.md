@@ -624,3 +624,37 @@ unchanged. The whole тест 6 run takes about 80 s (`TOPO_TIMING=1`).
 Tests: a wedge crack closed and a 20 mm slit kept, a non-matching interface
 removed while a real notch stays, a 5 mm fin of material never cut, each
 over rotations, translations, scales and renumbering.
+
+## тест 6 residuals closed, 2026-09-28
+
+After the crack rebuild тест 6 assembled completely but failed the strict
+audit (58 unrepresented junction segments on 5 pairs, 1 coplanar overlap,
+55 unshared point contacts, 2 unshared bar-surface contacts). General fixes,
+each with a regression test that fails without it:
+
+- a vertex already on a junction line within the minimum edge of the
+  required junction end becomes that end (it moves onto it) instead of a
+  second vertex 2.9 um away that rejected the whole junction (56 segments
+  and 54 point contacts along one wall/slab line);
+- a junction chain end just outside a surface (a wall corner held by two
+  walls 30 um beyond a slab edge) bends the nearest boundary edge through
+  it (`Model::split_edge_within`, less than the minimum edge, contours
+  revalidated); boundary splits during junction insertion accept the
+  detection tolerance;
+- a crack mouth identified in one region applies to every region of the
+  same patch: a part split off at the crack otherwise kept the old node and
+  overlapped the main region by a 0.6 cm2 sliver;
+- a contour edge within the minimum edge of another surface's plane and on
+  its material, but beyond the detection tolerance (a wall top 0.7 um below
+  a slab it was not connected to in the source), is settled onto that plane
+  before junction detection (`junctions.snapped_vertices`);
+- a bar node on the plane and material of a surface that does not use it (a
+  column through a slab without a shared source node) is a point contact of
+  that surface.
+
+тест 6 strict audit: all failing classes 0 (was 58 + 1 + 55 + 2); 203 surface
+near misses remain review items; triangles below 1 degree 41 -> 10, minimum
+angle 0.00 -> 0.24 degrees. Two junction diagnostics remain (a 19.6 mm near
+touch left open, one crossing split refused as a short edge); the audit
+confirms the geometry they concern is connected. скала1, типовая секция,
+тест 5: output byte-identical; debug and release outputs identical.

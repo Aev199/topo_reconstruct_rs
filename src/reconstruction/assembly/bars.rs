@@ -660,6 +660,40 @@ pub fn refresh_contacts(model: &Model, axes: &[Axis], contacts: &mut Vec<Contact
             }
         }
     }
+    // A bar node on the plane and material of a surface that does not use
+    // it (a column through a slab without a shared source node) is a point
+    // contact of that surface too.
+    let boxes: Vec<(DVec3, DVec3)> = (0..model.surfaces.len())
+        .map(|s| {
+            model
+                .surface_edges(s)
+                .flat_map(|e| model.edges[e])
+                .map(|v| DVec3::from_array(model.vertices[v]))
+                .fold(
+                    (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
+                    |(lo, hi), p| (lo.min(p), hi.max(p)),
+                )
+        })
+        .collect();
+    for (i, axis) in axes.iter().enumerate() {
+        for anchor in &axis.anchors {
+            let p = model.vertices[anchor.vertex];
+            let q = DVec3::from_array(p);
+            for (s, &(lo, hi)) in boxes.iter().enumerate() {
+                if (q + precision).cmplt(lo).any() || (q - precision).cmpgt(hi).any() {
+                    continue;
+                }
+                let surface = &model.surfaces[s];
+                let plane = &model.planes[surface.plane];
+                if plane.distance(p).abs() <= precision
+                    && location(plane.project(p), &surface.contours, precision).is_some()
+                {
+                    previous.insert((i, s, anchor.vertex));
+                    pairs.insert((i, s));
+                }
+            }
+        }
+    }
     let mut result = vec![];
     for (i, s) in pairs {
         let (Some(axis), Some(surface)) = (axes.get(i), model.surfaces.get(s)) else {

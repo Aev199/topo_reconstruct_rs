@@ -55,22 +55,20 @@ slab meshes ignored 2194 junction segments.
 
 ## Current blockers
 
-Small fixtures: none in the extended audit, including the mesh-level
-connectivity and missing-property checks (2026-09-28). Large private fixture
-`тест 6` (69 MB, 490k elements, converted mesh) now assembles completely
-(20 -> 0 failed patches, 12461 -> 0 unresolved elements, trial mesh valid,
-external-mesher gate passes; whole run about 80 s) after region contours
-are rebuilt across cracks (`assembly::cracks`). Remaining on тест 6, strict
-audit:
+All four private fixtures pass the strict extended audit, including the
+mesh-level connectivity and missing-property checks (2026-09-28). `тест 6`
+(69 MB, 490k elements, converted mesh) assembles completely in about 80 s.
+Remaining on тест 6:
 
-1. 58 unrepresented junction segments on 5 surface pairs (56 of them on two
-   pairs sharing surface 338) and 1 coplanar overlap;
-2. 55 unshared surface point contacts and 2 unshared bar-surface contacts;
-3. 225 surface near misses (review items);
-4. trial mesh quality: 41 triangles below 1 degree (380 below 20 degrees of
-   403755).
+1. trial mesh quality: 10 triangles below 1 degree (minimum 0.24), 326
+   below 20 degrees of 403200;
+2. 203 surface near misses (review items, not inspected individually);
+3. two junction diagnostics: a 19.6 mm near touch left open and one
+   crossing split refused as a short edge.
 
-Fixed after тест 6: cracks of the converted mesh (contour rebuild, not
+Fixed after тест 6: junction ends micrometres from existing vertices or
+surface edges, near-planar wall tops, crack mouths shared across a patch,
+columns through slabs without shared nodes, cracks of the converted mesh (contour rebuild, not
 node welding: `--v2-node-weld` is removed), duplicate edge keys after splits (released edges stay
 indexed), a stacked-alignment identification that ignored other supports of
 the upper node, unbuffered report output, slow console trimming.

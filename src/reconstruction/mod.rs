@@ -483,6 +483,17 @@ impl Model {
     /// edge, as a boundary or embedded edge, receives the same two pieces, so
     /// shared identity is preserved. Validation precedes mutation.
     pub fn split_edge(&mut self, edge: usize, vertex: usize) -> Result<usize, Error> {
+        self.split_edge_within(edge, vertex, 0.)
+    }
+
+    /// `split_edge` for a vertex up to `deviation` off the edge line: the
+    /// edge bends through the vertex. Every user surface is revalidated.
+    pub fn split_edge_within(
+        &mut self,
+        edge: usize,
+        vertex: usize,
+        deviation: f64,
+    ) -> Result<usize, Error> {
         let [a, b] = *self.edges.get(edge).ok_or(Error::InvalidVertex)?;
         let p = DVec3::from_array(*self.vertices.get(vertex).ok_or(Error::InvalidVertex)?);
         if vertex == a || vertex == b {
@@ -492,12 +503,46 @@ impl Model {
         let pb = DVec3::from_array(self.vertices[b]);
         let d = pb - pa;
         let t = (p - pa).dot(d) / d.length_squared();
-        if !(t > 0. && t < 1.) || p.distance(pa + d * t) > self.precision {
+        if !(t > 0. && t < 1.) || p.distance(pa + d * t) > self.precision.max(deviation) {
             return Err(Error::InvalidVertex);
         }
         if p.distance(pa) < self.minimum_edge || p.distance(pb) < self.minimum_edge {
             return Err(Error::ShortEdge);
         }
+        // Off the line, the contours change shape: validate them after the
+        // split and restore the model on failure.
+        if p.distance(pa + d * t) > self.precision {
+            let backup = self.clone();
+            let result = self.split_unchecked(edge, vertex, a, b, p);
+            let valid = result.is_ok()
+                && (0..self.surfaces.len())
+                    .filter(|&s| {
+                        self.surface_edges(s)
+                            .any(|e| self.edges[e].contains(&vertex))
+                    })
+                    .all(|s| {
+                        let c = &self.surfaces[s].contours;
+                        c.iter().all(|r| validate_ring(r, self.precision).is_ok())
+                            && validate_holes(c).is_ok()
+                    });
+            if !valid {
+                *self = backup;
+                return result.and(Err(Error::InvalidRing));
+            }
+            return result;
+        }
+        self.split_unchecked(edge, vertex, a, b, p)
+    }
+
+    /// Replace `edge` (a, b) by two pieces through `vertex` at `p`.
+    fn split_unchecked(
+        &mut self,
+        edge: usize,
+        vertex: usize,
+        a: usize,
+        b: usize,
+        p: DVec3,
+    ) -> Result<usize, Error> {
         let users: Vec<usize> = (0..self.surfaces.len())
             .filter(|&s| self.surface_edges(s).any(|e| e == edge))
             .collect();

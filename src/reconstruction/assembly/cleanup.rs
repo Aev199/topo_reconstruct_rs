@@ -931,6 +931,28 @@ mod tests {
     }
 
     #[test]
+    fn column_through_a_slab_without_a_shared_node_gets_a_point_contact() {
+        use super::super::bars::{refresh_contacts, Location};
+        for place in Placement::all() {
+            let m = {
+                let mut m = build(&place, &[slab(0., 4.)]);
+                let lo = m.add_vertex(place.point([2., 1., -3.])).unwrap();
+                let mid = m.add_vertex(place.point([2., 1., 0.])).unwrap();
+                let hi = m.add_vertex(place.point([2., 1., 3.])).unwrap();
+                (m, [lo, mid, hi])
+            };
+            let (m, [lo, mid, hi]) = m;
+            let axes = vec![bar([lo, hi], Some(mid))];
+            let mut contacts = vec![];
+            refresh_contacts(&m, &axes, &mut contacts);
+            assert_eq!(contacts.len(), 1, "{contacts:?}");
+            assert!(matches!(contacts[0],
+                Contact::Point { vertex, surface: 0, location: Location::Interior, .. }
+                    if vertex == mid));
+        }
+    }
+
+    #[test]
     fn stale_contacts_gain_the_in_plane_interval_of_a_beam() {
         use super::super::bars::{refresh_contacts, Location};
         for place in Placement::all() {

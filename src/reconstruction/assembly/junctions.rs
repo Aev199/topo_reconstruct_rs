@@ -215,7 +215,7 @@ fn split_through(
         let Some(edge) = found else {
             return Ok(());
         };
-        model.split_edge(edge, vertex).map_err(|e| {
+        model.split_edge_within(edge, vertex, tol).map_err(|e| {
             let [a, b] = model.edges[edge].map(|v| p3(model.vertices[v]));
             format!(
                 "edge_split_{e:?}: distances to edge ends {:e}, {:e}",
@@ -378,6 +378,27 @@ fn process(
             revert(model, &moves);
             return;
         };
+        // A vertex already on the line next to the required endpoint is the
+        // endpoint: it moves onto it instead of leaving a tiny gap.
+        if let Some(k) = chain
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                c.1.is_some_and(|v| !context.locked.contains(&v))
+                    && c.2.distance(q) < model.minimum_edge
+            })
+            .min_by(|x, y| x.1 .2.distance(q).total_cmp(&y.1 .2.distance(q)))
+            .map(|(k, _)| k)
+        {
+            let v = chain[k].1.unwrap();
+            let from = p3(model.vertices[v]);
+            if snap(model, v, q.to_array(), [pa, pb], line, tol) {
+                let target = p3(model.vertices[v]);
+                moves.push((v, from, target));
+                chain[k] = (line.parameter(target), Some(v), target);
+                continue;
+            }
+        }
         let near = edge_vertices
             .iter()
             .copied()
@@ -483,6 +504,36 @@ fn process(
             report.split_edges += splits;
             report.generated_vertices.extend(generated);
             return;
+        }
+    }
+    // A chain end just outside a surface (a wall end a few micrometres
+    // beyond a slab edge) is put on that surface's contour: the nearest
+    // boundary edge bends through it, less than the minimum edge length.
+    for &v in [ids[0], ids[ids.len() - 1]].iter() {
+        for s in [a, b] {
+            let own = model.surface_edges(s).any(|e| model.edges[e].contains(&v));
+            let surface = &model.surfaces[s];
+            let uv = model.planes[surface.plane].project(model.vertices[v]);
+            if own || closed_contains(&surface.contours, uv, eps) {
+                continue;
+            }
+            let p = p3(model.vertices[v]);
+            let nearest = surface
+                .boundaries
+                .iter()
+                .flatten()
+                .map(|u| u.edge)
+                .filter_map(|e| {
+                    let [i, j] = model.edges[e];
+                    let (t, d) = on_segment(p, p3(model.vertices[i]), p3(model.vertices[j]));
+                    (t > 0. && t < 1. && d < model.minimum_edge).then_some((d, e))
+                })
+                .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            if let Some((_, e)) = nearest {
+                if model.split_edge_within(e, v, model.minimum_edge).is_ok() {
+                    splits += 1;
+                }
+            }
         }
     }
     let mut chain_edges = vec![];
@@ -839,6 +890,74 @@ fn resolve_crossings(model: &mut Model, context: &Context<'_>, tol: f64, report:
     }
 }
 
+/// Contour edges lying on the material of another surface within the
+/// minimum edge length of its plane, but beyond the detection tolerance
+/// (e.g. a wall top a micrometre below a slab it was not connected to in
+/// the source), are moved onto that plane so the junction is detected. Each
+/// vertex keeps every plane it lies on and moves less than the minimum edge.
+fn settle(model: &mut Model, context: &Context<'_>, tol: f64, report: &mut Report) {
+    let count = model.surfaces.len();
+    let limit = model.minimum_edge;
+    let boxes: Vec<_> = (0..count).map(|s| bounds(model, s)).collect();
+    for a in 0..count {
+        for b in 0..count {
+            let ((la, ha), (lb, hb)) = (boxes[a], boxes[b]);
+            if a == b || (ha + limit).cmplt(lb).any() || (hb + limit).cmplt(la).any() {
+                continue;
+            }
+            let pb = model.planes[model.surfaces[b].plane].clone();
+            let pa = &model.planes[model.surfaces[a].plane];
+            if normal(pa).cross(normal(&pb)).length() < 1e-6 {
+                continue;
+            }
+            let edges: Vec<usize> = model.surfaces[a]
+                .boundaries
+                .iter()
+                .flatten()
+                .map(|u| u.edge)
+                .collect();
+            for e in edges {
+                let [i, j] = model.edges[e];
+                let (pi, pj) = (p3(model.vertices[i]), p3(model.vertices[j]));
+                let (hi, hj) = (pb.distance(pi.to_array()), pb.distance(pj.to_array()));
+                if hi.abs().max(hj.abs()) <= tol || hi.abs().max(hj.abs()) >= limit {
+                    continue;
+                }
+                let mid = pb.project(((pi + pj) / 2.).to_array());
+                if !closed_contains(&model.surfaces[b].contours, mid, limit) {
+                    continue;
+                }
+                for (v, h) in [(i, hi), (j, hj)] {
+                    if h.abs() <= tol || context.locked.contains(&v) {
+                        continue;
+                    }
+                    let from = p3(model.vertices[v]);
+                    let mut planes: Vec<PlaneFrame> = (0..count)
+                        .filter(|&s| model.surface_edges(s).any(|x| model.edges[x].contains(&v)))
+                        .map(|s| model.planes[model.surfaces[s].plane].clone())
+                        .collect();
+                    planes.push(pb.clone());
+                    let refs: Vec<&PlaneFrame> = planes.iter().collect();
+                    let Some(target) = super::intersection(from, &refs, model.precision) else {
+                        continue;
+                    };
+                    if from.distance(target) < limit
+                        && model.move_vertex(v, target.to_array()).is_ok()
+                    {
+                        report.snapped_vertices.push(Snap {
+                            vertex: v,
+                            surfaces: [a, b],
+                            from: from.to_array(),
+                            to: target.to_array(),
+                            distance: from.distance(target),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Insert all detectable surface junctions into the shared topology.
 pub fn insert(model: &mut Model, context: &Context<'_>) -> Report {
     let tol = model.precision * DETECTION_FACTOR;
@@ -846,6 +965,7 @@ pub fn insert(model: &mut Model, context: &Context<'_>) -> Report {
         detection_tolerance: tol,
         ..Default::default()
     };
+    settle(model, context, tol, &mut report);
     let count = model.surfaces.len();
     let boxes: Vec<_> = (0..count).map(|s| bounds(model, s)).collect();
     for a in 0..count {
@@ -1029,6 +1149,86 @@ pub(crate) mod tests {
             "{again:?}"
         );
         assert_eq!((edges, vertices), (model.edges.len(), model.vertices.len()));
+    }
+
+    #[test]
+    fn wall_vertex_micrometres_before_the_junction_end_becomes_the_end() {
+        for place in Placement::all() {
+            // The wall top has a vertex 3 um before the slab edge x = 2.
+            let wall = (
+                vec![vec![
+                    [1., 2., -2.],
+                    [3., 2., -2.],
+                    [3., 2., 0.],
+                    [1.999997, 2., 0.],
+                    [1., 2., 0.],
+                ]],
+                [0., 1., 0.],
+            );
+            let mut m = build(&place, &[slab(0., 2.), wall]);
+            let r = run(&mut m);
+            assert!(r.issues.is_empty(), "{:?}", r.issues);
+            shared_cover(&m, &place, 0, 1, [1., 2., 0.], [2., 2., 0.]);
+            assert_idempotent(&mut m);
+        }
+    }
+
+    #[test]
+    fn wall_top_a_micrometre_below_a_slab_is_settled_and_joined() {
+        for place in Placement::all() {
+            // 0.7 um below the slab: beyond the detection tolerance, far
+            // below the minimum edge length.
+            let mut m = build(&place, &[slab(0., 4.), wall(1., 3., -2., -7e-7)]);
+            let r = run(&mut m);
+            assert!(r.issues.is_empty(), "{:?}", r.issues);
+            assert_eq!(r.snapped_vertices.len(), 2);
+            for snap in &r.snapped_vertices {
+                assert!(snap.distance < 1e-6 * place.scale);
+            }
+            shared_cover(&m, &place, 0, 1, [1., 2., 0.], [3., 2., 0.]);
+            assert_idempotent(&mut m);
+            // A millimetre gap is geometry, not noise: nothing moves.
+            let mut m = build(&place, &[slab(0., 4.), wall(1., 3., -2., -0.002)]);
+            let r = run(&mut m);
+            assert!(r.snapped_vertices.is_empty() && r.junctions.is_empty());
+        }
+    }
+
+    #[test]
+    fn wall_end_just_beyond_a_slab_edge_bends_the_edge_through_it() {
+        for place in Placement::all() {
+            // The wall corner is held 30 um beyond the slab edge x = 2 by a
+            // perpendicular wall, so it cannot move onto the edge.
+            let x = 2.00003;
+            let cross = (
+                vec![vec![[x, 1., -2.], [x, 2., -2.], [x, 3., -2.], [x, 2., 0.]]],
+                [1., 0., 0.],
+            );
+            // The slab edge carries a vertex 7 mm past the wall line.
+            let slab = (
+                vec![vec![
+                    [0., 0., 0.],
+                    [2., 0., 0.],
+                    [2., 2.007, 0.],
+                    [2., 4., 0.],
+                    [0., 4., 0.],
+                ]],
+                [0., 0., 1.],
+            );
+            let mut m = build(&place, &[slab, wall(1., x, -2., 0.), cross]);
+            let r = run(&mut m);
+            assert!(r.issues.is_empty(), "{:?}", r.issues);
+            let corner = (0..m.vertices.len())
+                .find(|&v| {
+                    p3(m.vertices[v]).distance(p3(place.point([x, 2., 0.])))
+                        < 1e-9 * place.scale.max(1.)
+                })
+                .unwrap();
+            assert!(m.surfaces[0].boundaries[0]
+                .iter()
+                .any(|e| m.edges[e.edge].contains(&corner)));
+            assert_idempotent(&mut m);
+        }
     }
 
     #[test]

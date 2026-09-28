@@ -418,6 +418,46 @@ fn movement_budget(mesh: &MeshData, source: &frame::Report, index: usize) -> f64
     budget
 }
 
+/// Apply the crack mouths identified in any region of a patch to the rings
+/// of every region of that patch; consecutive repeated nodes collapse.
+fn share_crack_mouths(
+    rings: &mut BTreeMap<usize, Vec<Vec<u32>>>,
+    patch: impl Fn(usize) -> usize,
+    cracks: &[cracks::Closure],
+) {
+    let mut mouths = BTreeMap::<usize, BTreeMap<u32, u32>>::new();
+    for closure in cracks {
+        let map = mouths.entry(closure.patch).or_default();
+        for &[dropped, kept] in &closure.identified {
+            map.insert(dropped, kept);
+        }
+    }
+    for (&i, loops) in rings.iter_mut() {
+        let Some(map) = mouths.get(&patch(i)) else {
+            continue;
+        };
+        let resolve = |mut n: u32| {
+            for _ in 0..map.len() {
+                match map.get(&n) {
+                    Some(&k) => n = k,
+                    None => break,
+                }
+            }
+            n
+        };
+        for ring in loops.iter_mut() {
+            if ring.iter().any(|n| map.contains_key(n)) {
+                let mut mapped: Vec<u32> = ring.iter().map(|&n| resolve(n)).collect();
+                mapped.dedup();
+                while mapped.len() > 1 && mapped.first() == mapped.last() {
+                    mapped.pop();
+                }
+                *ring = mapped;
+            }
+        }
+    }
+}
+
 fn ring_area(ring: &[u32], plane: &PlaneFrame, point: impl Fn(u32) -> [f64; 3]) -> f64 {
     let uv: Vec<_> = ring.iter().map(|&n| plane.project(point(n))).collect();
     (0..uv.len())
@@ -543,6 +583,9 @@ fn assemble_impl(
             }),
         }
     }
+    // A crack mouth identified in one region is one point for every region
+    // of the same patch (parts split off at the crack share its nodes).
+    share_crack_mouths(&mut rings, |i| regions[i].0, &cracks);
     // Include every support owning a boundary node, including a patch whose
     // own boundary failed. Never silently disconnect it from valid neighbors.
     timer.lap("region_boundaries");
@@ -1522,6 +1565,32 @@ mod tests {
         assert_eq!(reports[0].outcome, HoleOutcome::ContourConflict);
         assert!(reports[0].changes.is_empty());
         assert_eq!(points, before);
+    }
+
+    #[test]
+    fn crack_mouth_is_shared_by_every_region_of_its_patch() {
+        let closure = cracks::Closure {
+            patch: 7,
+            source_elements: 10,
+            overlapping_pieces_removed: 0,
+            cuts: 1,
+            identified: vec![[20, 12]],
+            removed_nodes: vec![],
+            dropped_contours: 0,
+            maximum_width: 0.001,
+            contour_nodes_before: 5,
+            contour_nodes_after: 4,
+        };
+        let mut rings = BTreeMap::from([
+            (0, vec![vec![10, 11, 12, 13]]),
+            (1, vec![vec![30, 20, 31, 32], vec![40, 20, 12, 41]]),
+            (2, vec![vec![50, 20, 51]]),
+        ]);
+        // Regions 0 and 1 belong to patch 7, region 2 to another patch.
+        share_crack_mouths(&mut rings, |i| if i == 2 { 3 } else { 7 }, &[closure]);
+        assert_eq!(rings[&0], vec![vec![10, 11, 12, 13]]);
+        assert_eq!(rings[&1], vec![vec![30, 12, 31, 32], vec![40, 12, 41]]);
+        assert_eq!(rings[&2], vec![vec![50, 20, 51]]);
     }
 
     #[test]
