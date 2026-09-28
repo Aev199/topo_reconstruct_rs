@@ -55,25 +55,25 @@ slab meshes ignored 2194 junction segments.
 
 ## Current blockers
 
-No failing item in the implemented surface audit. Remaining quality: тест 5
-has 28 triangles below 20° (minimum 6.98°), скала1 73 (minimum 2.39°); the
-user accepted this level for a trial MIDAS import.
+None in the extended independent audit (surfaces, point contacts, bars,
+property transfer): strict mode passes on all three fixtures. Review items:
+скала1 two short source bars (6.9 and 28.6 mm); тест 5 five surface near
+misses (30–36 mm). Loads are not in the reconstruction input.
 
 ## Next coherent development batch
 
 ### Goal
 
-Close the audit scope and verify the handoff: bar-bar intersections, isolated
-point contacts, non-parallel near misses, and load/property transfer; then an
-actual MIDAS/PLAXIS import of one fixture.
+Actual solver handoff: an exporter for the trial mesh/geometry and an import
+of one fixture into MIDAS GTS NX and/or PLAXIS 3D by the user.
 
 ### Required approach
 
-- Extend the independent auditor to the missing classes first, with analytic
-  regression cases, and measure all three fixtures.
-- Repair only what the audit shows, under the existing tolerances and
-  provenance rules.
-- Keep `export_ready` false until an import is demonstrated.
+- Agree the exchange format with the user (for example NASTRAN bulk data for a
+  MIDAS mesh, DXF/STEP faces for PLAXIS geometry).
+- Export shells per stiffness and bars per span with source provenance;
+  shared nodes must stay shared in the file.
+- Keep `export_ready` false until the user confirms a successful import.
 
 ### Also pending
 

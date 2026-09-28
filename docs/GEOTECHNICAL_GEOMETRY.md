@@ -497,3 +497,49 @@ property transfer, and an actual MIDAS/PLAXIS import remain unverified.
 
 Tests: duplicated bar ends merge and both bars stay straight with the contact
 following the kept vertex; a bar passing through a duplicate is not bent.
+
+## Extended independent audit, 2026-09-28
+
+`scripts/check_v2_global_geometry.py` now also checks, read-only:
+
+- bar-bar: crossings or touches without a shared node (`unshared_bar_intersection`)
+  and overlapping collinear bars (`overlapping_bars`);
+- bar-surface: a bar piercing or touching a panel without a point contact or a
+  shared vertex (`unshared_bar_surface_intersection`), and a bar lying in a
+  panel without an interval contact (`bar_in_surface_without_contact`);
+- surface point contacts: a vertex of one panel on another panel that is not
+  one of its vertices (`unshared_point_contact`);
+- property transfer: every triangle carries its surface stiffness and every
+  bar segment a stiffness of its axis spans.
+
+Review items (reported, never failing): surface-surface and bar-surface
+near misses within `--near-distance` (default 0.05), bar near misses between
+bars not already joined through a neighbouring bar, and bars shorter than that
+distance. `global_checks_passed` combines all failing classes; `--strict`
+exits 1 on it. Loads are not part of the reconstruction input and remain
+unverified; `solver_import_verified` stays false.
+
+Geotechnical assembly additionally merges the ends of two different bars
+within `--v2-wall-end-snap` (`topology.bar_ends`), carrying both bars; a merge
+that would collapse a bar joining them is rejected.
+
+Private fixtures, strict audit passing on all three:
+
+| | скала1 | типовая секция | тест 5 |
+|---|---:|---:|---:|
+| Failing issues (all classes) | 0 | 0 | 0 |
+| Triangles / bars with wrong stiffness | 0 / 0 | 0 / 0 | 0 / 0 |
+| Review items | 2 short bars (6.9 and 28.6 mm) | 0 | 5 surface near misses (30–36 mm) |
+| Bar-end merges | 0 (2 rejected: joined by short bars) | 0 | 0 |
+
+The short bars of скала1 are source elements joining two beam pieces; they are
+kept (removing them would drop a source element). The near misses of тест 5
+are a wall corner 30 mm from a perpendicular wall and a stepped common edge of
+two coplanar walls 36 mm from a neighbouring vertex. Debug and release outputs
+are identical.
+
+Tests: six analytic auditor cases (bar crossings with and without a node, a
+column through a slab with and without a contact, a bar in a slab with and
+without an interval contact, a gap versus a short joining bar, a tilted panel
+touching a slab at a corner, a stiffness mismatch) and a Rust case joining a
+beam split by a 20 mm gap while keeping a 20 mm joining bar.

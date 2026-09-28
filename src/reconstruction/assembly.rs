@@ -67,6 +67,8 @@ pub struct Report {
     pub coincident_vertices: cleanup::MergeReport,
     /// Wall ends merged into nearby vertices (geotechnical).
     pub wall_ends: cleanup::MergeReport,
+    /// Bar ends merged across small gaps (geotechnical).
+    pub bar_ends: cleanup::MergeReport,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -804,6 +806,19 @@ fn assemble_impl(
         ),
         None => cleanup::MergeReport::default(),
     };
+    let bar_ends = match features {
+        Some(features) if features.maximum_wall_end_snap > 0. => cleanup::merge_bar_ends(
+            &mut model,
+            &mut cleanup::Bars {
+                axes: &mut axis_assembly.axes,
+                contacts: &mut axis_assembly.contacts,
+            },
+            features.maximum_wall_end_snap,
+            &fixed,
+            &vertex_source_nodes,
+        ),
+        _ => cleanup::MergeReport::default(),
+    };
     let (interior, locked, fixed) = protected(&model, &axis_assembly);
     let junctions = junctions::insert(
         &mut model,
@@ -880,6 +895,7 @@ fn assemble_impl(
         short_edges,
         coincident_vertices: coincident,
         wall_ends,
+        bar_ends,
         issues,
         maximum_closure_movement,
         rejected_vertices,

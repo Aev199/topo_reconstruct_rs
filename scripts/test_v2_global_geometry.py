@@ -138,5 +138,79 @@ class GlobalAuditTests(unittest.TestCase):
         self.assertEqual(audit(data)['invalid_surfaces'][0]['reason'], 'invalid embedded edges')
 
 
+def with_bars(data, bars, contacts=()):
+    """Append bar axes given by coordinates; equal points share one vertex."""
+    preview = data['topology']['preview']
+    vertices = preview['vertices']
+    index = {tuple(p): i for i, p in enumerate(vertices)}
+    def vid(p):
+        if tuple(p) not in index:
+            index[tuple(p)] = len(vertices)
+            vertices.append(tuple(p))
+        return index[tuple(p)]
+    axes = []
+    for points in bars:
+        ids = [vid(p) for p in points]
+        axes.append(dict(endpoints=[ids[0], ids[-1]], spans=[],
+                         anchors=[dict(vertex=v, t=k / (len(ids) - 1)) for k, v in enumerate(ids)]))
+    data['topology']['axis_assembly'] = dict(
+        axes=axes, contacts=[dict(c, vertex=vid(c['vertex'])) if 'vertex' in c else c
+                             for c in contacts])
+    return data
+
+
+class BarAndPointTests(unittest.TestCase):
+    def test_crossing_bars_need_a_shared_node(self):
+        data = with_bars(model([xy(z=5)]), [[(0, 0, 1), (2, 2, 1)], [(0, 2, 1), (2, 0, 1)]])
+        r = audit(data)
+        self.assertEqual(r['point_and_bar_issue_counts'], {'unshared_bar_intersection': 1})
+        self.assertFalse(r['global_checks_passed'])
+        data = with_bars(model([xy(z=5)]), [[(0, 0, 1), (1, 1, 1), (2, 2, 1)],
+                                           [(0, 2, 1), (1, 1, 1), (2, 0, 1)]])
+        self.assertTrue(audit(data)['global_checks_passed'])
+
+    def test_bar_piercing_a_panel_needs_a_contact(self):
+        column = [(0.5, 0.5, -1), (0.5, 0.5, 0), (0.5, 0.5, 1)]
+        data = with_bars(model([xy()]), [column])
+        r = audit(data)
+        self.assertEqual(r['point_and_bar_issue_counts'], {'unshared_bar_surface_intersection': 1})
+        data = with_bars(model([xy()]), [column],
+                         [dict(kind='point', axis=0, surface=0, vertex=(0.5, 0.5, 0))])
+        self.assertTrue(audit(data)['global_checks_passed'])
+
+    def test_bar_in_panel_needs_an_interval_contact(self):
+        data = with_bars(model([xy()]), [[(0.1, 0.5, 0), (0.9, 0.5, 0)]])
+        r = audit(data)
+        self.assertEqual(r['point_and_bar_issue_counts'], {'bar_in_surface_without_contact': 1})
+        data['topology']['axis_assembly']['contacts'] = [
+            dict(kind='interval', axis=0, surface=0, start_t=0, end_t=1)]
+        self.assertTrue(audit(data)['global_checks_passed'])
+
+    def test_short_bars_and_gaps_are_review_items(self):
+        data = with_bars(model([xy(z=5)]), [[(0, 0, 1), (1, 0, 1)], [(1.02, 0, 1), (2, 0, 1)],
+                                           [(0, 1, 1), (1, 1, 1)], [(1, 1, 1), (1.01, 1, 1)],
+                                           [(1.01, 1, 1), (2, 1, 1)]])
+        r = audit(data)
+        self.assertTrue(r['global_checks_passed'])
+        self.assertEqual(r['review_counts'], {'bar_near_miss': 1, 'short_bar': 1})
+
+    def test_corner_touching_a_panel_needs_a_shared_vertex(self):
+        # A tilted panel whose corner touches the slab interior at one point.
+        tilted = ([0.5, 0.5, 0], [1, 0, 0], [0, 0.6, 0.8], [0, -0.8, 0.6],
+                  [[[0, 0], [0.3, 0.2], [0, 1]]])
+        r = audit(model([xy(), tilted]))
+        self.assertIn('unshared_point_contact', r['point_and_bar_issue_counts'])
+        self.assertFalse(r['global_checks_passed'])
+
+    def test_property_transfer_mismatch_fails(self):
+        data = model([xy()])
+        data['topology']['surface_stiffness'] = [7]
+        data['mesh'] = dict(vertices=data['topology']['preview']['vertices'], bars=[],
+                            triangles=[dict(surface=0, vertices=[0, 1, 2], stiffness=8)])
+        r = audit(data)
+        self.assertEqual(r['properties']['triangles_with_wrong_stiffness'], 1)
+        self.assertFalse(r['global_checks_passed'])
+
+
 if __name__ == '__main__':
     unittest.main()

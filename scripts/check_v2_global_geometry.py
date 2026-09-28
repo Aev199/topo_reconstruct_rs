@@ -1,6 +1,9 @@
-"""Pairwise audit of assembled v2 surfaces and their actual trial-mesh junctions.
+"""Pairwise audit of assembled v2 surfaces, bars and their trial-mesh junctions.
 
 Requires numpy and shapely>=2. Coordinates/near_distance use model length units.
+Checked: surface validity, coplanar overlaps, surface-surface intersection lines,
+isolated surface point contacts, bar-bar and bar-surface intersections, and
+property transfer to the trial mesh. Near misses are review items, not failures.
 This is a read-only geometric audit, not proof of solver import or load transfer.
 """
 import argparse
@@ -9,6 +12,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import shapely
 from shapely.geometry import LineString, Polygon
 from shapely.validation import explain_validity
 
@@ -69,6 +73,183 @@ class Surface:
 
     def lift(self, points):
         return self.o + points[:, :1] * self.u + points[:, 1:] * self.v
+
+
+def closest_points(p0, p1, q0, q1):
+    """Parameters and distance of the closest points of two segments."""
+    d1, d2, r = p1 - p0, q1 - q0, p0 - q0
+    a, e, f = d1 @ d1, d2 @ d2, d2 @ r
+    c, b = d1 @ r, d1 @ d2
+    denom = a * e - b * b
+    s = np.clip((b * f - c * e) / denom, 0., 1.) if denom > 1e-18 * a * e else 0.
+    t = (b * s + f) / e
+    if t < 0.:
+        t, s = 0., np.clip(-c / a, 0., 1.)
+    elif t > 1.:
+        t, s = 1., np.clip((b - c) / a, 0., 1.)
+    x, y = p0 + s * d1, q0 + t * d2
+    return s, t, float(np.linalg.norm(x - y)), x
+
+
+def surface_distances(surface, points):
+    """Distance of 3D points to a surface polygon, and their plane heights."""
+    h = (points - surface.o) @ surface.n
+    xy = surface.project(points)
+    d2 = shapely.distance(surface.shape, shapely.points(xy))
+    return np.hypot(h, d2), h
+
+
+def audit_point_contacts(surfaces, invalid_ids, vertices, model, eps, near_distance):
+    """Surface vertices touching another surface without a shared vertex."""
+    vertex_sets = [{v for e in s.edge_ids for v in model["edges"][e]} for s in surfaces]
+    issues, review = [], []
+    for a in surfaces:
+        if a.index in invalid_ids:
+            continue
+        ids = np.array(sorted(vertex_sets[a.index]))
+        points = vertices[ids]
+        for b in surfaces:
+            if b.index == a.index or b.index in invalid_ids:
+                continue
+            if np.any(a.high + near_distance < b.low) or np.any(b.high + near_distance < a.low):
+                continue
+            dist, _ = surface_distances(b, points)
+            for v, d in zip(ids[dist <= near_distance], dist[dist <= near_distance]):
+                v = int(v)
+                if v in vertex_sets[b.index]:
+                    continue
+                entry = dict(vertex=v, surfaces=[a.index, b.index], distance=float(d),
+                             point=vertices[v].tolist())
+                if d <= eps:
+                    # On b but not one of its vertices: unshared unless it lies
+                    # on one of b's edges (a split would be required) - both
+                    # cases mean the contact has no shared identity.
+                    issues.append(dict(entry, kind="unshared_point_contact"))
+                else:
+                    review.append(dict(entry, kind="surface_near_miss"))
+    return issues, review
+
+
+def audit_bars(data, surfaces, invalid_ids, vertices, eps, near_distance):
+    bars = data["topology"].get("axis_assembly", {})
+    axes = bars.get("axes", [])
+    contacts = bars.get("contacts", [])
+    segments = []
+    for i, axis in enumerate(axes):
+        p0, p1 = (vertices[v] for v in axis["endpoints"])
+        anchors = {a["vertex"] for a in axis["anchors"]} | set(axis["endpoints"])
+        segments.append((i, p0, p1, anchors, np.minimum(p0, p1), np.maximum(p0, p1)))
+    issues, review = [], []
+    # Bars sharing a vertex are connected; a near miss between bars joined
+    # through one intermediate bar is a short bar, not a gap.
+    by_vertex = {}
+    for i, _, _, anchors, _, _ in segments:
+        for v in anchors:
+            by_vertex.setdefault(v, set()).add(i)
+    neighbours = [set().union(*(by_vertex[v] for v in anchors)) - {i}
+                  for i, _, _, anchors, _, _ in segments]
+    for i, p0, p1, _, _, _ in segments:
+        length = float(np.linalg.norm(p1 - p0))
+        if length < near_distance:
+            review.append(dict(bars=[i], kind="short_bar", length=length, point=p0.tolist()))
+    for k, (i, p0, p1, anchors_i, lo_i, hi_i) in enumerate(segments):
+        for j, q0, q1, anchors_j, lo_j, hi_j in segments[k + 1:]:
+            if np.any(hi_i + near_distance < lo_j) or np.any(hi_j + near_distance < lo_i):
+                continue
+            _, _, dist, x = closest_points(p0, p1, q0, q1)
+            if dist > near_distance:
+                continue
+            d1, d2 = p1 - p0, q1 - q0
+            parallel = np.linalg.norm(np.cross(d1, d2)) <= 1e-9 * np.linalg.norm(d1) * np.linalg.norm(d2)
+            entry = dict(bars=[i, j], distance=dist, point=x.tolist())
+            if dist <= eps:
+                if parallel:
+                    u = d1 / np.linalg.norm(d1)
+                    ts = sorted([0., float(d1 @ u)])
+                    tq = sorted([float((q0 - p0) @ u), float((q1 - p0) @ u)])
+                    overlap = min(ts[1], tq[1]) - max(ts[0], tq[0])
+                    if overlap > eps:
+                        issues.append(dict(entry, kind="overlapping_bars", length=overlap))
+                        continue
+                shared = [v for v in anchors_i & anchors_j
+                          if np.linalg.norm(vertices[v] - x) <= eps]
+                if not shared:
+                    issues.append(dict(entry, kind="unshared_bar_intersection"))
+            elif j not in neighbours[i] and not neighbours[i] & neighbours[j]:
+                review.append(dict(entry, kind="bar_near_miss"))
+    surface_vertices = [{v for e in s.edge_ids for v in data["topology"]["preview"]["edges"][e]}
+                        for s in surfaces]
+    contact_pairs = {(c["axis"], c["surface"]) for c in contacts}
+    point_contacts = {}
+    for c in contacts:
+        if c["kind"] == "point":
+            point_contacts.setdefault((c["axis"], c["surface"]), []).append(c["vertex"])
+    for i, p0, p1, anchors, lo, hi in segments:
+        for s in surfaces:
+            if s.index in invalid_ids:
+                continue
+            if np.any(hi + near_distance < s.low) or np.any(s.high + near_distance < lo):
+                continue
+            h0, h1 = ((p - s.o) @ s.n for p in (p0, p1))
+            entry = dict(bar=i, surface=s.index)
+            if abs(h0) <= eps and abs(h1) <= eps:
+                inside = s.shape.buffer(eps).intersection(LineString(s.project(np.array([p0, p1]))))
+                # A touch at one point is checked like a piercing point below.
+                if inside.length > 10 * eps and (i, s.index) not in contact_pairs:
+                    issues.append(dict(entry, kind="bar_in_surface_without_contact",
+                                       length=float(inside.length)))
+                if inside.length > 10 * eps:
+                    continue
+                # Touching at an end: that end must be connected.
+                d, _ = surface_distances(s, np.array([p0, p1]))
+                ends = data["topology"]["axis_assembly"]["axes"][i]["endpoints"]
+                for v, dist in zip(ends, d):
+                    if dist <= eps and v not in surface_vertices[s.index] \
+                            and v not in point_contacts.get((i, s.index), []):
+                        issues.append(dict(entry, kind="unshared_bar_surface_intersection",
+                                           point=vertices[v].tolist()))
+                if np.min(d) > eps and np.min(d) <= near_distance \
+                        and (i, s.index) not in contact_pairs:
+                    review.append(dict(entry, kind="bar_surface_near_miss", distance=float(np.min(d))))
+                continue
+            if h0 * h1 < 0 or abs(h0) <= eps or abs(h1) <= eps:
+                t = h0 / (h0 - h1) if abs(h0 - h1) > 0 else 0.
+                x = p0 + np.clip(t, 0., 1.) * (p1 - p0)
+                d, _ = surface_distances(s, x[None, :])
+                if d[0] <= eps:
+                    # Connected through a point contact or a vertex of the surface.
+                    shared = [v for v in set(point_contacts.get((i, s.index), [])) | anchors
+                              if np.linalg.norm(vertices[v] - x) <= eps
+                              and (v in surface_vertices[s.index]
+                                   or v in point_contacts.get((i, s.index), []))]
+                    if not shared:
+                        issues.append(dict(entry, kind="unshared_bar_surface_intersection",
+                                           point=x.tolist()))
+                    continue
+            if (i, s.index) in contact_pairs:
+                continue
+            d, _ = surface_distances(s, np.array([p0, p1]))
+            if np.min(d) <= near_distance:
+                review.append(dict(entry, kind="bar_surface_near_miss", distance=float(np.min(d))))
+    return issues, review
+
+
+def audit_properties(data):
+    topology, mesh = data["topology"], data.get("mesh")
+    result = dict(loads="not available: the reconstruction input carries geometry and stiffness only")
+    if not mesh:
+        return result
+    stiffness = topology.get("surface_stiffness", [])
+    wrong_triangles = sum(1 for t in mesh["triangles"]
+                          if "stiffness" in t and t["surface"] < len(stiffness)
+                          and t["stiffness"] != stiffness[t["surface"]])
+    axes = topology.get("axis_assembly", {}).get("axes", [])
+    wrong_bars = sum(1 for b in mesh.get("bars", [])
+                     if (b["source_element"], b["stiffness"]) not in
+                     {(sp["element"], sp["stiffness"]) for sp in axes[b["axis"]]["spans"]})
+    result.update(triangles_with_wrong_stiffness=wrong_triangles,
+                  bars_with_wrong_stiffness=wrong_bars)
+    return result
 
 
 def audit(data, near_distance=0.05):
@@ -182,8 +363,16 @@ def audit(data, near_distance=0.05):
                 contacts.append(entry)
                 if not geometry_conforming or mesh_conforming is False:
                     issues.append(dict(entry, kind="unrepresented_intersection", contact_kind=kind))
+    point_issues, point_review = audit_point_contacts(
+        surfaces, invalid_ids, vertices, model, eps, near_distance)
+    bar_issues, bar_review = audit_bars(data, surfaces, invalid_ids, vertices, eps, near_distance)
+    properties = audit_properties(data)
+    extra_issues = point_issues + bar_issues
+    property_ok = not properties.get("triangles_with_wrong_stiffness") and \
+        not properties.get("bars_with_wrong_stiffness")
+    surface_passed = not invalid and not issues
     return dict(
-        scope="surface contours, coplanar overlaps, intersection lines and shared edge identities",
+        scope="surfaces, intersection lines, point contacts, bars, property transfer",
         audit_complete=False,
         precision=eps, near_distance=near_distance, surfaces=len(surfaces),
         candidate_pairs=candidates, invalid_surfaces=invalid, issues=issues,
@@ -194,11 +383,17 @@ def audit(data, near_distance=0.05):
         mesh_unrepresented_segments=None if mesh is None else sum(c["mesh_conforming"] is False for c in contacts),
         near_face_pair_count=len(near), contacts=contacts,
         near_faces=near, maximum_planarity_error=max((s.planarity for s in surfaces),default=0.),
-        global_surface_checks_passed=not invalid and not issues,
+        global_surface_checks_passed=surface_passed,
+        point_and_bar_issues=extra_issues,
+        point_and_bar_issue_counts=dict(Counter(i["kind"] for i in extra_issues)),
+        review_items=point_review + bar_review,
+        review_counts=dict(Counter(i["kind"] for i in point_review + bar_review)),
+        properties=properties,
+        global_checks_passed=surface_passed and not extra_issues and property_ok,
         solver_import_verified=False,
-        limitations=["isolated point contacts and nonparallel near-misses are not audited",
-                     "near parallel faces require interpretation; no automatic merging",
-                     "bar-bar intersections and load transfer are not audited"],
+        limitations=["near misses and near parallel faces are review items; no automatic merging",
+                     "loads are not part of the reconstruction input and are not audited",
+                     "a passing audit does not prove a successful MIDAS/PLAXIS import"],
     )
 
 
@@ -212,9 +407,10 @@ def main():
     args = parser.parse_args()
     result = audit(json.loads(args.report.read_text()), args.near_distance)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2))
-    print(json.dumps({k:v for k,v in result.items() if k not in ("issues","contacts","near_faces")},ensure_ascii=False,indent=2))
+    hidden = ("issues", "contacts", "near_faces", "point_and_bar_issues", "review_items")
+    print(json.dumps({k:v for k,v in result.items() if k not in hidden},ensure_ascii=False,indent=2))
 
-    if args.strict and not result["global_surface_checks_passed"]:
+    if args.strict and not result["global_checks_passed"]:
         raise SystemExit(1)
 
 

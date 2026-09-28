@@ -138,6 +138,17 @@ fn merge(
     let from = DVec3::from_array(model.vertices[keep]);
     let mut surfaces = users(model, drop);
     surfaces.extend(users(model, keep));
+    // A bar node inside a surface (point contact) stays in its plane.
+    for c in bars.contacts.iter() {
+        if let Contact::Point {
+            vertex, surface, ..
+        } = c
+        {
+            if *vertex == drop || *vertex == keep {
+                surfaces.push(*surface);
+            }
+        }
+    }
     surfaces.sort_unstable();
     surfaces.dedup();
     let planes: Vec<_> = surfaces
@@ -358,6 +369,94 @@ pub fn merge_wall_ends(
             }
         }
         return report;
+    }
+}
+
+/// Merge the ends of two different bars that stop within `tolerance` of each
+/// other (a beam split by a small gap). Both bars stay straight; a bar end
+/// near the interior of another bar is left for review.
+pub fn merge_bar_ends(
+    model: &mut Model,
+    bars: &mut Bars<'_>,
+    tolerance: f64,
+    fixed: &BTreeSet<usize>,
+    source_nodes: &[u32],
+) -> MergeReport {
+    let mut report = MergeReport {
+        tolerance,
+        ..Default::default()
+    };
+    let mut tried = BTreeSet::new();
+    loop {
+        let mut best: Option<(f64, usize, usize)> = None;
+        for (i, a) in bars.axes.iter().enumerate() {
+            for b in bars.axes.iter().skip(i + 1) {
+                for &u in &a.endpoints {
+                    for &w in &b.endpoints {
+                        if u == w
+                            || tried.contains(&(u.min(w), u.max(w)))
+                            || a.endpoints.contains(&w)
+                            || b.endpoints.contains(&u)
+                        {
+                            continue;
+                        }
+                        let d = DVec3::from_array(model.vertices[u])
+                            .distance(DVec3::from_array(model.vertices[w]));
+                        if d <= tolerance && best.is_none_or(|x| d < x.0) {
+                            best = Some((d, u, w));
+                        }
+                    }
+                }
+            }
+        }
+        let Some((d, u, w)) = best else {
+            return report;
+        };
+        tried.insert((u.min(w), u.max(w)));
+        // Keep the end with more connections.
+        let connections = |v: usize| {
+            users(model, v).len()
+                + bars
+                    .axes
+                    .iter()
+                    .filter(|a| a.anchors.iter().any(|x| x.vertex == v))
+                    .count()
+        };
+        let (drop, keep) = if connections(u) > connections(w) {
+            (w, u)
+        } else {
+            (u, w)
+        };
+        let surfaces = {
+            let mut s = users(model, drop);
+            s.extend(users(model, keep));
+            s.sort_unstable();
+            s.dedup();
+            s
+        };
+        let kept_from = model.vertices[keep];
+        match merge(model, bars, drop, keep, tolerance, fixed) {
+            Ok(movement) => report.merged.push(MergedVertex {
+                kind: "bar_ends".into(),
+                dropped: drop,
+                kept: keep,
+                dropped_source_node: source_nodes.get(drop).copied(),
+                kept_source_node: source_nodes.get(keep).copied(),
+                distance: d,
+                kept_movement: movement,
+                kept_from,
+                surfaces,
+            }),
+            Err(reason) => report.rejected.push(RejectedMerge {
+                vertices: [drop, keep],
+                source_nodes: [
+                    source_nodes.get(drop).copied(),
+                    source_nodes.get(keep).copied(),
+                ],
+                distance: d,
+                reason,
+            }),
+        }
     }
 }
 
@@ -606,6 +705,52 @@ mod tests {
                     assert!(x.distance(p.lerp(q, anchor.t)) <= m.precision);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn beam_split_by_a_small_gap_is_joined_but_a_short_bar_is_kept() {
+        for place in Placement::all() {
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            // Two beam pieces above the slab with a 20 mm gap.
+            let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [1.99, 1., 1.]));
+            let (b0, b1) = (v(&mut m, [2.01, 1., 1.]), v(&mut m, [4., 1., 1.]));
+            let mut axes = vec![bar([a0, a1], None), bar([b0, b1], None)];
+            let mut contacts = vec![];
+            let r = merge_bar_ends(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut contacts,
+                },
+                0.05 * place.scale,
+                &BTreeSet::new(),
+                &[],
+            );
+            assert_eq!(r.merged.len(), 1, "{:?}", r.rejected);
+            assert_eq!(axes[0].endpoints[1], axes[1].endpoints[0]);
+            // The same pieces joined by a 20 mm bar: nothing to merge.
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [1.99, 1., 1.]));
+            let (b0, b1) = (v(&mut m, [2.01, 1., 1.]), v(&mut m, [4., 1., 1.]));
+            let mut axes = vec![
+                bar([a0, a1], None),
+                bar([a1, b0], None),
+                bar([b0, b1], None),
+            ];
+            let r = merge_bar_ends(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut contacts,
+                },
+                0.05 * place.scale,
+                &BTreeSet::new(),
+                &[],
+            );
+            assert!(r.merged.is_empty());
+            assert_eq!(axes.len(), 3);
         }
     }
 
