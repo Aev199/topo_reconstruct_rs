@@ -86,25 +86,25 @@ struct Args {
     #[arg(long, default_value_t = 0.05)]
     v2_wall_end_snap: f64,
 
-    /// v2, геотехнический режим: допуск сшивки исходных узлов, не связанных
-    /// общим элементом (трещины и дубликаты после конвертации), в единицах
-    /// модели. Узлы одного элемента не сшиваются. По умолчанию выключено (0):
-    /// на части моделей сшивка пока ухудшает сборку (см. docs/DEV_STATE.md).
-    #[arg(long, default_value_t = 0.)]
-    v2_node_weld: f64,
-
     /// v2, геотехнический режим: максимальная ширина обрезаемой консоли за
     /// линией стыка, в единицах модели. 0 — не обрезать.
     #[arg(long, default_value_t = 0.25)]
     v2_console_width: f64,
+
+    /// v2, геотехнический режим: максимальная ширина трещины конвертированной
+    /// сетки внутри одной плоской конструкции (несвязанные узлы границы по
+    /// разные стороны пустоты). Контур конструкции пересобирается без
+    /// трещины; исходная сетка не сшивается. В единицах модели, 0 — отключить.
+    #[arg(long, default_value_t = 0.01)]
+    v2_crack_width: f64,
 }
 
 /// Geotechnical simplification tolerances of the v2 pipeline (model units).
 struct V2Tolerances {
-    node_weld: f64,
     stack_offset: f64,
     wall_end_snap: f64,
     console_width: f64,
+    crack_width: f64,
 }
 
 fn run_v2_preview(
@@ -124,10 +124,10 @@ fn run_v2_preview(
         return Err("--v2-iterations must be positive".into());
     }
     for (name, value) in [
-        ("--v2-node-weld", tolerances.node_weld),
         ("--v2-stack-offset", tolerances.stack_offset),
         ("--v2-wall-end-snap", tolerances.wall_end_snap),
         ("--v2-console-width", tolerances.console_width),
+        ("--v2-crack-width", tolerances.crack_width),
     ] {
         if !value.is_finite() || value < 0. {
             return Err(format!("{name} must be a finite non-negative length").into());
@@ -142,16 +142,8 @@ fn run_v2_preview(
         }
         clock = Instant::now();
     };
-    let mut mesh = V2LiraParser::parse(input)?;
+    let mesh = V2LiraParser::parse(input)?;
     lap("parse");
-    // Geotechnical simplification starts at the source: cracks between
-    // elements (unshared, nearly coincident nodes) are closed.
-    let welds = if preserve_details {
-        vec![]
-    } else {
-        mesh.weld_unconnected(tolerances.node_weld)
-    };
-    lap("weld");
     let axes = recognize::recognize(
         &mesh,
         &recognize::Policy {
@@ -206,6 +198,7 @@ fn run_v2_preview(
                 maximum_console_width: tolerances.console_width,
                 maximum_stack_offset: tolerances.stack_offset,
                 maximum_wall_end_snap: tolerances.wall_end_snap,
+                maximum_crack_width: tolerances.crack_width,
                 ..Default::default()
             },
         )?
@@ -237,10 +230,6 @@ fn run_v2_preview(
         "topology": topology,
         "reconciliation": reconciliation,
         "axis_recognition": axes,
-        "input_welds": serde_json::json!({
-            "tolerance": if preserve_details { 0. } else { tolerances.node_weld },
-            "welds": welds,
-        }),
         "plane_recognition": plane_report,
     });
     if include_mesh {
@@ -266,10 +255,10 @@ fn run_v2_preview(
 fn main() {
     let args = Args::parse();
     let tolerances = V2Tolerances {
-        node_weld: args.v2_node_weld,
         stack_offset: args.v2_stack_offset,
         wall_end_snap: args.v2_wall_end_snap,
         console_width: args.v2_console_width,
+        crack_width: args.v2_crack_width,
     };
     let mut config = ReconstructionConfig::default();
     for value in [

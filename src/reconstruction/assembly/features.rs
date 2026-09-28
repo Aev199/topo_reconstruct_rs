@@ -24,6 +24,10 @@ pub struct FeaturePolicy {
     /// the edge length below which redundant collinear vertices are removed
     /// (model units, default 0.05 m).
     pub maximum_wall_end_snap: f64,
+    /// Widest void between unconnected boundary nodes of one planar region
+    /// that is treated as a crack of the source mesh and left out of the
+    /// region contour (model units, default 0.01 m; 0 disables).
+    pub maximum_crack_width: f64,
 }
 impl Default for FeaturePolicy {
     fn default() -> Self {
@@ -33,6 +37,7 @@ impl Default for FeaturePolicy {
             maximum_console_width: 0.25,
             maximum_stack_offset: 0.05,
             maximum_wall_end_snap: 0.05,
+            maximum_crack_width: 0.01,
         }
     }
 }

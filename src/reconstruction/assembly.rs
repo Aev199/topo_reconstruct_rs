@@ -3,6 +3,7 @@
 pub mod bars;
 pub mod cleanup;
 pub mod consoles;
+pub mod cracks;
 mod features;
 mod holes;
 pub mod junctions;
@@ -71,6 +72,8 @@ pub struct Report {
     pub bar_ends: cleanup::MergeReport,
     /// Surface vertices identified with nearly coincident bar nodes.
     pub bar_anchors: cleanup::MergeReport,
+    /// Region contours rebuilt across cracks of the source mesh.
+    pub cracks: Vec<cracks::Closure>,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -452,6 +455,8 @@ pub fn assemble_geotechnical(
         || features.maximum_stack_offset < 0.
         || !features.maximum_wall_end_snap.is_finite()
         || features.maximum_wall_end_snap < 0.
+        || !features.maximum_crack_width.is_finite()
+        || features.maximum_crack_width < 0.
     {
         return Err("invalid feature simplification policy");
     }
@@ -493,13 +498,33 @@ fn assemble_impl(
     let mut timer = Timer::new();
     let regions = property_regions(mesh, source, policy.precision, &mut pinched_region_splits)?;
     timer.lap("property_regions");
+    let mut cracks = vec![];
     for (i, (patch, _, ids)) in regions.iter().enumerate() {
-        match boundary(
-            mesh,
-            ids,
-            &source.candidate_planes[*patch],
-            policy.precision,
-        ) {
+        let plane = &source.candidate_planes[*patch];
+        let result = boundary(mesh, ids, plane, policy.precision).map(|r| {
+            // A crack of the source mesh is left out of the region contour.
+            let closed = features
+                .filter(|f| f.maximum_crack_width > 0.)
+                .and_then(|f| {
+                    cracks::close(
+                        mesh,
+                        ids,
+                        &r,
+                        plane,
+                        policy.precision,
+                        f.maximum_crack_width,
+                        *patch,
+                    )
+                });
+            match closed {
+                Some((rebuilt, closure)) => {
+                    cracks.push(closure);
+                    rebuilt
+                }
+                None => r,
+            }
+        });
+        match result {
             Ok(mut r) => {
                 // Fix exterior/hole roles from the immutable source geometry.
                 let area = |ring: &Vec<u32>| {
@@ -758,9 +783,18 @@ fn assemble_impl(
             .skip(1)
             .any(|ring| area(ring) <= policy.precision * policy.precision);
         let plane_id = model.add_plane(plane.clone());
+        // An edge whose two nodes were identified (a stacked wall aligned
+        // onto the wall below) collapses: its contour keeps one vertex.
         let mapped = loops
             .iter()
-            .map(|r| r.iter().map(|n| vertices[n]).collect())
+            .map(|r| {
+                let mut ring: Vec<usize> = r.iter().map(|n| vertices[n]).collect();
+                ring.dedup();
+                while ring.len() > 1 && ring.first() == ring.last() {
+                    ring.pop();
+                }
+                ring
+            })
             .collect();
         match model.add_surface(plane_id, mapped, ids.clone()) {
             Ok(_) => {
@@ -963,6 +997,7 @@ fn assemble_impl(
         wall_ends,
         bar_ends,
         bar_anchors,
+        cracks,
         issues,
         maximum_closure_movement,
         rejected_vertices,

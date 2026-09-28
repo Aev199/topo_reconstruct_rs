@@ -322,6 +322,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         wall_ends: assembly::cleanup::MergeReport::default(),
         bar_ends: assembly::cleanup::MergeReport::default(),
         bar_anchors: assembly::cleanup::MergeReport::default(),
+        cracks: vec![],
         issues: vec![],
         maximum_closure_movement: 0.,
         rejected_vertices: BTreeMap::new(),

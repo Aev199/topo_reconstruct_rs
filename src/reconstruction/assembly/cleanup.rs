@@ -901,7 +901,15 @@ mod tests {
             refresh_contacts(&m, &axes, &mut contacts);
             let points = contacts
                 .iter()
-                .filter(|c| matches!(c, Contact::Point { location: Location::Boundary, .. }))
+                .filter(|c| {
+                    matches!(
+                        c,
+                        Contact::Point {
+                            location: Location::Boundary,
+                            ..
+                        }
+                    )
+                })
                 .count();
             assert_eq!(points, 3, "{contacts:?}");
             assert!(contacts.iter().any(|c| matches!(c,
@@ -945,9 +953,12 @@ mod tests {
                 location: Location::Interior,
             }];
             refresh_contacts(&m, &axes, &mut contacts);
-            assert!(contacts.iter().any(|c| matches!(c,
+            assert!(
+                contacts.iter().any(|c| matches!(c,
                 Contact::Interval { location: Location::Interior, start_t, end_t, .. }
-                    if *start_t < 1e-9 && *end_t > 1. - 1e-9)), "{contacts:?}");
+                    if *start_t < 1e-9 && *end_t > 1. - 1e-9)),
+                "{contacts:?}"
+            );
             assert!(contacts.iter().any(|c| matches!(c,
                 Contact::Point { vertex, location: Location::Boundary, .. } if *vertex == corner)));
         }

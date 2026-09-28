@@ -578,3 +578,49 @@ checks; mesh metrics unchanged (скала1 +2 triangles). Debug and release
 outputs are identical. Tests: 10 new analytic auditor cases and 2 Rust cases
 (beam node beside a slab edge vertex, stale contact without its interval),
 each over rotations, translations, reversed normals and scales.
+
+## Cracks of converted meshes: region contours rebuilt, 2026-09-28
+
+The large private fixture тест 6 (converted mesh, 490k elements) had 20
+planar patches that did not assemble. Causes, all inside one planar region:
+
+- a wedge crack: two neighbouring elements end at distinct nodes 0.4-3 mm
+  apart and share the node at the crack tip;
+- a zero-width crack: overlapping collinear element edges end at distinct
+  nodes (up to 50 mm apart), for example along a line where two meshes with
+  non-matching nodes meet (patch 57: nine real 0.15 x 0.2 m openings joined
+  by such zero-width channels into one self-intersecting contour);
+- an edge collapsed by a stacked-wall alignment: an upper perpendicular wall
+  moved 50 mm onto the wall below identifies its node with the lower node,
+  and the 50 mm step edge of the wall containing both collapses.
+
+Source nodes are no longer welded (`--v2-node-weld` is removed: it regressed
+скала1 and тест 5). Instead the contour of the affected region is rebuilt
+(`assembly::cracks`, `--v2-crack-width`, default 0.01 m):
+
+1. every contour edge is split at contour nodes lying on it (within ten
+   times the precision); a piece traversed twice has material on both sides
+   and is dropped, the remaining pieces are relinked into simple contours;
+2. an excursion of a contour between two unconnected nodes within the crack
+   width (path longer than twice their distance, enclosing void of mean
+   width within the crack width, chord crossing no element) is cut and its
+   mouth becomes one contour point; a mouth wider than the crack width is
+   allowed only for a zero-width crack, and a thin fin of material (its loop
+   has the material orientation) is never cut;
+3. consecutive contour vertices identified by a stacked-wall alignment
+   collapse to one vertex.
+
+Enclosed narrow voids of positive width stay with the collapsed-opening
+policy, which keeps their nodes. Every rebuilt region is reported in
+`topology.cracks` (pieces removed, cuts, identified mouth nodes, removed
+nodes, widest mouth).
+
+тест 6 before/after: plane patches not assembled 20 -> 0, unresolved source
+elements 12461 -> 0, trial mesh topology valid and external-mesher gate pass
+(before: blocked). 23 regions rebuilt: 162 overlapping pieces, 13 cuts with
+mouths up to 3.0 mm. скала1, типовая секция, тест 5 have no crack and are
+unchanged. The whole тест 6 run takes about 80 s (`TOPO_TIMING=1`).
+
+Tests: a wedge crack closed and a 20 mm slit kept, a non-matching interface
+removed while a real notch stays, a 5 mm fin of material never cut, each
+over rotations, translations, scales and renumbering.

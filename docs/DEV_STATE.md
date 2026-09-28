@@ -56,24 +56,22 @@ slab meshes ignored 2194 junction segments.
 ## Current blockers
 
 Small fixtures: none in the extended audit, including the mesh-level
-connectivity and missing-property checks (2026-09-28). Large private fixture `тест 6`
-(69 MB, 490k elements, converted mesh) exposes:
+connectivity and missing-property checks (2026-09-28). Large private fixture
+`тест 6` (69 MB, 490k elements, converted mesh) now assembles completely
+(20 -> 0 failed patches, 12461 -> 0 unresolved elements, trial mesh valid,
+external-mesher gate passes; whole run about 80 s) after region contours
+are rebuilt across cracks (`assembly::cracks`). Remaining on тест 6, strict
+audit:
 
-1. 20 plane patches not assembled (12461 source elements unresolved), the same
-   as before this session: the converted mesh has cracks, i.e. neighbouring
-   elements whose nodes are 1-5 mm apart instead of shared (139 unconnected
-   pairs within 2 mm, 366 within 5 mm), so region contours fold into the
-   crack. `MeshData::weld_unconnected` (`--v2-node-weld`) closes such cracks
-   without collapsing any element, but at 5 mm it regressed скала1 (mesh
-   invalid on one surface) and тест 5 (unresolved patches, many acute
-   triangles), so it is off by default until the interaction is understood.
-2. Performance: the pre-existing region/representative stage takes ~2 min on
-   тест 6; the whole run exceeds 10 min. `TOPO_TIMING=1` prints per-stage
-   times (pipeline and assembly).
-3. Extended audit on тест 6 (welding off): 94 unrepresented junction segments
-   (18 pairs), 61 unshared point contacts, 2 bar-surface contacts.
+1. 58 unrepresented junction segments on 5 surface pairs (56 of them on two
+   pairs sharing surface 338) and 1 coplanar overlap;
+2. 55 unshared surface point contacts and 2 unshared bar-surface contacts;
+3. 225 surface near misses (review items);
+4. trial mesh quality: 41 triangles below 1 degree (380 below 20 degrees of
+   403755).
 
-Fixed after тест 6: duplicate edge keys after splits (released edges stay
+Fixed after тест 6: cracks of the converted mesh (contour rebuild, not
+node welding: `--v2-node-weld` is removed), duplicate edge keys after splits (released edges stay
 indexed), a stacked-alignment identification that ignored other supports of
 the upper node, unbuffered report output, slow console trimming.
 
