@@ -207,6 +207,27 @@ impl Faces {
         // face: an opening contour or a floating junction line. It belongs
         // to the smallest material face strictly containing it.
         let polygons: Vec<Vec<Uv>> = (0..faces.cycles.len()).map(|f| faces.polygon(f)).collect();
+        let boxes: Vec<[f64; 4]> = polygons
+            .iter()
+            .map(|p| {
+                p.iter().fold(
+                    [
+                        f64::INFINITY,
+                        f64::INFINITY,
+                        f64::NEG_INFINITY,
+                        f64::NEG_INFINITY,
+                    ],
+                    |b, q| {
+                        [
+                            b[0].min(q[0]),
+                            b[1].min(q[1]),
+                            b[2].max(q[0]),
+                            b[3].max(q[1]),
+                        ]
+                    },
+                )
+            })
+            .collect();
         faces.inner = vec![vec![]; faces.cycles.len()];
         for c in 0..faces.cycles.len() {
             if faces.area[c] > 0. {
@@ -214,7 +235,11 @@ impl Faces {
             }
             let p = faces.uv[&faces.tail(faces.cycles[c][0])];
             let owner = (0..faces.cycles.len())
-                .filter(|&f| faces.material[f] && strictly_inside(&polygons[f], p, eps))
+                .filter(|&f| {
+                    let b = boxes[f];
+                    faces.material[f] && p[0] > b[0] && p[0] < b[2] && p[1] > b[1] && p[1] < b[3]
+                })
+                .filter(|&f| strictly_inside(&polygons[f], p, eps))
                 .min_by(|&x, &y| faces.area[x].total_cmp(&faces.area[y]));
             if let Some(owner) = owner {
                 for &h in &faces.cycles[c] {
@@ -265,6 +290,42 @@ impl Faces {
     }
 }
 
+/// Per-pass indexes: surfaces using each edge, bar intervals per surface.
+struct Lookup {
+    edge_users: BTreeMap<usize, Vec<usize>>,
+    intervals: Vec<Vec<(DVec3, DVec3)>>,
+}
+impl Lookup {
+    fn new(model: &Model, context: &Context<'_>) -> Self {
+        let mut edge_users = BTreeMap::<usize, Vec<usize>>::new();
+        for s in 0..model.surfaces.len() {
+            for e in model.surface_edges(s) {
+                edge_users.entry(e).or_default().push(s);
+            }
+        }
+        let mut intervals = vec![vec![]; model.surfaces.len()];
+        for contact in context.contacts {
+            if let Contact::Interval {
+                axis,
+                surface,
+                start_t,
+                end_t,
+                ..
+            } = *contact
+            {
+                let [a, b] = context.axes[axis]
+                    .endpoints
+                    .map(|v| DVec3::from_array(model.vertices[v]));
+                intervals[surface].push((a.lerp(b, start_t), a.lerp(b, end_t)));
+            }
+        }
+        Self {
+            edge_users,
+            intervals,
+        }
+    }
+}
+
 /// Why a thin face on a free contour must be kept, if it must.
 fn blocked(
     model: &Model,
@@ -272,6 +333,7 @@ fn blocked(
     faces: &Faces,
     f: usize,
     context: &Context<'_>,
+    lookup: &Lookup,
 ) -> Option<&'static str> {
     let eps = model.precision;
     let cycle = faces.members(f);
@@ -291,7 +353,11 @@ fn blocked(
             continue;
         }
         let e = faces.edges[h / 2];
-        if (0..model.surfaces.len()).any(|o| o != s && model.surface_edges(o).any(|x| x == e)) {
+        if lookup
+            .edge_users
+            .get(&e)
+            .is_some_and(|u| u.iter().any(|&o| o != s))
+        {
             return Some("contour_shared_with_other_surface");
         }
         let v = faces.tail(h);
@@ -310,24 +376,7 @@ fn blocked(
             return Some("retained_node_inside");
         }
     }
-    for contact in context.contacts {
-        let Contact::Interval {
-            axis,
-            surface,
-            start_t,
-            end_t,
-            ..
-        } = *contact
-        else {
-            continue;
-        };
-        if surface != s {
-            continue;
-        }
-        let [a, b] = context.axes[axis]
-            .endpoints
-            .map(|v| DVec3::from_array(model.vertices[v]));
-        let (p, q) = (a.lerp(b, start_t), a.lerp(b, end_t));
+    for &(p, q) in &lookup.intervals[s] {
         let samples = [p, q, p.lerp(q, 0.5)].map(|x| plane.project(x.to_array()));
         let (pu, qu) = (samples[0], samples[1]);
         if samples.iter().any(|&x| faces.contains(f, x, eps))
@@ -340,7 +389,17 @@ fn blocked(
 }
 
 /// Trim console groups of one surface. Returns whether the surface changed.
-fn trim_surface(model: &mut Model, s: usize, context: &Context<'_>, report: &mut Report) -> bool {
+fn trim_surface(
+    model: &mut Model,
+    s: usize,
+    context: &Context<'_>,
+    lookup: &Lookup,
+    report: &mut Report,
+) -> bool {
+    // Consoles lie beyond junction lines inside the surface.
+    if model.surfaces[s].embedded_edges.is_empty() {
+        return false;
+    }
     let faces = Faces::new(model, s);
     let eps = model.precision;
     let material: Vec<usize> = (0..faces.cycles.len())
@@ -359,6 +418,16 @@ fn trim_surface(model: &mut Model, s: usize, context: &Context<'_>, report: &mut
             .filter(|&h| !faces.boundary[h / 2])
             .collect();
         if junctions.is_empty() || junctions.len() == cycle.len() {
+            continue;
+        }
+        // Everything within the width of the junction edges has at most this
+        // area; a larger face is not a console (cheap rejection).
+        let w = context.maximum_width;
+        let reach: f64 = junctions
+            .iter()
+            .map(|&h| 2. * w * faces.length(h) + std::f64::consts::PI * w * w)
+            .sum();
+        if faces.net_area(f) > reach {
             continue;
         }
         let mut probes: Vec<Uv> = cycle.iter().map(|&h| faces.uv[&faces.tail(h)]).collect();
@@ -380,7 +449,7 @@ fn trim_surface(model: &mut Model, s: usize, context: &Context<'_>, report: &mut
         if width > context.maximum_width {
             continue;
         }
-        if let Some(reason) = blocked(model, s, &faces, f, context) {
+        if let Some(reason) = blocked(model, s, &faces, f, context, lookup) {
             *report.kept.entry(reason.into()).or_default() += 1;
             continue;
         }
@@ -519,16 +588,30 @@ pub fn trim(model: &mut Model, context: &Context<'_>) -> Report {
         maximum_width: context.maximum_width,
         ..Default::default()
     };
+    let mut dirty: BTreeSet<usize> = (0..model.surfaces.len()).collect();
     for _ in 0..16 {
         report.passes += 1;
         report.kept.clear();
-        let mut changed = false;
-        for s in 0..model.surfaces.len() {
-            changed |= trim_surface(model, s, context, &mut report);
+        let mut lookup = Lookup::new(model, context);
+        let mut next = BTreeSet::new();
+        for s in dirty {
+            let before: Vec<usize> = model.surface_edges(s).collect();
+            if trim_surface(model, s, context, &lookup, &mut report) {
+                // Surfaces sharing a released or new edge may now be free.
+                for e in before
+                    .into_iter()
+                    .chain(model.surface_edges(s).collect::<Vec<_>>())
+                {
+                    next.extend(lookup.edge_users.get(&e).into_iter().flatten().copied());
+                }
+                next.insert(s);
+                lookup = Lookup::new(model, context);
+            }
         }
-        if !changed {
+        if next.is_empty() {
             break;
         }
+        dirty = next;
     }
     report
 }

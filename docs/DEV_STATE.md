@@ -55,10 +55,26 @@ slab meshes ignored 2194 junction segments.
 
 ## Current blockers
 
-None in the extended independent audit (surfaces, point contacts, bars,
-property transfer): strict mode passes on all three fixtures. Review items:
-скала1 two short source bars (6.9 and 28.6 mm); тест 5 five surface near
-misses (30–36 mm). Loads are not in the reconstruction input.
+Small fixtures: none in the extended audit. Large private fixture `тест 6`
+(69 MB, 490k elements, converted mesh) exposes:
+
+1. 20 plane patches not assembled (12461 source elements unresolved), the same
+   as before this session: the converted mesh has cracks, i.e. neighbouring
+   elements whose nodes are 1-5 mm apart instead of shared (139 unconnected
+   pairs within 2 mm, 366 within 5 mm), so region contours fold into the
+   crack. `MeshData::weld_unconnected` (`--v2-node-weld`) closes such cracks
+   without collapsing any element, but at 5 mm it regressed скала1 (mesh
+   invalid on one surface) and тест 5 (unresolved patches, many acute
+   triangles), so it is off by default until the interaction is understood.
+2. Performance: the pre-existing region/representative stage takes ~2 min on
+   тест 6; the whole run exceeds 10 min. `TOPO_TIMING=1` prints per-stage
+   times (pipeline and assembly).
+3. Extended audit on тест 6 (welding off): 94 unrepresented junction segments
+   (18 pairs), 61 unshared point contacts, 2 bar-surface contacts.
+
+Fixed after тест 6: duplicate edge keys after splits (released edges stay
+indexed), a stacked-alignment identification that ignored other supports of
+the upper node, unbuffered report output, slow console trimming.
 
 ## Next coherent development batch
 

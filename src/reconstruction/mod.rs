@@ -91,8 +91,9 @@ pub struct Model {
     vertices: Vec<[f64; 3]>,
     edges: Vec<[usize; 2]>,
     surfaces: Vec<Surface>,
-    /// Edges referenced by no surface (replaced by pre-existing pieces during
-    /// a split, or released by a trimmed console). Kept to preserve edge ids.
+    /// Edges referenced by no surface (replaced during a split, released by
+    /// a trim or merge). Kept, still indexed, to preserve edge ids; refreshed
+    /// by `refresh_orphaned_edges`.
     orphaned_edges: Vec<usize>,
     #[serde(skip)]
     edge_index: BTreeMap<[usize; 2], usize>,
@@ -395,11 +396,6 @@ impl Model {
                 surface.embedded_edges.push(merged);
             }
         }
-        for e in [e1, e2] {
-            if !self.orphaned_edges.contains(&e) {
-                self.orphaned_edges.push(e);
-            }
-        }
         Ok(merged)
     }
 
@@ -444,22 +440,23 @@ impl Model {
                 return Err(Error::InvalidRing);
             }
         }
-        let before: BTreeSet<usize> = self.surface_edges(surface).collect();
         let boundaries = self.intern(&rings);
         let target = &mut self.surfaces[surface];
         target.contours = contours;
         target.boundaries = boundaries;
         target.embedded_edges = embedded;
-        for e in before {
-            if !(0..self.surfaces.len()).any(|s| self.surface_edges(s).any(|f| f == e))
-                && !self.orphaned_edges.contains(&e)
-            {
-                self.orphaned_edges.push(e);
-            }
-        }
         Ok(())
     }
 
+    /// Recompute the list of edges no surface uses.
+    pub fn refresh_orphaned_edges(&mut self) {
+        let used: BTreeSet<usize> = (0..self.surfaces.len())
+            .flat_map(|s| self.surface_edges(s).collect::<Vec<_>>())
+            .collect();
+        self.orphaned_edges = (0..self.edges.len())
+            .filter(|e| !used.contains(e))
+            .collect();
+    }
     pub fn vertices(&self) -> &[[f64; 3]] {
         &self.vertices
     }
@@ -533,7 +530,12 @@ impl Model {
                 }
             }
         }
-        self.edge_index.remove(&[a, b]);
+        // The original key stays indexed unless its id is reused for a piece,
+        // so a later edge between the same vertices reuses this id.
+        let rekeyed = existing_first.is_none() || existing_second.is_none();
+        if rekeyed {
+            self.edge_index.remove(&[a, b]);
+        }
         let e_first = match existing_first {
             Some(id) => id,
             None => {
@@ -555,11 +557,6 @@ impl Model {
                 self.edges.len() - 1
             }
         };
-        if e_first != edge && e_second != edge {
-            // Both pieces existed. The original id is left unreferenced with a
-            // key no other edge uses; it is no longer indexed.
-            self.orphaned_edges.push(edge);
-        }
         for s in users {
             let plane = self.planes[self.surfaces[s].plane].clone();
             let uv = plane.project(p.to_array());

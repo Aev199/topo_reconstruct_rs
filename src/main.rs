@@ -86,6 +86,13 @@ struct Args {
     #[arg(long, default_value_t = 0.05)]
     v2_wall_end_snap: f64,
 
+    /// v2, геотехнический режим: допуск сшивки исходных узлов, не связанных
+    /// общим элементом (трещины и дубликаты после конвертации), в единицах
+    /// модели. Узлы одного элемента не сшиваются. По умолчанию выключено (0):
+    /// на части моделей сшивка пока ухудшает сборку (см. docs/DEV_STATE.md).
+    #[arg(long, default_value_t = 0.)]
+    v2_node_weld: f64,
+
     /// v2, геотехнический режим: максимальная ширина обрезаемой консоли за
     /// линией стыка, в единицах модели. 0 — не обрезать.
     #[arg(long, default_value_t = 0.25)]
@@ -94,6 +101,7 @@ struct Args {
 
 /// Geotechnical simplification tolerances of the v2 pipeline (model units).
 struct V2Tolerances {
+    node_weld: f64,
     stack_offset: f64,
     wall_end_snap: f64,
     console_width: f64,
@@ -115,7 +123,35 @@ fn run_v2_preview(
     if iterations == 0 {
         return Err("--v2-iterations must be positive".into());
     }
-    let mesh = V2LiraParser::parse(input)?;
+    for (name, value) in [
+        ("--v2-node-weld", tolerances.node_weld),
+        ("--v2-stack-offset", tolerances.stack_offset),
+        ("--v2-wall-end-snap", tolerances.wall_end_snap),
+        ("--v2-console-width", tolerances.console_width),
+    ] {
+        if !value.is_finite() || value < 0. {
+            return Err(format!("{name} must be a finite non-negative length").into());
+        }
+    }
+    // Stage timing on stderr when TOPO_TIMING is set (diagnostics only).
+    let timing = std::env::var_os("TOPO_TIMING").is_some();
+    let mut clock = Instant::now();
+    let mut lap = |stage: &str| {
+        if timing {
+            eprintln!("[timing] {stage}: {:.1}s", clock.elapsed().as_secs_f64());
+        }
+        clock = Instant::now();
+    };
+    let mut mesh = V2LiraParser::parse(input)?;
+    lap("parse");
+    // Geotechnical simplification starts at the source: cracks between
+    // elements (unshared, nearly coincident nodes) are closed.
+    let welds = if preserve_details {
+        vec![]
+    } else {
+        mesh.weld_unconnected(tolerances.node_weld)
+    };
+    lap("weld");
     let axes = recognize::recognize(
         &mesh,
         &recognize::Policy {
@@ -124,6 +160,7 @@ fn run_v2_preview(
             numerical_precision: 1e-8,
         },
     )?;
+    lap("axis_recognition");
     let plane_report = planes::recognize(
         &mesh,
         &planes::Policy {
@@ -132,6 +169,7 @@ fn run_v2_preview(
             precision: 1e-8,
         },
     )?;
+    lap("plane_recognition");
     // A finite residual with no movement/axis failure is retried with a
     // doubled LSQR budget. The tolerance and all geometric budgets stay fixed.
     let result = frame::solve_with_retry(
@@ -149,15 +187,7 @@ fn run_v2_preview(
         },
         3,
     )?;
-    for (name, value) in [
-        ("--v2-stack-offset", tolerances.stack_offset),
-        ("--v2-wall-end-snap", tolerances.wall_end_snap),
-        ("--v2-console-width", tolerances.console_width),
-    ] {
-        if !value.is_finite() || value < 0. {
-            return Err(format!("{name} must be a finite non-negative length").into());
-        }
-    }
+    lap("frame");
     let assembly_policy = assembly::Policy {
         closure_tolerance: 0.001,
         // A stacked wall moves by its offset when closing onto the lower axis.
@@ -180,8 +210,10 @@ fn run_v2_preview(
             },
         )?
     };
+    lap("assembly");
     let reconciliation =
         reconcile::solve(&mesh, &result, &topology, &reconcile::Policy::default())?;
+    lap("reconciliation");
     let (mesh_report, mesh_error) = if include_mesh {
         match mesh::build_partial(
             &topology,
@@ -198,23 +230,35 @@ fn run_v2_preview(
     } else {
         (None, None)
     };
+    lap("mesh");
     let mut report = serde_json::json!({
         "constraint_graph": graph::Graph::from_frame(&result),
         "frame": result,
         "topology": topology,
         "reconciliation": reconciliation,
         "axis_recognition": axes,
+        "input_welds": serde_json::json!({
+            "tolerance": if preserve_details { 0. } else { tolerances.node_weld },
+            "welds": welds,
+        }),
         "plane_recognition": plane_report,
     });
     if include_mesh {
         report["mesh"] = serde_json::to_value(mesh_report)?;
         report["mesh_error"] = serde_json::to_value(mesh_error)?;
     }
+    lap("report");
+    // Buffered: the pretty report of a large model has hundreds of MB.
+    use std::io::Write as _;
     if output == "-" {
-        serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
-        println!();
+        let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+        serde_json::to_writer_pretty(&mut out, &report)?;
+        writeln!(out)?;
+        out.flush()?;
     } else {
-        serde_json::to_writer_pretty(File::create(output)?, &report)?;
+        let mut out = std::io::BufWriter::new(File::create(output)?);
+        serde_json::to_writer_pretty(&mut out, &report)?;
+        out.flush()?;
     }
     Ok(())
 }
@@ -222,6 +266,7 @@ fn run_v2_preview(
 fn main() {
     let args = Args::parse();
     let tolerances = V2Tolerances {
+        node_weld: args.v2_node_weld,
         stack_offset: args.v2_stack_offset,
         wall_end_snap: args.v2_wall_end_snap,
         console_width: args.v2_console_width,

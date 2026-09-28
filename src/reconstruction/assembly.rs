@@ -378,6 +378,29 @@ fn concurrent_supports(planes: &[PlaneFrame], junctions: &[Vec<usize>]) -> Vec<P
         .collect()
 }
 
+/// Stage timing on stderr when `TOPO_TIMING` is set (diagnostics only).
+struct Timer {
+    enabled: bool,
+    last: std::time::Instant,
+}
+impl Timer {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var_os("TOPO_TIMING").is_some(),
+            last: std::time::Instant::now(),
+        }
+    }
+    fn lap(&mut self, stage: &str) {
+        if self.enabled {
+            eprintln!(
+                "[timing] assembly {stage}: {:.1}s",
+                self.last.elapsed().as_secs_f64()
+            );
+        }
+        self.last = std::time::Instant::now();
+    }
+}
+
 fn movement_budget(mesh: &MeshData, source: &frame::Report, index: usize) -> f64 {
     let mut budget = source.policy.maximum_movement;
     for axis in &source.axes {
@@ -465,7 +488,9 @@ fn assemble_impl(
     let mut issues = vec![];
     let mut rings = BTreeMap::new();
     let mut pinched_region_splits = vec![];
+    let mut timer = Timer::new();
     let regions = property_regions(mesh, source, policy.precision, &mut pinched_region_splits)?;
+    timer.lap("property_regions");
     for (i, (patch, _, ids)) in regions.iter().enumerate() {
         match boundary(
             mesh,
@@ -493,6 +518,7 @@ fn assemble_impl(
     }
     // Include every support owning a boundary node, including a patch whose
     // own boundary failed. Never silently disconnect it from valid neighbors.
+    timer.lap("region_boundaries");
     let boundary_nodes: BTreeSet<_> = rings.values().flatten().flatten().copied().collect();
     let mut owners = BTreeMap::<u32, Vec<usize>>::new();
     for (i, s) in source.surfaces.iter().enumerate() {
@@ -503,6 +529,7 @@ fn assemble_impl(
             }
         }
     }
+    timer.lap("owners");
     // Connected nearly coplanar source patches can use one support. Validate
     // every candidate point against the chosen support, preventing chain drift.
     let mut support_representatives: Vec<_> = (0..source.surfaces.len()).collect();
@@ -542,6 +569,7 @@ fn assemble_impl(
             }
         }
     }
+    timer.lap("regions_and_representatives");
     let mut stacked_walls = match features {
         Some(features) if features.maximum_stack_offset > 0. => stacking::align(
             mesh,
@@ -572,6 +600,7 @@ fn assemble_impl(
                 .collect()
         })
         .collect();
+    timer.lap("stacked_walls");
     let proposal = concurrent_supports(&source.candidate_planes, &junctions);
     let support_offsets_adjusted = source.surfaces.iter().enumerate().all(|(i, s)| {
         aligned.contains(&i)
@@ -587,6 +616,7 @@ fn assemble_impl(
     } else {
         source.candidate_planes.clone()
     };
+    timer.lap("concurrent_supports");
     let mut rejected_vertices = BTreeMap::new();
     let mut closed_points = BTreeMap::new();
     for (&id, supports) in &owners {
@@ -618,6 +648,7 @@ fn assemble_impl(
         }
         closed_points.insert(id, q);
     }
+    timer.lap("vertex_closure");
     let hole_recovery = holes::recover(
         &mut closed_points,
         &holes::Context {
@@ -652,7 +683,17 @@ fn assemble_impl(
             .nodes
             .get(&pair.upper_node)
             .ok_or("missing reference node")?;
-        if p.distance(q) <= policy.junction_movement_limit
+        // The shared position must lie on every support of the upper node.
+        let on_supports = owners.get(&pair.upper_node).is_none_or(|patches| {
+            patches.iter().all(|&patch| {
+                closed_supports[support_representatives[patch]]
+                    .distance(q.to_array())
+                    .abs()
+                    <= policy.precision
+            })
+        });
+        if on_supports
+            && p.distance(q) <= policy.junction_movement_limit
             && q.distance(reference) <= movement_budget(mesh, source, i) + policy.precision
         {
             identified.insert(pair.upper_node, pair.lower_node);
@@ -737,6 +778,7 @@ fn assemble_impl(
             }),
         }
     }
+    timer.lap("holes_and_surfaces");
     let mut axis_assembly = bars::assemble(
         mesh,
         source,
@@ -793,6 +835,7 @@ fn assemble_impl(
         (interior, locked, fixed)
     };
     let (_, _, fixed) = protected(&model, &axis_assembly);
+    timer.lap("bars");
     let coincident = match features {
         Some(_) => cleanup::merge_coincident(
             &mut model,
@@ -806,6 +849,7 @@ fn assemble_impl(
         ),
         None => cleanup::MergeReport::default(),
     };
+    timer.lap("coincident_merges");
     let bar_ends = match features {
         Some(features) if features.maximum_wall_end_snap > 0. => cleanup::merge_bar_ends(
             &mut model,
@@ -820,6 +864,7 @@ fn assemble_impl(
         _ => cleanup::MergeReport::default(),
     };
     let (interior, locked, fixed) = protected(&model, &axis_assembly);
+    timer.lap("bar_end_merges");
     let junctions = junctions::insert(
         &mut model,
         &junctions::Context {
@@ -828,6 +873,7 @@ fn assemble_impl(
             wall_end_tolerance: features.map_or(0., |f| f.maximum_wall_end_snap),
         },
     );
+    timer.lap("junctions");
     let wall_ends = match features {
         Some(features) if features.maximum_wall_end_snap > 0. => cleanup::merge_wall_ends(
             &mut model,
@@ -854,6 +900,7 @@ fn assemble_impl(
                 })
             })
     });
+    timer.lap("wall_end_merges");
     let consoles = match features {
         Some(features) => consoles::trim(
             &mut model,
@@ -867,6 +914,7 @@ fn assemble_impl(
         ),
         None => consoles::Report::default(),
     };
+    timer.lap("consoles");
     let short_edges = match features {
         Some(features) if features.maximum_wall_end_snap > 0. => cleanup::remove_short_edges(
             &mut model,
@@ -876,6 +924,8 @@ fn assemble_impl(
         ),
         _ => cleanup::Report::default(),
     };
+    timer.lap("short_edges");
+    model.refresh_orphaned_edges();
     Ok(Report {
         policy: policy.clone(),
         export_ready: false,
