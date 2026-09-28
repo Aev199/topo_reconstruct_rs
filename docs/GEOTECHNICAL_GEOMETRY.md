@@ -543,3 +543,38 @@ column through a slab with and without a contact, a bar in a slab with and
 without an interval contact, a gap versus a short joining bar, a tilted panel
 touching a slab at a corner, a stiffness mismatch) and a Rust case joining a
 beam split by a 20 mm gap while keeping a 20 mm joining bar.
+
+## Mesh-level connectivity audit, 2026-09-28
+
+An external review found three gaps in the extended audit: any bar-surface
+contact record passed a whole in-plane intersection; bar checks read contact
+records, not the mesh; missing stiffness data counted as zero errors. Now:
+
+- a bar lying in a surface must have its whole in-surface length covered by
+  surface edges or interval contacts (`bar_in_surface_without_contact`), and,
+  with a mesh, by bar segments that are also triangle edges of that surface
+  (`bar_in_surface_not_shared_in_mesh`);
+- a piercing/touching bar, two crossing bars and a vertex shared by two
+  surfaces must use one mesh node (`bar_surface_point_not_shared_in_mesh`,
+  `bar_intersection_not_shared_in_mesh`, `shared_vertex_not_shared_in_mesh`);
+  every axis must be covered by its mesh bars (`bar_not_covered_by_mesh`);
+- a triangle without stiffness or without a `surface_stiffness` record, a
+  mesh bar without a valid axis/spans, and a surface without triangles fail.
+
+The new checks found a real defect on скала1: two beams in a slab plane were
+connected to the slab only at their ends. Causes and general fixes:
+
+- contacts were derived before later vertex moves (a coincident merge moved a
+  beam end by 0.036 mm off the slab plane numerically, so the in-plane
+  interval was never recorded). `bars::refresh_contacts` recomputes all
+  bar-surface point and interval contacts from the final geometry;
+- a beam node stayed 0.038 mm from the slab edge vertex it belongs to, two
+  parallel lines side by side. `cleanup::merge_bar_anchors` identifies a bar
+  node with a surface vertex within `minimum_edge`, moving the surface vertex
+  onto the bar (a bar never bends; reported in `topology.bar_anchors`).
+
+After the fix all three fixtures pass the strict audit with mesh-level
+checks; mesh metrics unchanged (скала1 +2 triangles). Debug and release
+outputs are identical. Tests: 10 new analytic auditor cases and 2 Rust cases
+(beam node beside a slab edge vertex, stale contact without its interval),
+each over rotations, translations, reversed normals and scales.

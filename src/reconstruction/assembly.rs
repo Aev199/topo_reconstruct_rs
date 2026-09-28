@@ -69,6 +69,8 @@ pub struct Report {
     pub wall_ends: cleanup::MergeReport,
     /// Bar ends merged across small gaps (geotechnical).
     pub bar_ends: cleanup::MergeReport,
+    /// Surface vertices identified with nearly coincident bar nodes.
+    pub bar_anchors: cleanup::MergeReport,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -863,6 +865,19 @@ fn assemble_impl(
         ),
         _ => cleanup::MergeReport::default(),
     };
+    let bar_anchors = match features {
+        Some(_) => cleanup::merge_bar_anchors(
+            &mut model,
+            &mut cleanup::Bars {
+                axes: &mut axis_assembly.axes,
+                contacts: &mut axis_assembly.contacts,
+            },
+            policy.minimum_edge,
+            &fixed,
+            &vertex_source_nodes,
+        ),
+        None => cleanup::MergeReport::default(),
+    };
     let (interior, locked, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
     let junctions = junctions::insert(
@@ -926,6 +941,7 @@ fn assemble_impl(
     };
     timer.lap("short_edges");
     model.refresh_orphaned_edges();
+    bars::refresh_contacts(&model, &axis_assembly.axes, &mut axis_assembly.contacts);
     Ok(Report {
         policy: policy.clone(),
         export_ready: false,
@@ -946,6 +962,7 @@ fn assemble_impl(
         coincident_vertices: coincident,
         wall_ends,
         bar_ends,
+        bar_anchors,
         issues,
         maximum_closure_movement,
         rejected_vertices,

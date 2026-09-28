@@ -211,6 +211,138 @@ class BarAndPointTests(unittest.TestCase):
         self.assertEqual(r['properties']['triangles_with_wrong_stiffness'], 1)
         self.assertFalse(r['global_checks_passed'])
 
+    def test_partial_interval_contact_does_not_cover_the_line(self):
+        data = with_bars(model([xy()]), [[(0.1, 0.5, 0), (0.9, 0.5, 0)]],
+                         [dict(kind='interval', axis=0, surface=0, start_t=0, end_t=0.2)])
+        r = audit(data)
+        self.assertEqual(r['point_and_bar_issue_counts'], {'bar_in_surface_without_contact': 1})
+        data['topology']['axis_assembly']['contacts'].append(
+            dict(kind='interval', axis=0, surface=0, start_t=0.2, end_t=1))
+        self.assertTrue(audit(data)['global_checks_passed'])
+
+    def test_bar_crossing_a_panel_edge_needs_full_coverage(self):
+        # In the slab plane, the bar leaves the slab: only the inside part is
+        # required, and a contact covering it is sufficient.
+        data = with_bars(model([xy()]), [[(0.5, 0.5, 0), (1.5, 0.5, 0)]],
+                         [dict(kind='interval', axis=0, surface=0, start_t=0, end_t=0.25)])
+        self.assertEqual(audit(data)['point_and_bar_issue_counts'],
+                         {'bar_in_surface_without_contact': 1})
+        data['topology']['axis_assembly']['contacts'][0]['end_t'] = 0.5
+        self.assertTrue(audit(data)['global_checks_passed'])
+
+
+def meshed(data, triangles, bars, extra=()):
+    """Trial mesh over the preview vertices plus extra (duplicate) nodes."""
+    preview = data['topology']['preview']
+    data['topology']['surface_stiffness'] = [1] * len(preview['surfaces'])
+    for axis in data['topology'].get('axis_assembly', {}).get('axes', []):
+        axis['spans'] = [dict(element=1, stiffness=2, start_t=0, end_t=1)]
+    data['mesh'] = dict(vertices=list(preview['vertices']) + list(extra),
+                        triangles=[dict(surface=s, vertices=v, stiffness=1) for s, v in triangles],
+                        bars=[dict(axis=a, vertices=v, source_element=1, stiffness=2)
+                              for a, v in bars])
+    return data
+
+
+class MeshConnectivityTests(unittest.TestCase):
+    """Contact records never prove that the mesh is connected."""
+
+    def column(self):
+        data = with_bars(model([xy()]), [[(0.5, 0.5, -1), (0.5, 0.5, 0), (0.5, 0.5, 1)]],
+                         [dict(kind='point', axis=0, surface=0, vertex=(0.5, 0.5, 0))])
+        # Preview vertices: 0-3 slab corners, 4-6 column nodes (5 = pierce point).
+        return data
+
+    def test_piercing_bar_must_share_a_mesh_node(self):
+        fan = [(0, [0, 1, 5]), (0, [1, 2, 5]), (0, [2, 3, 5]), (0, [3, 0, 5])]
+        data = meshed(self.column(), fan, [(0, [4, 5]), (0, [5, 6])])
+        self.assertTrue(audit(data)['global_checks_passed'])
+        # Same geometry, but the bar uses a duplicate node at the pierce point.
+        data = meshed(self.column(), fan, [(0, [4, 7]), (0, [7, 6])], extra=[(0.5, 0.5, 0)])
+        r = audit(data)
+        self.assertEqual(r['point_and_bar_issue_counts'],
+                         {'bar_surface_point_not_shared_in_mesh': 1})
+        self.assertFalse(r['global_checks_passed'])
+
+    def test_bar_in_panel_must_follow_triangle_edges(self):
+        data = with_bars(model([xy()]), [[(0, 0.5, 0), (1, 0.5, 0)]],
+                         [dict(kind='interval', axis=0, surface=0, start_t=0, end_t=1)])
+        # Preview vertices 4 and 5 are the bar ends on the slab edges.
+        split = [(0, [0, 1, 5]), (0, [0, 5, 4]), (0, [4, 5, 2]), (0, [4, 2, 3])]
+        self.assertTrue(audit(meshed(data, split, [(0, [4, 5])]))['global_checks_passed'])
+        diagonal = [(0, [0, 1, 2]), (0, [0, 2, 3])]
+        data = with_bars(model([xy()]), [[(0, 0.5, 0), (1, 0.5, 0)]],
+                         [dict(kind='interval', axis=0, surface=0, start_t=0, end_t=1)])
+        r = audit(meshed(data, diagonal, [(0, [4, 5])]))
+        self.assertIn('bar_in_surface_not_shared_in_mesh', r['point_and_bar_issue_counts'])
+
+    def test_unmeshed_bar_fails(self):
+        fan = [(0, [0, 1, 5]), (0, [1, 2, 5]), (0, [2, 3, 5]), (0, [3, 0, 5])]
+        r = audit(meshed(self.column(), fan, [(0, [4, 5])]))
+        self.assertIn('bar_not_covered_by_mesh', r['point_and_bar_issue_counts'])
+
+    def test_crossing_bars_must_share_a_mesh_node(self):
+        data = with_bars(model([xy(z=5)]), [[(0, 0, 1), (1, 1, 1), (2, 2, 1)],
+                                           [(0, 2, 1), (1, 1, 1), (2, 0, 1)]])
+        slab = [(0, [0, 1, 2]), (0, [0, 2, 3])]
+        # Vertices 4-6 and 7, 5, 8 form the two bars through shared node 5.
+        good = meshed(data, slab, [(0, [4, 5]), (0, [5, 6]), (1, [7, 5]), (1, [5, 8])])
+        self.assertTrue(audit(good)['global_checks_passed'])
+        bad = meshed(data, slab, [(0, [4, 5]), (0, [5, 6]), (1, [7, 9]), (1, [9, 8])],
+                     extra=[(1, 1, 1)])
+        self.assertEqual(audit(bad)['point_and_bar_issue_counts'],
+                         {'bar_intersection_not_shared_in_mesh': 1})
+
+    def test_shared_surface_vertex_must_be_one_mesh_node(self):
+        data = model([xy(), wall()])
+        good = meshed(data, [(0, [0, 1, 2]), (0, [0, 2, 3]), (1, [0, 1, 4]), (1, [0, 4, 5])], [])
+        self.assertTrue(audit(good)['global_checks_passed'])
+        data = model([xy(), wall()])
+        bad = meshed(data, [(0, [0, 1, 2]), (0, [0, 2, 3]), (1, [6, 7, 4]), (1, [6, 4, 5])], [],
+                     extra=data['topology']['preview']['vertices'][:2])
+        r = audit(bad)
+        self.assertEqual(r['point_and_bar_issue_counts'], {'shared_vertex_not_shared_in_mesh': 2})
+
+
+class PropertyTests(unittest.TestCase):
+    def slab(self, triangle):
+        data = model([xy(), xy(1, 2)])
+        data['topology']['surface_stiffness'] = [7, 7]
+        data['mesh'] = dict(vertices=data['topology']['preview']['vertices'], bars=[],
+                            triangles=[dict(surface=0, vertices=[0, 1, 2], stiffness=7), triangle])
+        return data
+
+    def test_missing_stiffness_field_fails(self):
+        self.assertTrue(audit(self.slab(dict(surface=1, vertices=[1, 5, 2], stiffness=7)))
+                        ['global_checks_passed'])
+        r = audit(self.slab(dict(surface=1, vertices=[1, 5, 2])))
+        self.assertEqual(r['properties']['triangles_with_missing_stiffness'], 1)
+        self.assertFalse(r['global_checks_passed'])
+
+    def test_missing_surface_record_fails(self):
+        data = self.slab(dict(surface=1, vertices=[1, 5, 2], stiffness=7))
+        data['topology']['surface_stiffness'] = [7]
+        r = audit(data)
+        self.assertEqual(r['properties']['triangles_with_missing_stiffness'], 1)
+        self.assertFalse(r['global_checks_passed'])
+        del data['topology']['surface_stiffness']
+        self.assertEqual(audit(data)['properties']['triangles_with_missing_stiffness'], 2)
+
+    def test_unmeshed_surface_and_bar_without_spans_fail(self):
+        data = self.slab(dict(surface=0, vertices=[0, 2, 3], stiffness=7))
+        r = audit(data)
+        self.assertEqual(r['properties']['surfaces_without_triangles'], [1])
+        self.assertFalse(r['global_checks_passed'])
+        data = with_bars(self.slab(dict(surface=1, vertices=[1, 5, 2], stiffness=7)),
+                         [[(0, 0, 3), (1, 0, 3)]])
+        n = len(data['topology']['preview']['vertices'])
+        data['mesh']['vertices'] = data['topology']['preview']['vertices']
+        data['mesh']['bars'] = [dict(axis=0, vertices=[n - 2, n - 1], source_element=1, stiffness=2)]
+        r = audit(data)
+        self.assertEqual(r['properties']['bars_with_missing_stiffness'], 1)
+        data['mesh']['bars'][0]['axis'] = 5
+        self.assertEqual(audit(data)['properties']['bars_with_missing_stiffness'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

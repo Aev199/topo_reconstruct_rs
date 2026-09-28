@@ -84,6 +84,9 @@ fn move_with_axes(
     q: DVec3,
     limit: f64,
 ) -> Result<(), String> {
+    if q.distance(DVec3::from_array(model.vertices[v])) <= model.precision {
+        return Ok(());
+    }
     let mut moves = vec![(v, q)];
     for (i, axis) in axes.iter().enumerate() {
         let member = axis.endpoints.contains(&v) || axis.anchors.iter().any(|a| a.vertex == v);
@@ -370,6 +373,101 @@ pub fn merge_wall_ends(
         }
         return report;
     }
+}
+
+/// Identify bar nodes with surface vertices closer than `tolerance`.
+///
+/// A beam on a slab edge may keep its own node a fraction of a millimetre
+/// from the slab contour vertex: two parallel lines then run side by side
+/// and the mesh leaves the bar unconnected along them. The surface vertex
+/// moves onto the bar node (a bar never bends), and the merge is recorded.
+pub fn merge_bar_anchors(
+    model: &mut Model,
+    bars: &mut Bars<'_>,
+    tolerance: f64,
+    fixed: &BTreeSet<usize>,
+    source_nodes: &[u32],
+) -> MergeReport {
+    let mut report = MergeReport {
+        tolerance,
+        ..Default::default()
+    };
+    let used: BTreeSet<usize> = (0..model.surfaces.len())
+        .flat_map(|s| model.surface_edges(s).collect::<Vec<_>>())
+        .flat_map(|e| model.edges[e])
+        .collect();
+    let anchors: BTreeSet<usize> = bars
+        .axes
+        .iter()
+        .flat_map(|a| a.anchors.iter().map(|x| x.vertex).chain(a.endpoints))
+        .filter(|v| !used.contains(v))
+        .collect();
+    let cell = tolerance.max(model.precision);
+    let key = |p: [f64; 3]| p.map(|x| (x / cell).floor() as i64);
+    let mut grid = std::collections::BTreeMap::<[i64; 3], Vec<usize>>::new();
+    for &v in &used {
+        grid.entry(key(model.vertices[v])).or_default().push(v);
+    }
+    let mut pairs = vec![];
+    for &a in &anchors {
+        let k = key(model.vertices[a]);
+        let mut best: Option<(f64, usize)> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    for &b in grid
+                        .get(&[k[0] + dx, k[1] + dy, k[2] + dz])
+                        .into_iter()
+                        .flatten()
+                    {
+                        let d = DVec3::from_array(model.vertices[a])
+                            .distance(DVec3::from_array(model.vertices[b]));
+                        if d <= tolerance && best.is_none_or(|x| (d, b) < x) {
+                            best = Some((d, b));
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((d, b)) = best {
+            pairs.push((d, a, b));
+        }
+    }
+    pairs.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
+    let mut gone = BTreeSet::new();
+    for (d, keep, drop) in pairs {
+        if gone.contains(&drop) {
+            continue;
+        }
+        let surfaces = users(model, drop);
+        let kept_from = model.vertices[keep];
+        match merge(model, bars, drop, keep, tolerance, fixed) {
+            Ok(movement) => {
+                gone.insert(drop);
+                report.merged.push(MergedVertex {
+                    kind: "bar_anchor".into(),
+                    dropped: drop,
+                    kept: keep,
+                    dropped_source_node: source_nodes.get(drop).copied(),
+                    kept_source_node: source_nodes.get(keep).copied(),
+                    distance: d,
+                    kept_movement: movement,
+                    kept_from,
+                    surfaces,
+                })
+            }
+            Err(reason) => report.rejected.push(RejectedMerge {
+                vertices: [drop, keep],
+                source_nodes: [
+                    source_nodes.get(drop).copied(),
+                    source_nodes.get(keep).copied(),
+                ],
+                distance: d,
+                reason,
+            }),
+        }
+    }
+    report
 }
 
 /// Merge the ends of two different bars that stop within `tolerance` of each
@@ -755,6 +853,107 @@ mod tests {
     }
 
     #[test]
+    fn beam_node_next_to_a_slab_edge_vertex_is_identified_and_contacts_refreshed() {
+        use super::super::bars::{refresh_contacts, Location};
+        for place in Placement::all() {
+            // The slab edge x = 4 carries a vertex 0.4 mm off the beam axis.
+            let panel = (
+                vec![vec![
+                    [0., 0., 0.],
+                    [4., 0., 0.],
+                    [4.0004, 2., 0.],
+                    [4., 4., 0.],
+                    [0., 4., 0.],
+                ]],
+                [0., 0., 1.],
+            );
+            let mut m = build(&place, &[panel]);
+            let at = |m: &Model, p: [f64; 3]| {
+                (0..m.vertices.len())
+                    .find(|&v| {
+                        DVec3::from_array(m.vertices[v]).distance(DVec3::from_array(place.point(p)))
+                            < 1e-9 * place.scale.max(1.)
+                    })
+                    .unwrap()
+            };
+            let (a, b) = (at(&m, [4., 0., 0.]), at(&m, [4., 4., 0.]));
+            let mid = m.add_vertex(place.point([4., 2., 0.])).unwrap();
+            let before = m.vertices[mid];
+            let mut axes = vec![bar([a, b], Some(mid))];
+            let mut contacts = vec![];
+            let r = merge_bar_anchors(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut contacts,
+                },
+                0.001 * place.scale,
+                &BTreeSet::new(),
+                &[],
+            );
+            assert_eq!(r.merged.len(), 1, "{:?}", r.rejected);
+            assert_eq!(r.merged[0].kept, mid);
+            // The bar stays straight; the slab contour now runs through it.
+            assert_eq!(m.vertices[mid], before);
+            assert!(m.surfaces[0].boundaries[0]
+                .iter()
+                .any(|e| m.edges[e.edge].contains(&mid)));
+            refresh_contacts(&m, &axes, &mut contacts);
+            let points = contacts
+                .iter()
+                .filter(|c| matches!(c, Contact::Point { location: Location::Boundary, .. }))
+                .count();
+            assert_eq!(points, 3, "{contacts:?}");
+            assert!(contacts.iter().any(|c| matches!(c,
+                Contact::Interval { start_t, end_t, location: Location::Boundary, .. }
+                    if *start_t < 1e-9 && *end_t > 1. - 1e-9)));
+            // Idempotent.
+            let again = merge_bar_anchors(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut contacts,
+                },
+                0.001 * place.scale,
+                &BTreeSet::new(),
+                &[],
+            );
+            assert!(again.merged.is_empty() && again.rejected.is_empty());
+        }
+    }
+
+    #[test]
+    fn stale_contacts_gain_the_in_plane_interval_of_a_beam() {
+        use super::super::bars::{refresh_contacts, Location};
+        for place in Placement::all() {
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let corner = (0..m.vertices.len())
+                .find(|&v| {
+                    DVec3::from_array(m.vertices[v])
+                        .distance(DVec3::from_array(place.point([0., 0., 0.])))
+                        < 1e-9 * place.scale.max(1.)
+                })
+                .unwrap();
+            let inner = m.add_vertex(place.point([2., 2., 0.])).unwrap();
+            let axes = vec![bar([corner, inner], None)];
+            // Only the interior end was recorded before later vertex moves.
+            let mut contacts = vec![Contact::Point {
+                axis: 0,
+                surface: 0,
+                vertex: inner,
+                t: 1.,
+                location: Location::Interior,
+            }];
+            refresh_contacts(&m, &axes, &mut contacts);
+            assert!(contacts.iter().any(|c| matches!(c,
+                Contact::Interval { location: Location::Interior, start_t, end_t, .. }
+                    if *start_t < 1e-9 && *end_t > 1. - 1e-9)), "{contacts:?}");
+            assert!(contacts.iter().any(|c| matches!(c,
+                Contact::Point { vertex, location: Location::Boundary, .. } if *vertex == corner)));
+        }
+    }
+
+    #[test]
     fn bar_passing_through_a_duplicate_is_not_bent() {
         let place = &Placement::all()[2];
         let mut m = build(place, &[slab(0., 2.)]);
@@ -771,6 +970,40 @@ mod tests {
         // Both duplicates are interior anchors of bars.
         let mut axes = vec![bar([far0, far1], Some(d[0])), bar([far1, far0], Some(d[1]))];
         let mut contacts = vec![];
+        let r = merge_coincident(
+            &mut m,
+            &mut Bars {
+                axes: &mut axes,
+                contacts: &mut contacts,
+            },
+            0.001,
+            &BTreeSet::new(),
+            &[],
+        );
+        // Exactly coincident interior anchors may merge (nothing moves);
+        // any merge must keep every anchor on its straight bar.
+        assert!(!r.merged.is_empty() || !r.rejected.is_empty());
+        for axis in &axes {
+            let [p, q] = axis.endpoints.map(|e| DVec3::from_array(m.vertices[e]));
+            for anchor in &axis.anchors {
+                let x = DVec3::from_array(m.vertices[anchor.vertex]);
+                assert!(x.distance(p.lerp(q, anchor.t)) <= m.precision);
+            }
+        }
+        // An interior anchor off the other bar's position would bend it.
+        let mut m = build(place, &[slab(0., 2.)]);
+        duplicate_panel(&mut m, place);
+        let d: Vec<usize> = (0..m.vertices.len())
+            .filter(|&v| {
+                DVec3::from_array(m.vertices[v])
+                    .distance(DVec3::from_array(place.point([2., 4., 0.])))
+                    < 1e-9
+            })
+            .collect();
+        let far0 = m.add_vertex(place.point([0., 5., 0.])).unwrap();
+        let far1 = m.add_vertex(place.point([4., 3., 0.])).unwrap();
+        m.move_vertex(d[1], place.point([2., 4.0005, 0.])).unwrap();
+        let mut axes = vec![bar([far0, far1], Some(d[0])), bar([far1, far0], Some(d[1]))];
         let r = merge_coincident(
             &mut m,
             &mut Bars {

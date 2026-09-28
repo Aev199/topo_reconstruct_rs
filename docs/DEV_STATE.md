@@ -55,7 +55,8 @@ slab meshes ignored 2194 junction segments.
 
 ## Current blockers
 
-Small fixtures: none in the extended audit. Large private fixture `тест 6`
+Small fixtures: none in the extended audit, including the mesh-level
+connectivity and missing-property checks (2026-09-28). Large private fixture `тест 6`
 (69 MB, 490k elements, converted mesh) exposes:
 
 1. 20 plane patches not assembled (12461 source elements unresolved), the same
@@ -93,7 +94,7 @@ of one fixture into MIDAS GTS NX and/or PLAXIS 3D by the user.
 
 ### Also pending
 
-- Isolated point contacts, bar-bar intersections, load/property transfer.
+- Load transfer (loads are not in the reconstruction input).
 - Actual MIDAS/PLAXIS import verification.
 - `panic = "abort"` in release makes the Spade `catch_unwind` ineffective.
 
@@ -102,10 +103,8 @@ of one fixture into MIDAS GTS NX and/or PLAXIS 3D by the user.
 Even where the surface audit passes, global readiness is not yet
 proven. Remaining audit scope includes:
 
-- isolated point contacts;
-- non-parallel near misses;
-- bar-bar intersections;
-- full load/property transfer verification;
+- non-parallel near misses (review items only);
+- load transfer verification;
 - actual MIDAS/PLAXIS import verification.
 
 Do not set `export_ready` or equivalent final-readiness flags merely because

@@ -616,6 +616,99 @@ pub(super) fn assemble(
     report
 }
 
+/// Recompute bar-surface contacts from the final geometry.
+///
+/// Contacts are first derived from source ownership, before vertex merges,
+/// junction snapping and console trimming move vertices and rebuild
+/// contours. A contact computed then can miss an in-plane interval or keep a
+/// stale location, and the mesh would leave the bar unconnected along it.
+/// Pairs are those already in contact plus every surface having an anchor as
+/// a contour vertex: a point contact exists for each anchor on the surface
+/// material, and an interval for each part of an axis lying in its plane.
+pub fn refresh_contacts(model: &Model, axes: &[Axis], contacts: &mut Vec<Contact>) {
+    let precision = model.precision;
+    let mut owners = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for s in 0..model.surfaces.len() {
+        for e in model.surface_edges(s) {
+            for v in model.edges[e] {
+                owners.entry(v).or_default().insert(s);
+            }
+        }
+    }
+    let mut previous = BTreeSet::new();
+    let mut pairs = BTreeSet::new();
+    for c in contacts.iter() {
+        match *c {
+            Contact::Point {
+                axis,
+                surface,
+                vertex,
+                ..
+            } => {
+                previous.insert((axis, surface, vertex));
+                pairs.insert((axis, surface));
+            }
+            Contact::Interval { axis, surface, .. } => {
+                pairs.insert((axis, surface));
+            }
+        }
+    }
+    for (i, axis) in axes.iter().enumerate() {
+        for anchor in &axis.anchors {
+            for &s in owners.get(&anchor.vertex).into_iter().flatten() {
+                pairs.insert((i, s));
+            }
+        }
+    }
+    let mut result = vec![];
+    for (i, s) in pairs {
+        let (Some(axis), Some(surface)) = (axes.get(i), model.surfaces.get(s)) else {
+            continue;
+        };
+        let plane = &model.planes[surface.plane];
+        for anchor in &axis.anchors {
+            let p = model.vertices[anchor.vertex];
+            let owned = owners.get(&anchor.vertex).is_some_and(|o| o.contains(&s));
+            if !owned
+                && !previous.contains(&(i, s, anchor.vertex))
+                && plane.distance(p).abs() > precision
+            {
+                continue;
+            }
+            if let Some(location) = location(plane.project(p), &surface.contours, precision) {
+                result.push(Contact::Point {
+                    axis: i,
+                    surface: s,
+                    vertex: anchor.vertex,
+                    t: anchor.t,
+                    location,
+                });
+            }
+        }
+        let (a, b) = (
+            model.vertices[axis.endpoints[0]],
+            model.vertices[axis.endpoints[1]],
+        );
+        if plane.distance(a).abs() <= precision && plane.distance(b).abs() <= precision {
+            for (start_t, end_t, location) in intervals(
+                plane.project(a),
+                plane.project(b),
+                &surface.contours,
+                precision,
+            ) {
+                result.push(Contact::Interval {
+                    axis: i,
+                    surface: s,
+                    start_t,
+                    end_t,
+                    location,
+                });
+            }
+        }
+    }
+    *contacts = result;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

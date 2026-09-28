@@ -204,7 +204,7 @@ def check(data, baseline=None):
     # Geotechnical merges give a dropped source node the kept vertex; both
     # nodes then share one identity (the kept node).
     merged = {}
-    for key in ("coincident_vertices", "wall_ends", "bar_ends"):
+    for key in ("coincident_vertices", "wall_ends", "bar_ends", "bar_anchors"):
         for m in topology.get(key, {}).get("merged", []):
             if m["dropped_source_node"] is not None and m["kept_source_node"] is not None:
                 merged[m["dropped_source_node"]] = m["kept_source_node"]
