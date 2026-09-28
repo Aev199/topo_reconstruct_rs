@@ -852,21 +852,21 @@ pub fn insert(model: &mut Model, context: &Context<'_>) -> Report {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::reconstruction::PlaneFrame;
     use glam::DQuat;
     use std::collections::BTreeMap;
 
     /// A rigid transform, a scale and an optional reversal of every normal.
-    struct Placement {
-        rotation: DQuat,
-        shift: DVec3,
-        scale: f64,
-        flip: bool,
+    pub(crate) struct Placement {
+        pub(crate) rotation: DQuat,
+        pub(crate) shift: DVec3,
+        pub(crate) scale: f64,
+        pub(crate) flip: bool,
     }
     impl Placement {
-        fn all() -> Vec<Placement> {
+        pub(crate) fn all() -> Vec<Placement> {
             let mut out = vec![];
             for scale in [0.1, 1., 25.] {
                 for (rotation, shift, flip) in [
@@ -887,17 +887,17 @@ mod tests {
             }
             out
         }
-        fn point(&self, p: [f64; 3]) -> [f64; 3] {
+        pub(crate) fn point(&self, p: [f64; 3]) -> [f64; 3] {
             (self.rotation * (DVec3::from_array(p) * self.scale) + self.shift).to_array()
         }
     }
 
     /// Rings of coordinates and the plane normal of one surface.
-    type Panel = (Vec<Vec<[f64; 3]>>, [f64; 3]);
+    pub(crate) type Panel = (Vec<Vec<[f64; 3]>>, [f64; 3]);
 
     /// Surfaces given as rings of coordinates. Equal coordinates in the input
     /// description denote one explicit vertex; the placement never merges.
-    fn build(place: &Placement, surfaces: &[Panel]) -> Model {
+    pub(crate) fn build(place: &Placement, surfaces: &[Panel]) -> Model {
         let mut model = Model::new(1e-7 * place.scale, 0.001 * place.scale).unwrap();
         let mut ids = BTreeMap::new();
         for (rings, normal) in surfaces {
@@ -922,22 +922,22 @@ mod tests {
         model
     }
 
-    fn slab(x0: f64, x1: f64) -> Panel {
+    pub(crate) fn slab(x0: f64, x1: f64) -> Panel {
         (
             vec![vec![[x0, 0., 0.], [x1, 0., 0.], [x1, 4., 0.], [x0, 4., 0.]]],
             [0., 0., 1.],
         )
     }
-    fn wall(x0: f64, x1: f64, z0: f64, z1: f64) -> Panel {
+    pub(crate) fn wall(x0: f64, x1: f64, z0: f64, z1: f64) -> Panel {
         (
             vec![vec![[x0, 2., z0], [x1, 2., z0], [x1, 2., z1], [x0, 2., z1]]],
             [0., 1., 0.],
         )
     }
-    fn no_interior(model: &Model) -> Vec<BTreeSet<usize>> {
+    pub(crate) fn no_interior(model: &Model) -> Vec<BTreeSet<usize>> {
         vec![BTreeSet::new(); model.surfaces.len()]
     }
-    fn run(model: &mut Model) -> Report {
+    pub(crate) fn run(model: &mut Model) -> Report {
         let interior = no_interior(model);
         let locked = BTreeSet::new();
         insert(

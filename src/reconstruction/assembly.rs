@@ -1,6 +1,7 @@
 //! Surface topology preview. Engineering closure tolerance is distinct from
 //! numerical planarity. Mechanical ties and mesh readiness are not inferred.
 pub mod bars;
+pub mod consoles;
 mod features;
 mod holes;
 pub mod junctions;
@@ -54,6 +55,8 @@ pub struct Report {
     /// Surface-surface junction lines inserted as shared edges. Vertices with
     /// index `>= vertex_source_nodes.len()` are generated junction vertices.
     pub junctions: junctions::Report,
+    /// Thin consoles beyond junction lines trimmed in geotechnical assembly.
+    pub consoles: consoles::Report,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -406,6 +409,8 @@ pub fn assemble_geotechnical(
         || !features.maximum_filled_area_ratio.is_finite()
         || features.maximum_filled_area_ratio <= 0.
         || features.maximum_filled_area_ratio >= 1.
+        || !features.maximum_console_width.is_finite()
+        || features.maximum_console_width < 0.
     {
         return Err("invalid feature simplification policy");
     }
@@ -707,6 +712,19 @@ fn assemble_impl(
             locked: &locked,
         },
     );
+    let consoles = match features {
+        Some(features) => consoles::trim(
+            &mut model,
+            &consoles::Context {
+                maximum_width: features.maximum_console_width,
+                interior: &interior,
+                locked: &locked,
+                axes: &axis_assembly.axes,
+                contacts: &axis_assembly.contacts,
+            },
+        ),
+        None => consoles::Report::default(),
+    };
     Ok(Report {
         policy: policy.clone(),
         export_ready: false,
@@ -721,6 +739,7 @@ fn assemble_impl(
         simplified_holes,
         axis_assembly,
         junctions,
+        consoles,
         issues,
         maximum_closure_movement,
         rejected_vertices,

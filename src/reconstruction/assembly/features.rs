@@ -11,12 +11,17 @@ pub struct FeaturePolicy {
     pub maximum_source_width: f64,
     /// Cumulative filled source area / exterior area, per property region.
     pub maximum_filled_area_ratio: f64,
+    /// Maximum width of a free console beyond a junction line that is
+    /// trimmed (model units). The default, 0.25 m, is half the default mesh
+    /// spacing: such a strip cannot hold elements of the target size.
+    pub maximum_console_width: f64,
 }
 impl Default for FeaturePolicy {
     fn default() -> Self {
         Self {
             maximum_source_width: 0.05,
             maximum_filled_area_ratio: 0.001,
+            maximum_console_width: 0.25,
         }
     }
 }
@@ -214,6 +219,7 @@ mod tests {
         let mut loops = vec![vec![0, 1, 2, 3], vec![4, 5, 6]];
         let policy = FeaturePolicy {
             maximum_filled_area_ratio: 0.000001,
+            maximum_console_width: 0.,
             ..FeaturePolicy::default()
         };
         assert!(simplify(&mut loops, &mesh, &points, &plane, 1e-7, &policy, 0, &[12]).is_empty());

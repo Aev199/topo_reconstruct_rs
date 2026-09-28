@@ -91,8 +91,8 @@ pub struct Model {
     vertices: Vec<[f64; 3]>,
     edges: Vec<[usize; 2]>,
     surfaces: Vec<Surface>,
-    /// Edges replaced by two pre-existing pieces during a split. They are
-    /// referenced by no surface and kept only to preserve edge ids.
+    /// Edges referenced by no surface (replaced by pre-existing pieces during
+    /// a split, or released by a trimmed console). Kept to preserve edge ids.
     orphaned_edges: Vec<usize>,
     #[serde(skip)]
     edge_index: BTreeMap<[usize; 2], usize>,
@@ -149,12 +149,30 @@ impl Model {
         rings: Vec<Vec<usize>>,
         mut source_elements: Vec<u32>,
     ) -> Result<usize, Error> {
+        let contours = self.contours(plane, &rings)?;
+        // All validation precedes mutation, including edge interning.
+        let boundaries = self.intern(&rings);
+        source_elements.sort_unstable();
+        source_elements.dedup();
+        let id = self.surfaces.len();
+        self.surfaces.push(Surface {
+            plane,
+            contours,
+            boundaries,
+            embedded_edges: vec![],
+            source_elements,
+        });
+        Ok(id)
+    }
+
+    /// Validated plane contours of vertex rings (exterior first).
+    fn contours(&self, plane: usize, rings: &[Vec<usize>]) -> Result<Vec<Vec<[f64; 2]>>, Error> {
         let frame = self.planes.get(plane).ok_or(Error::InvalidPlane)?;
         if rings.is_empty() {
             return Err(Error::InvalidRing);
         }
         let mut contours = vec![];
-        for ring in &rings {
+        for ring in rings {
             if ring.len() < 3 || ring.iter().copied().collect::<BTreeSet<_>>().len() != ring.len() {
                 return Err(Error::InvalidRing);
             }
@@ -180,8 +198,11 @@ impl Model {
             contours.push(uv);
         }
         validate_holes(&contours)?;
-        // All validation precedes mutation, including edge interning.
-        let boundaries = rings
+        Ok(contours)
+    }
+
+    fn intern(&mut self, rings: &[Vec<usize>]) -> Vec<Vec<EdgeUse>> {
+        rings
             .iter()
             .map(|ring| {
                 (0..ring.len())
@@ -201,19 +222,66 @@ impl Model {
                     })
                     .collect()
             })
-            .collect();
-        source_elements.sort_unstable();
-        source_elements.dedup();
-        let id = self.surfaces.len();
-        self.surfaces.push(Surface {
-            plane,
-            contours,
-            boundaries,
-            embedded_edges: vec![],
-            source_elements,
-        });
-        Ok(id)
+            .collect()
     }
+
+    /// Replace the material domain of a surface: new rings (exterior first)
+    /// and embedded edges, validated like a new surface. Plane and source
+    /// provenance are kept. Edges no longer used by any surface are recorded
+    /// as unreferenced. The model is unchanged on error.
+    pub fn rebuild_surface(
+        &mut self,
+        surface: usize,
+        rings: Vec<Vec<usize>>,
+        embedded: Vec<usize>,
+    ) -> Result<(), Error> {
+        let plane = self.surfaces.get(surface).ok_or(Error::InvalidRing)?.plane;
+        let contours = self.contours(plane, &rings)?;
+        let frame = &self.planes[plane];
+        let ring_keys: BTreeSet<[usize; 2]> = rings
+            .iter()
+            .flat_map(|r| {
+                (0..r.len()).map(move |i| {
+                    let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                    [a.min(b), a.max(b)]
+                })
+            })
+            .collect();
+        for &e in &embedded {
+            let key = *self.edges.get(e).ok_or(Error::InvalidRing)?;
+            if ring_keys.contains(&key) {
+                return Err(Error::InvalidRing);
+            }
+            let [pa, pb] = key.map(|v| self.vertices[v]);
+            if frame.distance(pa).abs() > self.precision
+                || frame.distance(pb).abs() > self.precision
+            {
+                return Err(Error::NonPlanar);
+            }
+            let (ua, ub) = (frame.project(pa), frame.project(pb));
+            let mid = [(ua[0] + ub[0]) / 2., (ua[1] + ub[1]) / 2.];
+            if !closed_contains(&contours, mid, self.precision)
+                || properly_crosses(&contours, ua, ub, self.precision)
+            {
+                return Err(Error::InvalidRing);
+            }
+        }
+        let before: BTreeSet<usize> = self.surface_edges(surface).collect();
+        let boundaries = self.intern(&rings);
+        let target = &mut self.surfaces[surface];
+        target.contours = contours;
+        target.boundaries = boundaries;
+        target.embedded_edges = embedded;
+        for e in before {
+            if !(0..self.surfaces.len()).any(|s| self.surface_edges(s).any(|f| f == e))
+                && !self.orphaned_edges.contains(&e)
+            {
+                self.orphaned_edges.push(e);
+            }
+        }
+        Ok(())
+    }
+
     pub fn vertices(&self) -> &[[f64; 3]] {
         &self.vertices
     }

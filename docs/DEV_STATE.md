@@ -39,8 +39,12 @@ Everywhere: 0 invalid surfaces, 0 coplanar overlaps, 0 unresolved source
 elements, trial topology and external-mesher gate pass, surface/axis counts
 unchanged, 0 reconciliation problems. Debug and release outputs are identical.
 
+Geotechnical assembly trims thin consoles beyond junction lines
+(`assembly::consoles`): тест 5 loses 26.61 m² of 0.10–0.19 m slab consoles,
+audit still passing.
+
 Mesh quality (below 20°): скала1 163 → 73 (min 2.39°), типовая секция 0,
-тест 5 261 (min 1.93°). The тест 5 baseline (53) was not comparable: its
+тест 5 241 (min 1.93°). The тест 5 baseline (53) was not comparable: its
 slab meshes ignored 2194 junction segments.
 
 ## Current blockers
@@ -51,16 +55,19 @@ slab meshes ignored 2194 junction segments.
    vertex that anchors a bar (`junction_vertex_near_edge_end`). Both need an
    explicit vertex-identity rule (merge with provenance, or a declared seam),
    never coordinate welding.
-2. Near-miss features of 4.6–25 mm inside one surface (e.g. wall lines offset
-   by millimetres on a slab) force the remaining acute triangles in тест 5.
-   They exceed the 1 mm snap limit and need an evidence-based rule.
+2. тест 5: walls above and below one slab with axes 25–30 mm apart (aligned
+   outer faces, different thicknesses), often short piers near the edge,
+   produce two junction lines millimetres apart and the remaining small and
+   acute elements. Needs an explicit stacked-wall axis alignment rule
+   (moves a wall plane; awaiting the user's decision on tolerance).
 
 ## Next coherent development batch
 
 ### Goal
 
-Vertex identity and near-miss repair with provenance, so the global audit
-passes on all three fixtures and small offsets stop forcing acute triangles.
+Stacked-wall axis alignment and vertex identity with provenance, so small
+offsets stop forcing tiny elements and the global audit passes on all three
+fixtures.
 
 ### Required approach
 

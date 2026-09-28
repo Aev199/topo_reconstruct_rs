@@ -281,3 +281,53 @@ and the three-model debug/release comparison is identical. Keep that comparison
 in the full-model gate. Separately, `panic = "abort"` in the release profile
 means the existing `catch_unwind` around Spade refinement cannot turn a library
 panic into a diagnostic in release builds.
+
+## Console trimming, 2026-09-28
+
+A mid-surface FE model lets a slab reach the outer face of a wall whose
+mid-plane lies inside it: a console of half the wall thickness (0.10–0.20 m on
+тест 5, 171 m of free edge in total). It carries no structure but forces
+elements far below the target size. Geotechnical assembly
+(`assembly::consoles`, after junction insertion) now trims such consoles; the
+conservative `--v2-preserve-details` path does not.
+
+Each surface is divided by its contour and junction lines into faces
+(separate components such as openings or floating junction lines belong to the
+smallest face containing them). A connected group of faces is removed when:
+
+- every face lies within `maximum_console_width` of its own junction lines
+  (default 0.25 model units: half the default mesh spacing, so such a strip
+  cannot hold target-size elements);
+- each face touches the free contour and the group borders material that stays
+  across a junction line (it is beyond a junction, not an isolated panel);
+- no removed contour edge is used by another surface (a parapet or facade
+  panel on the edge keeps the console);
+- no opening, dangling line, retained node, bar anchor or bar interval lies in
+  it;
+- the remaining material is one valid region.
+
+The junction line becomes the surface contour; its edge id is already shared
+with the wall, so the connection stays topological. Passes repeat until no
+change: trimming a slab console frees the contour of a wall stub beyond a
+perpendicular wall, which is then trimmed; a stub standing on a wider plate
+stays. Source elements remain assigned to their surface; each trim reports
+width, area, free length, junction edges and released edges
+(`topology.consoles`), and faces kept for a reason are counted by reason.
+
+тест 5 (private): 6 surfaces trimmed, 26.61 m², maximum width 0.19 m, three
+consoles kept because a parapet/facade surface shares their edge. The global
+surface audit still passes; triangles 49485 → 41975; below 20° 261 → 241;
+minimum angle unchanged at 1.93°. скала1 and типовая секция have no such
+consoles and are unchanged. Debug and release outputs are identical.
+
+The remaining small elements on тест 5 come from walls above and below one
+slab whose axes are 25–30 mm apart (outer faces aligned, different
+thicknesses), often short piers near the slab edge. Their two junction lines
+cannot be meshed without millimetre elements. Aligning stacked walls to a
+common axis moves a wall plane and is left as an explicit next decision.
+
+Tests: 5 synthetic cases (T-junction and crossing wall, too wide, parapet on
+the edge, retained node, opening plus floating line, perimeter annulus,
+corner consoles with wall stubs) under three scales, rigid transforms and
+reversed normals, and an FE-to-mesh test verifying trim width/area, full mesh
+quality and shared slab/wall mesh edges.

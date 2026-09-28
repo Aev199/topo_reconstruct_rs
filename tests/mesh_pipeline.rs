@@ -9,9 +9,18 @@ fn run(scale: f64, rotated: bool) -> (assembly::Report, mesh::Report) {
 }
 
 fn run_input(
+    input: topo_reconstruct_rs::input::MeshData,
+    scale: f64,
+    rotated: bool,
+) -> (assembly::Report, mesh::Report) {
+    run_with(input, scale, rotated, None)
+}
+
+fn run_with(
     mut input: topo_reconstruct_rs::input::MeshData,
     scale: f64,
     rotated: bool,
+    features: Option<assembly::FeaturePolicy>,
 ) -> (assembly::Report, mesh::Report) {
     let rotation = if rotated {
         DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.6)
@@ -74,16 +83,16 @@ fn run_input(
         },
     )
     .unwrap();
-    let t = assembly::assemble(
-        &input,
-        &f,
-        &assembly::Policy {
-            closure_tolerance: 0.001 * scale,
-            junction_movement_limit: 0.05 * scale,
-            precision: 1e-7 * scale,
-            minimum_edge: 0.001 * scale,
-        },
-    )
+    let policy = assembly::Policy {
+        closure_tolerance: 0.001 * scale,
+        junction_movement_limit: 0.05 * scale,
+        precision: 1e-7 * scale,
+        minimum_edge: 0.001 * scale,
+    };
+    let t = match features {
+        None => assembly::assemble(&input, &f, &policy),
+        Some(features) => assembly::assemble_geotechnical(&input, &f, &policy, &features),
+    }
     .unwrap();
     let m = mesh::build(
         &t,
@@ -306,6 +315,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         simplified_holes: vec![],
         axis_assembly: assembly::bars::Report::default(),
         junctions: assembly::junctions::Report::default(),
+        consoles: assembly::consoles::Report::default(),
         issues: vec![],
         maximum_closure_movement: 0.,
         rejected_vertices: BTreeMap::new(),
@@ -543,6 +553,103 @@ fn surface_junctions_are_shared_topology_and_conforming_mesh() {
                 BTreeSet::from([10, 20, 30])
             );
             assert!(!mesh.export_ready);
+        }
+    }
+}
+
+/// Slab whose edge lies 0.15 beyond the axis of the wall carrying it, as in a
+/// mid-surface model with the slab edge at the outer wall face. Coordinates
+/// are in 5 cm units.
+fn console_source() -> topo_reconstruct_rs::input::MeshData {
+    use topo_reconstruct_rs::input::{ElementData, MeshData};
+    let mut mesh = MeshData::default();
+    let mut nodes = BTreeMap::new();
+    let mut add = |coordinates: [(i32, i32, i32); 4], stiffness| {
+        let ids = coordinates
+            .into_iter()
+            .map(|p| {
+                *nodes.entry(p).or_insert_with(|| {
+                    let id = mesh.nodes.len() as u32 + 1;
+                    mesh.nodes
+                        .insert(id, DVec3::new(p.0 as f64, p.1 as f64, p.2 as f64) * 0.05);
+                    id
+                })
+            })
+            .collect();
+        mesh.elements.push(ElementData {
+            id: mesh.elements.len() as u32 + 1,
+            elem_type: 44,
+            stiff_id: stiffness,
+            nodes: ids,
+        });
+    };
+    let xs = [0, 20, 40, 60, 80, 100, 120];
+    let ys = [0, 20, 40, 60, 77, 80];
+    for x in xs.windows(2) {
+        for y in ys.windows(2) {
+            add(
+                [
+                    (x[0], y[0], 0),
+                    (x[1], y[0], 0),
+                    (x[1], y[1], 0),
+                    (x[0], y[1], 0),
+                ],
+                10,
+            );
+        }
+        for z in [-40, -20] {
+            add(
+                [
+                    (x[0], 77, z),
+                    (x[1], 77, z),
+                    (x[1], 77, z + 20),
+                    (x[0], 77, z + 20),
+                ],
+                20,
+            );
+        }
+    }
+    mesh
+}
+
+#[test]
+fn geotechnical_assembly_trims_slab_console_to_wall_axis() {
+    for scale in [0.1, 1., 10.] {
+        for rotated in [false, true] {
+            let features = assembly::FeaturePolicy {
+                maximum_console_width: 0.25 * scale,
+                ..Default::default()
+            };
+            let (topology, mesh) = run_with(console_source(), scale, rotated, Some(features));
+            let trimmed = &topology.consoles.trimmed;
+            assert_eq!(trimmed.len(), 1, "{:?}", topology.consoles.kept);
+            assert!((trimmed[0].width - 0.15 * scale).abs() < 1e-6 * scale);
+            assert!((trimmed[0].area - 0.9 * scale * scale).abs() < 1e-6 * scale * scale);
+            assert!(topology.junctions.issues.is_empty());
+            assert!(
+                mesh.topology_valid && mesh.quality_passed,
+                "scale={scale} rotated={rotated}: {:?}",
+                mesh.blockers
+            );
+            assert!(mesh.source_coverage_complete && mesh.external_mesher_ready);
+            // Slab and wall share the new slab edge in the mesh.
+            let mut edges = [BTreeSet::new(), BTreeSet::new()];
+            for t in &mesh.triangles {
+                let k = usize::from(t.stiffness == 20);
+                for i in 0..3 {
+                    let (a, b) = (t.vertices[i], t.vertices[(i + 1) % 3]);
+                    edges[k].insert([a.min(b), a.max(b)]);
+                }
+            }
+            let common = edges[0].intersection(&edges[1]).count();
+            assert!(common >= 12, "shared mesh edges: {common}");
+            // The slab keeps all of its source elements, including the console.
+            let slab = mesh
+                .surface_source_elements
+                .iter()
+                .find(|s| s.len() == 30)
+                .expect("slab provenance");
+            assert_eq!(slab.len(), 30);
         }
     }
 }
