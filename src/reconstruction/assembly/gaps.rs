@@ -270,7 +270,7 @@ pub fn close(
         })
     };
     let eligible = |model: &Model, v: usize, s: usize, g: &Gap| {
-        g.distance >= model.minimum_edge
+        g.distance > model.precision * 10.
             && g.distance < tolerance
             && (g.height.abs() <= model.minimum_edge || (offsets && !parallel(model, v, s)))
     };
@@ -298,7 +298,9 @@ pub fn close(
                     continue;
                 }
                 if let Some(g) = gap(model, v, s, &members) {
-                    // Sub-millimetre touches are junction insertion's job.
+                    // Point touches (a corner on another surface's contour)
+                    // are closed here too: junction insertion only imprints
+                    // intersection lines.
                     if eligible(model, v, s, &g) {
                         gaps.push((g.distance, v, s));
                     }

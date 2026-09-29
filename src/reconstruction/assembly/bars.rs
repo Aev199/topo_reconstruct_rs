@@ -1149,6 +1149,7 @@ mod tests {
         };
         let source = frame::Report {
             sliding_parameters: None,
+            virtual_incidences: Default::default(),
             nonlinear_steps: 0,
             candidate_parameters_valid: true,
             policy: frame::Policy {

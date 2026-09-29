@@ -5,6 +5,7 @@ use crate::input::MeshData;
 use glam::DVec3;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+pub mod gaps;
 mod segments;
 mod sliding;
 
@@ -54,6 +55,11 @@ pub enum ConstraintOrigin {
         axis: usize,
     },
     PlaneIncidence {
+        plane: usize,
+        node_id: u32,
+    },
+    /// A node near a plane it misses by a gap (`gaps`).
+    VirtualIncidence {
         plane: usize,
         node_id: u32,
     },
@@ -108,6 +114,8 @@ pub struct Report {
     pub plane_families: Vec<Vec<usize>>,
     pub equation_count: usize,
     pub short_axis_indices: Vec<usize>,
+    /// Gaps closed in the solve by virtual plane incidences.
+    pub virtual_incidences: gaps::Report,
 }
 struct Equation {
     origin: ConstraintOrigin,
@@ -326,7 +334,7 @@ pub fn solve(
     planes: &planes::Report,
     policy: &Policy,
 ) -> Result<Report, &'static str> {
-    solve_impl(mesh, axes, planes, policy, 0)
+    solve_impl(mesh, axes, planes, policy, 0, &[])
 }
 
 /// Retry only a numerically incomplete continuous solve with a bounded LSQR
@@ -339,13 +347,98 @@ pub fn solve_with_retry(
     policy: &Policy,
     maximum_attempts: usize,
 ) -> Result<Report, &'static str> {
+    retry(mesh, axes, planes, policy, maximum_attempts, &[])
+}
+
+/// `solve_with_retry`, then close gaps below `tolerance` between source nodes
+/// and non-parallel support planes by virtual incidences. Incidences the
+/// solve cannot satisfy within tolerance and movement budgets are dropped
+/// (largest residuals and over-budget nodes first); if none remain, the
+/// plain solve is returned. Every applied or dropped incidence is reported.
+pub fn solve_closing_gaps(
+    mesh: &MeshData,
+    axes: &recognize::Report,
+    planes: &planes::Report,
+    policy: &Policy,
+    maximum_attempts: usize,
+    tolerance: f64,
+    minimum: f64,
+) -> Result<Report, &'static str> {
+    let base = retry(mesh, axes, planes, policy, maximum_attempts, &[])?;
+    if tolerance <= 0. || !base.accepted {
+        return Ok(base);
+    }
+    let mut active = gaps::candidates(
+        mesh,
+        planes,
+        &base.node_ids,
+        tolerance,
+        minimum,
+        policy.angle,
+    );
+    let mut report = gaps::Report {
+        tolerance,
+        candidates: active.len(),
+        ..Default::default()
+    };
+    for round in 1..=4 {
+        if active.is_empty() {
+            break;
+        }
+        report.rounds = round;
+        let result = retry(mesh, axes, planes, policy, maximum_attempts, &active)?;
+        if result.accepted {
+            report.applied = active;
+            let mut result = result;
+            result.virtual_incidences = report;
+            return Ok(result);
+        }
+        // Drop what the solve could not satisfy.
+        let failing: BTreeSet<(u32, usize)> = result
+            .largest_constraint_failures
+            .iter()
+            .filter_map(|f| match f.origin {
+                ConstraintOrigin::VirtualIncidence { plane, node_id } => Some((node_id, plane)),
+                _ => None,
+            })
+            .collect();
+        let over: BTreeSet<u32> = result
+            .candidate_over_budget_node_ids
+            .iter()
+            .copied()
+            .collect();
+        let (keep, drop): (Vec<_>, Vec<_>) = active
+            .into_iter()
+            .partition(|i| !failing.contains(&(i.node_id, i.patch)) && !over.contains(&i.node_id));
+        if drop.is_empty() {
+            report.dropped.extend(keep);
+            active = vec![];
+            break;
+        }
+        report.dropped.extend(drop);
+        active = keep;
+    }
+    report.dropped.extend(active);
+    let mut base = base;
+    base.virtual_incidences = report;
+    Ok(base)
+}
+
+fn retry(
+    mesh: &MeshData,
+    axes: &recognize::Report,
+    planes: &planes::Report,
+    policy: &Policy,
+    maximum_attempts: usize,
+    extra: &[gaps::Incidence],
+) -> Result<Report, &'static str> {
     if maximum_attempts == 0 {
         return Err("frame retry limit must be positive");
     }
     let mut attempt_policy = policy.clone();
     let mut best = None;
     for attempt in 0..maximum_attempts {
-        let result = solve(mesh, axes, planes, &attempt_policy)?;
+        let result = solve_impl(mesh, axes, planes, &attempt_policy, 0, extra)?;
         let improved = best.as_ref().is_none_or(|previous: &Report| {
             result.candidate_max_residual < previous.candidate_max_residual
         });
@@ -385,7 +478,7 @@ pub fn solve_sliding(
     if maximum_steps == 0 {
         return Err("nonlinear step limit must be positive");
     }
-    solve_impl(mesh, axes, planes, policy, maximum_steps)
+    solve_impl(mesh, axes, planes, policy, maximum_steps, &[])
 }
 
 fn solve_impl(
@@ -394,6 +487,7 @@ fn solve_impl(
     planes: &planes::Report,
     policy: &Policy,
     maximum_steps: usize,
+    extra: &[gaps::Incidence],
 ) -> Result<Report, &'static str> {
     let up = DVec3::from_array(policy.up);
     if !up.is_finite()
@@ -590,6 +684,27 @@ fn solve_impl(
             stiffness_regions: p.stiffness_regions.clone(),
         });
     }
+    for incidence in extra {
+        let (Some(&node), Some(&family)) = (
+            map.get(&incidence.node_id),
+            plane_to_family.get(incidence.patch),
+        ) else {
+            continue;
+        };
+        let normal = normals[family];
+        equations.push(equation(
+            vec![
+                (node * 3, normal.x),
+                (node * 3 + 1, normal.y),
+                (node * 3 + 2, normal.z),
+                (base + family, -1.),
+            ],
+            ConstraintOrigin::VirtualIncidence {
+                plane: incidence.patch,
+                node_id: incidence.node_id,
+            },
+        ));
+    }
     equations.retain(|e| !e.terms.is_empty());
     let (residual, iterations, nonlinear_steps, sliding_parameters) = if maximum_steps == 0 {
         let (residual, iterations) = project(
@@ -767,6 +882,7 @@ fn solve_impl(
             .collect(),
         plane_families,
         equation_count: equations.len(),
+        virtual_incidences: gaps::Report::default(),
     })
 }
 
@@ -1358,5 +1474,172 @@ mod tests {
             serde_json::to_value(original_graph).unwrap(),
             serde_json::to_value(super::super::graph::Graph::from_frame(&r)).unwrap()
         );
+    }
+
+    /// Quad strip between `a` and `b` extruded by `h` along `up`, `n`
+    /// elements long; returns the next free node ID.
+    fn strip(
+        m: &mut MeshData,
+        first: u32,
+        stiff: u32,
+        a: DVec3,
+        b: DVec3,
+        up: DVec3,
+        n: u32,
+    ) -> u32 {
+        for i in 0..=n {
+            let p = a + (b - a) * (i as f64 / n as f64);
+            m.nodes.insert(first + 2 * i, p);
+            m.nodes.insert(first + 2 * i + 1, p + up);
+        }
+        for i in 0..n {
+            let k = first + 2 * i;
+            m.elements.push(ElementData {
+                id: first + i,
+                elem_type: 44,
+                stiff_id: stiff,
+                nodes: vec![k, k + 2, k + 3, k + 1],
+            });
+        }
+        first + 2 * n + 2
+    }
+
+    /// Wall B ends `gap` short of wall A (a corner left open by the source).
+    fn open_corner(gap: f64, transform: impl Fn(DVec3) -> DVec3) -> MeshData {
+        let mut m = MeshData::default();
+        let up = DVec3::Z * 3.;
+        let t = |p: DVec3| transform(p);
+        let mut raw = MeshData::default();
+        let next = strip(&mut raw, 1, 1, DVec3::ZERO, DVec3::new(0., 2., 0.), up, 4);
+        strip(
+            &mut raw,
+            next,
+            2,
+            DVec3::new(gap, 0., 0.),
+            DVec3::new(2., 0., 0.),
+            up,
+            4,
+        );
+        m.elements = raw.elements;
+        m.nodes = raw.nodes.into_iter().map(|(k, p)| (k, t(p))).collect();
+        m
+    }
+
+    fn planes_of(m: &MeshData, scale: f64) -> planes::Report {
+        planes::recognize(
+            m,
+            &planes::Policy {
+                angle: 0.02,
+                distance: 0.01 * scale,
+                precision: 1e-8 * scale,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn open_corner_gap_becomes_virtual_incidence_under_transforms() {
+        for scale in [0.5, 1., 4.] {
+            for transformed in [false, true] {
+                let rotation = if transformed {
+                    glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.4)
+                } else {
+                    glam::DQuat::IDENTITY
+                };
+                let shift = DVec3::new(10., -20., 5.) * transformed as u8 as f64;
+                let m = open_corner(0.026, |p| rotation * (p * scale) + shift);
+                let planes = planes_of(&m, scale);
+                let axes = recognize::recognize(
+                    &m,
+                    &recognize::Policy {
+                        angle: 0.02,
+                        line_tolerance: 0.01 * scale,
+                        numerical_precision: 1e-8 * scale,
+                    },
+                )
+                .unwrap();
+                let mut p = policy();
+                p.up = (rotation * DVec3::Z).to_array();
+                p.maximum_movement *= scale;
+                p.minimum_length *= scale;
+                let r = solve_closing_gaps(&m, &axes, &planes, &p, 3, 0.05 * scale, 0.001 * scale)
+                    .unwrap();
+                assert!(r.accepted);
+                let v = &r.virtual_incidences;
+                // Both end nodes of wall B (bottom and top of its free end).
+                assert_eq!(v.applied.len(), 2, "{v:?}");
+                assert!(v.dropped.is_empty());
+                let wall_a = &planes.patches[v.applied[0].patch];
+                assert!(wall_a.source_nodes.contains(&1));
+                let normal = DVec3::from_array(wall_a.plane.normal);
+                let on_a =
+                    DVec3::from_array(r.points[r.node_ids.iter().position(|&n| n == 1).unwrap()]);
+                for c in &v.applied {
+                    assert!((c.height - 0.026 * scale).abs() < 1e-6 * scale);
+                    let i = r.node_ids.iter().position(|&n| n == c.node_id).unwrap();
+                    let q = DVec3::from_array(r.points[i]);
+                    assert!((q - on_a).dot(normal).abs() < 1e-6 * scale);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_gaps_parallel_structures_and_interior_nodes_are_not_candidates() {
+        let m = open_corner(0.08, |p| p);
+        let planes = planes_of(&m, 1.);
+        let ids: Vec<u32> = m.nodes.keys().copied().collect();
+        assert!(gaps::candidates(&m, &planes, &ids, 0.05, 0.001, 0.02).is_empty());
+
+        // Two slabs 30 mm apart in level, overlapping in plan: never joined.
+        let mut m = MeshData::default();
+        let next = strip(
+            &mut m,
+            1,
+            1,
+            DVec3::ZERO,
+            DVec3::new(2., 0., 0.),
+            DVec3::Y * 2.,
+            2,
+        );
+        strip(
+            &mut m,
+            next,
+            2,
+            DVec3::new(1.99, 0., 0.03),
+            DVec3::new(4., 0., 0.03),
+            DVec3::Y * 2.,
+            2,
+        );
+        let planes = planes_of(&m, 1.);
+        let ids: Vec<u32> = m.nodes.keys().copied().collect();
+        assert!(gaps::candidates(&m, &planes, &ids, 0.05, 0.001, 0.02).is_empty());
+
+        // A wall crossing just above a slab: interior (non-contour) wall
+        // nodes are never pulled onto the slab, only its free edge nodes.
+        let mut m = MeshData::default();
+        let next = strip(
+            &mut m,
+            1,
+            1,
+            DVec3::new(-2., -2., 0.),
+            DVec3::new(2., -2., 0.),
+            DVec3::Y * 4.,
+            4,
+        );
+        strip(
+            &mut m,
+            next,
+            2,
+            DVec3::new(-1., 0., 0.02),
+            DVec3::new(1., 0., 0.02),
+            DVec3::Z * 3.,
+            4,
+        );
+        let planes = planes_of(&m, 1.);
+        let ids: Vec<u32> = m.nodes.keys().copied().collect();
+        let c = gaps::candidates(&m, &planes, &ids, 0.05, 0.001, 0.02);
+        assert_eq!(c.len(), 5, "{c:?}");
+        assert!(c.iter().all(|c| m.nodes[&c.node_id].z.abs() < 0.03));
     }
 }

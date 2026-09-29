@@ -784,3 +784,53 @@ parallel to the other one (within 0.02 rad) is not a gap candidate. Result:
 edge); тест 6 keeps 49 gaps, 21 of them between parallel structures (kept
 by rule) and 28 that would need a surface to leave its plane (corners held
 by several planes, edges shared with a third structure).
+
+## Source gaps closed in the frame solve, 2026-09-29
+
+User decision (after the corner cases of тест 6, a wall end 26 mm beyond
+the corner of two other walls): such gaps are source defects and are closed
+by the frame solve ("variant 3"), not by moving vertices out of their
+planes afterwards.
+
+`frame::gaps::candidates` finds virtual incidences: a contour node of its
+own patches within the gap tolerance (`--v2-gap-closure`, 50 mm) of the
+material of a non-parallel patch it does not belong to, off its plane by
+at least 1 mm. Excluded, with the reason in the rule:
+
+- nodes of a patch parallel to the target (within 0.02 rad): slabs at
+  different levels and parallel walls are never joined;
+- interior nodes of a patch (a gap is at the edge of a structure);
+- nodes near two mutually parallel candidate planes (between the walls of
+  a stacked offset pair: wall alignment's job);
+- steps: a node of the same structure already on the target plane within
+  the tolerance of the projection (the offset is a contour step or crack
+  mouth to that node; pulling onto the plane would collapse it to zero).
+
+`frame::solve_closing_gaps` adds `normal . node - offset = 0` for each
+incidence to the least-squares frame solve (normals fixed: planes only
+translate, they never rotate), with the usual movement budgets. Up to four
+rounds drop incidences named among the largest constraint failures or at
+over-budget nodes; a failed solve falls back to the base solve. The
+applied and dropped incidences are reported in `frame.virtual_incidences`
+(constraint origin `VirtualIncidence`). `--v2-keep-gap-offsets` and
+`--preserve-details` disable it.
+
+Assembly gap closure also handles point touches below the minimum edge (a
+corner micrometres from another surface's contour edge, lower bound
+10 x precision): junction insertion imprints only intersection lines.
+
+| After | скала1 | типовая секция | тест 5 | тест 6 |
+|---|---:|---:|---:|---:|
+| Virtual incidences applied / dropped | 0 | 0 | 7 / 0 | 115 / 0 |
+| Heights closed (mm) | - | - | 11-19 | 1.5-40 |
+| Maximum frame movement (mm) | 1.5 | 0 | 0.8 -> 18.9 | 5.8 -> 39.6 |
+| PLAXIS profile items | 1 | 0 | 0 | 53 -> 26 |
+| Trial mesh minimum angle (degrees) | 8.13 | 20.21 | 7.15 | 3.33 -> 7.09 |
+
+All four pass the strict extended audit and the assembly checker; debug and
+release outputs are identical (тест 5). The corner of тест 6 (wall ending
+short of two walls, 26 items) is closed. тест 6 residuals: 10 gaps of
+49.97 mm between parallel walls (kept by rule, at the tolerance), 4 of
+49.6 mm on a slab at a parallel slab edge, a 19 mm offset between two
+nearly coplanar walls (0.2 degrees) with its short edges, a 25 mm step at a
+wall corner and one 47 mm gap at a 53-degree wall.

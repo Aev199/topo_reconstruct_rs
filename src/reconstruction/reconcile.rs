@@ -388,7 +388,8 @@ fn collect_frame_problems(
             | frame::ConstraintOrigin::AxisDirection { axis } => {
                 (Some(*axis), None, axis_source_nodes(source, *axis))
             }
-            frame::ConstraintOrigin::PlaneIncidence { plane, node_id } => {
+            frame::ConstraintOrigin::PlaneIncidence { plane, node_id }
+            | frame::ConstraintOrigin::VirtualIncidence { plane, node_id } => {
                 (None, Some(*plane), vec![*node_id])
             }
         };

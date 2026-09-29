@@ -191,7 +191,14 @@ fn run_v2_preview(
     lap("plane_recognition");
     // A finite residual with no movement/axis failure is retried with a
     // doubled LSQR budget. The tolerance and all geometric budgets stay fixed.
-    let result = frame::solve_with_retry(
+    // Geotechnical mode also closes source gaps across planes (a wall end a
+    // few centimetres from the walls it abuts) by moving planes in the solve.
+    let gap_tolerance = if preserve_details || !tolerances.gap_offsets {
+        0.
+    } else {
+        tolerances.gap_closure
+    };
+    let result = frame::solve_closing_gaps(
         &mesh,
         &axes,
         &plane_report,
@@ -205,6 +212,8 @@ fn run_v2_preview(
             iterations,
         },
         3,
+        gap_tolerance,
+        0.001,
     )?;
     lap("frame");
     let assembly_policy = assembly::Policy {

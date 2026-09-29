@@ -1,6 +1,6 @@
 # Development state
 
-Updated: 2026-09-28
+Updated: 2026-09-29
 Repository baseline reviewed through the surface-junction batch (see git log).
 
 This file is intentionally short. It is the entry point for the next development
@@ -61,11 +61,13 @@ PLAXIS (`docs/GEOTECHNICAL_GEOMETRY.md`, "PLAXIS profile"):
 `scripts/check_plaxis_profile.py` is the readiness gate at a target element
 size of 0.5 m. типовая секция and тест 5 pass it. Remaining:
 
-1. тест 6: 49 gaps below 50 mm left by the user's rules (21 between
-   parallel structures, never joined; 28 needing a surface to leave its
-   plane), 4 short edges;
+1. тест 6: 22 gaps below 50 mm and 4 short edges left after the frame
+   closes source gaps across planes (virtual incidences, 115 applied):
+   parallel structures at 49.6-49.97 mm (kept by rule), a 19 mm offset
+   between nearly coplanar walls, a 25 mm step at a wall corner, one
+   47 mm gap at a 53-degree wall;
 2. скала1: one contour corner of 8 degrees;
-3. trial mesh quality on тест 6 (minimum 3.33 degrees); the final mesh
+3. trial mesh quality on тест 6 (minimum 7.09 degrees); the final mesh
    should come from Gmsh or the target program (`docs/PRIOR_ART.md`);
 4. two junction diagnostics on тест 6 (a 19.6 mm near touch, one refused
    crossing split).
