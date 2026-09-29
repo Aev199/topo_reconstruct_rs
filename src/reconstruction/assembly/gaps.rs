@@ -131,9 +131,14 @@ fn close_one(
     s: usize,
     tolerance: f64,
     fixed: &BTreeSet<usize>,
+    origin: &[[f64; 3]],
 ) -> Result<(Model, String, f64), String> {
     let mut trial = model.clone();
     let from = DVec3::from_array(model.vertices[v]);
+    // Movements are measured from the position before gap closure, so that
+    // a settle followed by a merge (or several closures of one vertex) stay
+    // within the tolerance as a whole.
+    let start = origin.get(v).map_or(from, |p| DVec3::from_array(*p));
     let plane = model.planes[model.surfaces[s].plane].clone();
     let members = surface_vertices(model, s);
     // 1. Onto the plane, keeping every own plane.
@@ -145,10 +150,10 @@ fn close_one(
         planes.push(plane.clone());
         let refs: Vec<&PlaneFrame> = planes.iter().collect();
         let target = intersection(from, &refs, model.precision).ok_or("inconsistent_planes")?;
-        if target.distance(from) > tolerance {
+        if target.distance(start) > tolerance {
             return Err(format!(
                 "movement_beyond_tolerance: {:e}",
-                target.distance(from)
+                target.distance(start)
             ));
         }
         cleanup::move_with_axes(&mut trial, bars.axes, v, target, tolerance)?;
@@ -163,12 +168,12 @@ fn close_one(
     if let Some((_, w)) = coincident {
         let mut merged = trial.clone();
         if cleanup::merge(&mut merged, bars, v, w, tolerance, fixed).is_ok() {
-            let reach = DVec3::from_array(merged.vertices[w]).distance(from);
+            let reach = DVec3::from_array(merged.vertices[w]).distance(start);
             return Ok((merged, "merged".into(), reach));
         }
     }
     if outside(&trial, s, plane.project(p.to_array())) <= trial.precision {
-        let movement = p.distance(from);
+        let movement = p.distance(start);
         return Ok((trial, "settled".into(), movement));
     }
     // 2a. Into a nearby contour vertex of the surface.
@@ -180,7 +185,7 @@ fn close_one(
     if let Some((_, w)) = nearest {
         let mut merged = trial.clone();
         if let Ok(movement) = cleanup::merge(&mut merged, bars, v, w, tolerance, fixed) {
-            let reach = DVec3::from_array(merged.vertices[w]).distance(from);
+            let reach = DVec3::from_array(merged.vertices[w]).distance(start);
             return Ok((merged, "merged".into(), movement.max(reach)));
         }
     }
@@ -222,7 +227,7 @@ fn close_one(
             continue;
         };
         let u = (c - pa).dot(d) / d.length_squared();
-        let movement = c.distance(from);
+        let movement = c.distance(start);
         if u > 0.
             && u < 1.
             && movement <= tolerance
@@ -245,7 +250,7 @@ fn close_one(
     trial
         .split_edge_within(e, v, tolerance)
         .map_err(|error| format!("bend_{error:?}"))?;
-    let movement = p.distance(from);
+    let movement = p.distance(start);
     Ok((trial, "bent_edge".into(), movement))
 }
 
@@ -279,6 +284,7 @@ pub fn close(
         ..Default::default()
     };
     let mut tried = BTreeSet::new();
+    let origin = model.vertices.clone();
     for _ in 0..4 {
         let mut candidates: BTreeSet<usize> = (0..model.surfaces.len())
             .flat_map(|s| surface_vertices(model, s))
@@ -322,7 +328,25 @@ pub fn close(
                 continue;
             }
             let _ = (g.height, g.outside);
-            match close_one(model, bars, v, s, tolerance, fixed) {
+            let closed = close_one(model, bars, v, s, tolerance, fixed, &origin).and_then(
+                |(trial, kind, movement)| {
+                    // Whole operation within the tolerance: the closed vertex
+                    // and every vertex it moved, from their original places.
+                    let drift = (0..origin.len().min(trial.vertices.len()))
+                        .filter(|&i| trial.vertices[i] != model.vertices[i])
+                        .map(|i| {
+                            DVec3::from_array(trial.vertices[i])
+                                .distance(DVec3::from_array(origin[i]))
+                        })
+                        .fold(movement, f64::max);
+                    if drift > tolerance + model.precision {
+                        Err(format!("movement_beyond_tolerance: {drift:e}"))
+                    } else {
+                        Ok((trial, kind, drift))
+                    }
+                },
+            );
+            match closed {
                 Ok((trial, kind, movement)) => {
                     *model = trial;
                     changed = true;
@@ -360,6 +384,50 @@ mod tests {
         Bars {
             axes: Box::leak(Box::new(vec![])),
             contacts: Box::leak(Box::new(vec![])),
+        }
+    }
+
+    #[test]
+    fn settle_then_merge_stays_within_the_tolerance_as_a_whole() {
+        for place in Placement::all() {
+            // A wall corner 44.7 mm from the slab corner material: settling
+            // (40 mm) and merging into the slab corner (35 mm) are each
+            // within 50 mm, together 53.2 mm from the source position.
+            let wall = (
+                vec![vec![
+                    [-0.02, 0.035, 0.04],
+                    [-0.02, 2., 0.04],
+                    [-0.02, 2., 2.],
+                    [-0.02, 0.035, 2.],
+                ]],
+                [1., 0., 0.],
+            );
+            let mut m = build(&place, &[slab(0., 4.), wall]);
+            let before = m.vertices.clone();
+            let tolerance = 0.05 * place.scale;
+            let r = close(
+                &mut m,
+                &mut no_bars(),
+                tolerance,
+                true,
+                &BTreeSet::new(),
+                &[],
+            );
+            for c in &r.closed {
+                assert!(c.movement <= tolerance * (1. + 1e-9), "{r:?}");
+            }
+            for (a, b) in before.iter().zip(&m.vertices) {
+                assert!(
+                    DVec3::from_array(*a).distance(DVec3::from_array(*b))
+                        <= tolerance * (1. + 1e-9)
+                );
+            }
+            assert!(
+                r.rejected
+                    .iter()
+                    .any(|x| x.reason.starts_with("movement_beyond_tolerance")),
+                "{r:?}"
+            );
         }
     }
 

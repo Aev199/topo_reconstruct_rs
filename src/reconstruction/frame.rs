@@ -354,7 +354,9 @@ pub fn solve_with_retry(
 /// and non-parallel support planes by virtual incidences. Incidences the
 /// solve cannot satisfy within tolerance and movement budgets are dropped
 /// (largest residuals and over-budget nodes first); if none remain, the
-/// plain solve is returned. Every applied or dropped incidence is reported.
+/// plain solve is returned. An accepted solve that collapses a source
+/// element edge at an incidence node below `minimum` drops those incidences.
+/// Every applied or dropped incidence is reported.
 pub fn solve_closing_gaps(
     mesh: &MeshData,
     axes: &recognize::Report,
@@ -387,6 +389,21 @@ pub fn solve_closing_gaps(
         }
         report.rounds = round;
         let result = retry(mesh, axes, planes, policy, maximum_attempts, &active)?;
+        // An accepted solve must not collapse an element edge at an
+        // incidence node (a narrow panel squeezed onto a plane).
+        let collapsed = if result.accepted {
+            gaps::collapsed_edges(mesh, &active, &result.node_ids, &result.points, minimum)
+        } else {
+            BTreeSet::new()
+        };
+        if result.accepted && !collapsed.is_empty() {
+            let (keep, drop): (Vec<_>, Vec<_>) = active
+                .into_iter()
+                .partition(|i| !collapsed.contains(&i.node_id));
+            report.dropped.extend(drop);
+            active = keep;
+            continue;
+        }
         if result.accepted {
             report.applied = active;
             let mut result = result;
@@ -1641,5 +1658,72 @@ mod tests {
         let c = gaps::candidates(&m, &planes, &ids, 0.05, 0.001, 0.02);
         assert_eq!(c.len(), 5, "{c:?}");
         assert!(c.iter().all(|c| m.nodes[&c.node_id].z.abs() < 0.03));
+    }
+
+    #[test]
+    fn narrow_panel_above_a_slab_extends_to_it_instead_of_collapsing() {
+        // A 30 mm high panel 10 mm above a slab: only its bottom closes.
+        let mut m = MeshData::default();
+        let next = strip(
+            &mut m,
+            1,
+            1,
+            DVec3::new(-2., -2., 0.),
+            DVec3::new(2., -2., 0.),
+            DVec3::Y * 4.,
+            2,
+        );
+        let first = next;
+        strip(
+            &mut m,
+            next,
+            2,
+            DVec3::new(-1., 0., 0.01),
+            DVec3::new(1., 0., 0.01),
+            DVec3::Z * 0.03,
+            1,
+        );
+        let planes = planes_of(&m, 1.);
+        let axes = recognize::recognize(
+            &m,
+            &recognize::Policy {
+                angle: 0.02,
+                line_tolerance: 0.01,
+                numerical_precision: 1e-8,
+            },
+        )
+        .unwrap();
+        let r = solve_closing_gaps(&m, &axes, &planes, &policy(), 3, 0.05, 0.001).unwrap();
+        assert!(r.accepted);
+        let v = &r.virtual_incidences;
+        let mut applied: Vec<u32> = v.applied.iter().map(|c| c.node_id).collect();
+        applied.sort();
+        assert_eq!(applied, vec![first, first + 2], "{v:?}");
+        let at =
+            |n: u32| DVec3::from_array(r.points[r.node_ids.iter().position(|&x| x == n).unwrap()]);
+        for k in [first, first + 2] {
+            assert!((at(k).z - at(1).z).abs() < 1e-6);
+            assert!((at(k + 1).z - at(k).z) > 0.03);
+        }
+
+        // The post-solve guard: an edge collapsed at an incidence node.
+        let incidence = |n| gaps::Incidence {
+            node_id: n,
+            patch: 0,
+            height: 0.04,
+            distance: 0.04,
+        };
+        let ids: Vec<u32> = m.nodes.keys().copied().collect();
+        let mut points: Vec<[f64; 3]> = ids.iter().map(|n| m.nodes[n].to_array()).collect();
+        let top = ids.iter().position(|&n| n == first + 1).unwrap();
+        points[top] = m.nodes[&first].to_array();
+        let c = gaps::collapsed_edges(
+            &m,
+            &[incidence(first + 1), incidence(first + 3)],
+            &ids,
+            &points,
+            0.001,
+        );
+        assert_eq!(c.into_iter().collect::<Vec<_>>(), vec![first + 1]);
     }
 }

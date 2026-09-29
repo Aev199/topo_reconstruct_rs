@@ -834,3 +834,27 @@ short of two walls, 26 items) is closed. тест 6 residuals: 10 gaps of
 49.6 mm on a slab at a parallel slab edge, a 19 mm offset between two
 nearly coplanar walls (0.2 degrees) with its short edges, a 25 mm step at a
 wall corner and one 47 mm gap at a 53-degree wall.
+
+## Audit fixes of de6d021, 2026-09-29
+
+Two defects reproduced by the external audit on synthetic cases:
+
+1. Gap closure could exceed its tolerance as a whole: a settle (40 mm)
+   followed by a merge into a surface corner (35 mm) left the vertex
+   53.9 mm from its source position. Every closure is now measured from the
+   positions before gap closure (the closed vertex and every vertex the
+   operation moved) and rejected beyond the tolerance
+   (`movement_beyond_tolerance`). Regression:
+   `settle_then_merge_stays_within_the_tolerance_as_a_whole`.
+2. Virtual incidences could squeeze a narrow panel (30 mm high, 10 mm above
+   a slab) onto the slab plane, losing the surface. Now (a) a node is not a
+   candidate when a node of the same structure is nearer to the target
+   plane next to its projection (the panel's own extent, not a gap), and
+   (b) an accepted solve that shortens a source element edge at an
+   incidence node below 1 mm drops those incidences and solves again, down
+   to the base solve. Regression:
+   `narrow_panel_above_a_slab_extends_to_it_instead_of_collapsing` (the
+   panel bottom closes, its top stays; the guard alone drops all four).
+
+Private fixtures unchanged in the metrics above (тест 6: 111 incidences
+applied instead of 115, same profile and audit results).

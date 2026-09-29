@@ -155,10 +155,12 @@ pub fn candidates(
                 if height < minimum || height >= tolerance {
                     continue;
                 }
-                // A node of the same structure already on the plane next to
-                // the projection: the offset is a step of that structure (a
-                // contour edge or crack mouth to that node), not a gap, and
-                // pulling the node onto the plane would collapse it there.
+                // A node of the same structure nearer to the plane (on it or
+                // between the node and it) next to the projection: the
+                // offset is a step of that structure (a contour edge or
+                // crack mouth to that node) or its own extent (a narrow
+                // panel), not a gap; pulling the node onto the plane would
+                // collapse the structure there.
                 let q3 = p - nb * plane.distance(p.to_array());
                 let step = (-1..=1).any(|dx| {
                     (-1..=1).any(|dy| {
@@ -169,9 +171,12 @@ pub fn candidates(
                                 .flatten()
                                 .any(|&m| {
                                     let pm = mesh.nodes[&m];
+                                    let hm = plane.distance(pm.to_array());
                                     m != n
                                         && pm.distance(q3) < tolerance
-                                        && plane.distance(pm.to_array()).abs() < minimum
+                                        && (hm.abs() < minimum
+                                            || (hm * plane.distance(p.to_array()) > 0.
+                                                && hm.abs() < height))
                                         && owners.get(&m).is_some_and(|om| {
                                             own.is_some_and(|o| o.intersection(om).next().is_some())
                                         })
@@ -233,6 +238,40 @@ pub fn candidates(
             .then(x.node_id.cmp(&y.node_id))
             .then(x.patch.cmp(&y.patch))
     });
+    out
+}
+
+/// Incidence nodes at which a source element edge became shorter than
+/// `minimum` in the solved `points` (it was not in the source).
+pub fn collapsed_edges(
+    mesh: &MeshData,
+    incidences: &[Incidence],
+    node_ids: &[u32],
+    points: &[[f64; 3]],
+    minimum: f64,
+) -> BTreeSet<u32> {
+    let nodes: BTreeSet<u32> = incidences.iter().map(|i| i.node_id).collect();
+    let index: BTreeMap<u32, usize> = node_ids.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+    let solved = |n: u32| index.get(&n).map(|&i| DVec3::from_array(points[i]));
+    let mut out = BTreeSet::new();
+    for e in &mesh.elements {
+        if !e.is_shell() || !e.nodes.iter().any(|n| nodes.contains(n)) {
+            continue;
+        }
+        for &a in &e.nodes {
+            for &b in &e.nodes {
+                if a >= b || !(nodes.contains(&a) || nodes.contains(&b)) {
+                    continue;
+                }
+                let (Some(pa), Some(pb)) = (solved(a), solved(b)) else {
+                    continue;
+                };
+                if pa.distance(pb) < minimum && mesh.nodes[&a].distance(mesh.nodes[&b]) >= minimum {
+                    out.extend([a, b].into_iter().filter(|n| nodes.contains(n)));
+                }
+            }
+        }
+    }
     out
 }
 
