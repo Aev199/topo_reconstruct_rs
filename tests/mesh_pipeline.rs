@@ -730,6 +730,134 @@ fn stacked_source() -> topo_reconstruct_rs::input::MeshData {
     mesh
 }
 
+/// Two walls on one slab in one line, the second one 25 mm off the first
+/// line (a jog), end to end; or, with `overlap`, side by side over 1 m.
+fn wall_line_source(overlap: bool) -> topo_reconstruct_rs::input::MeshData {
+    use topo_reconstruct_rs::input::{ElementData, MeshData};
+    let mut mesh = MeshData::default();
+    let mut nodes = BTreeMap::new();
+    let mut add = |coordinates: [(i32, i32, i32); 4], stiffness| {
+        let ids = coordinates
+            .into_iter()
+            .map(|p| {
+                *nodes.entry(p).or_insert_with(|| {
+                    let id = mesh.nodes.len() as u32 + 1;
+                    mesh.nodes
+                        .insert(id, DVec3::new(p.0 as f64, p.1 as f64, p.2 as f64) * 0.025);
+                    id
+                })
+            })
+            .collect();
+        mesh.elements.push(ElementData {
+            id: mesh.elements.len() as u32 + 1,
+            elem_type: 44,
+            stiff_id: stiffness,
+            nodes: ids,
+        });
+    };
+    for x in (0..240).step_by(40) {
+        for y in (0..160).step_by(40) {
+            add(
+                [
+                    (x, y, 0),
+                    (x + 40, y, 0),
+                    (x + 40, y + 40, 0),
+                    (x, y + 40, 0),
+                ],
+                10,
+            );
+        }
+    }
+    let (a, b) = if overlap {
+        (0..160, 120..240)
+    } else {
+        (0..120, 120..240)
+    };
+    for z in [0, 40] {
+        for x in a.clone().step_by(40) {
+            add(
+                [
+                    (x, 80, z),
+                    (x + 40, 80, z),
+                    (x + 40, 80, z + 40),
+                    (x, 80, z + 40),
+                ],
+                20,
+            );
+        }
+        for x in b.clone().step_by(40) {
+            add(
+                [
+                    (x, 81, z),
+                    (x + 40, 81, z),
+                    (x + 40, 81, z + 40),
+                    (x, 81, z + 40),
+                ],
+                30,
+            );
+        }
+    }
+    mesh
+}
+
+#[test]
+fn walls_in_one_line_adopt_one_plane_but_side_by_side_walls_do_not() {
+    for scale in [0.1, 1., 10.] {
+        for rotated in [false, true] {
+            let features = assembly::FeaturePolicy {
+                maximum_console_width: 0.25 * scale,
+                maximum_stack_offset: 0.05 * scale,
+                maximum_gap: 0.05 * scale,
+                maximum_collapsed_edge: 0.05 * scale,
+                ..Default::default()
+            };
+            let (topology, mesh) = run_with(
+                wall_line_source(false),
+                scale,
+                rotated,
+                Some(features.clone()),
+            );
+            let aligned = &topology.stacked_walls.aligned;
+            assert_eq!(aligned.len(), 1, "{:?}", topology.stacked_walls.kept);
+            assert_eq!(aligned[0].reason, "aligned_wall_line");
+            assert!(aligned[0].slab.is_none());
+            assert!((aligned[0].offset - 0.025 * scale).abs() < 1e-6 * scale);
+            assert!(topology.issues.is_empty() && topology.junctions.issues.is_empty());
+            assert!(
+                mesh.topology_valid && mesh.quality_passed,
+                "scale={scale} rotated={rotated}: {:?}",
+                mesh.blockers
+            );
+            // Both walls lie in one plane.
+            let model = &topology.preview;
+            let walls: Vec<_> = model
+                .surfaces()
+                .iter()
+                .filter(|s| s.source_elements.iter().all(|&e| e > 24))
+                .collect();
+            assert_eq!(walls.len(), 2);
+            let plane = &model.planes()[walls[0].plane];
+            for s in &walls {
+                for e in s.boundaries.iter().flatten() {
+                    for &v in &model.edges()[e.edge] {
+                        let d = plane.distance(model.vertices()[v]);
+                        assert!(d.abs() < 1e-6 * scale, "wall vertex off the line: {d}");
+                    }
+                }
+            }
+
+            let (topology, _) = run_with(wall_line_source(true), scale, rotated, Some(features));
+            assert!(topology.stacked_walls.aligned.is_empty());
+            assert!(!topology.stacked_walls.kept.is_empty());
+            assert!(topology
+                .stacked_walls
+                .kept
+                .iter()
+                .all(|k| k.reason == "overlapping_parallel_walls"));
+        }
+    }
+}
+
 #[test]
 fn stacked_wall_adopts_axis_of_the_wall_below() {
     for scale in [0.1, 1., 10.] {

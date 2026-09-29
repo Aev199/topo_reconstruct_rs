@@ -13,7 +13,11 @@ a target element size h:
   edge of the same surface that does not touch its neighbourhood;
 - gaps: a surface vertex or bar node closer than `gap` (h/10) to another
   surface without being one of its vertices (0 excluded: that is an
-  unshared contact, a failure of the global audit).
+  unshared contact, a failure of the global audit). A proximity explained
+  by an edge from the vertex to a vertex of that surface, itself at least
+  `edge` long and meeting the surface at `angle` or more (a vertex along a
+  wall meeting another wall at 53 degrees), is a corner of the geometry,
+  not a gap; it is counted in `explained_proximities`.
 
 Requires numpy and shapely>=2 (same as check_v2_global_geometry.py).
 """
@@ -118,6 +122,26 @@ def profile(data, element_size=0.5, edge=None, width=None, gap=None, angle=10.):
                                       edge=[a, b], width=float(dist[k]), point=p.tolist()))
 
     # Gaps between a surface vertex / bar node and another surface.
+    adjacent = {}
+    for e in used:
+        a, b = model["edges"][e]
+        adjacent.setdefault(a, set()).add(b)
+        adjacent.setdefault(b, set()).add(a)
+    for axis in axes:
+        ids = [x["vertex"] for x in sorted(axis["anchors"], key=lambda x: x["t"])]
+        for a, b in zip(ids, ids[1:]):
+            adjacent.setdefault(a, set()).add(b)
+            adjacent.setdefault(b, set()).add(a)
+    sin_angle = np.sin(np.radians(angle))
+
+    def explained(v, d, members):
+        for w in adjacent.get(v, ()):
+            length = float(np.linalg.norm(vertices[v] - vertices[w]))
+            if w in members and length >= edge and d >= length * sin_angle:
+                return True
+        return False
+
+    explained_count = 0
     vertex_sets = [{v for e in s.edge_ids for v in model["edges"][e]} for s in surfaces]
     owners = {}
     for s in surfaces:
@@ -135,6 +159,9 @@ def profile(data, element_size=0.5, edge=None, width=None, gap=None, angle=10.):
         for v, d in zip(ids, dist):
             v = int(v)
             if eps < d < gap and v not in vertex_sets[b.index]:
+                if explained(v, d, vertex_sets[b.index]):
+                    explained_count += 1
+                    continue
                 items.append(dict(kind="gap", vertex=v, surface=b.index, distance=float(d),
                                   of=[s.index for s in owners.get(v, [])],
                                   bar_node=v in bar_nodes, point=vertices[v].tolist()))
@@ -145,6 +172,7 @@ def profile(data, element_size=0.5, edge=None, width=None, gap=None, angle=10.):
         element_size=element_size,
         thresholds=dict(edge=edge, width=width, gap=gap, angle_degrees=angle),
         counts=dict(counts),
+        explained_proximities=explained_count,
         passed=not items,
         items=items,
     )

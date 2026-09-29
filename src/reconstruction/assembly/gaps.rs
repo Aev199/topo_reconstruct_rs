@@ -263,6 +263,8 @@ pub fn close(
     offsets: bool,
     fixed: &BTreeSet<usize>,
     source_nodes: &[u32],
+    frame_points: &[[f64; 3]],
+    limit: f64,
 ) -> Report {
     // Planes parallel within the plane recognition angle (0.02 rad).
     let parallel = |model: &Model, v: usize, s: usize| {
@@ -339,8 +341,19 @@ pub fn close(
                                 .distance(DVec3::from_array(origin[i]))
                         })
                         .fold(movement, f64::max);
+                    // And no vertex beyond the vertex movement limit from its
+                    // frame position (`frame_points`, source vertices only).
+                    let total = (0..frame_points.len().min(trial.vertices.len()))
+                        .filter(|&i| trial.vertices[i] != model.vertices[i])
+                        .map(|i| {
+                            DVec3::from_array(trial.vertices[i])
+                                .distance(DVec3::from_array(frame_points[i]))
+                        })
+                        .fold(0., f64::max);
                     if drift > tolerance + model.precision {
                         Err(format!("movement_beyond_tolerance: {drift:e}"))
+                    } else if total > limit + model.precision {
+                        Err(format!("movement_beyond_limit: {total:e}"))
                     } else {
                         Ok((trial, kind, drift))
                     }
@@ -412,6 +425,8 @@ mod tests {
                 true,
                 &BTreeSet::new(),
                 &[],
+                &[],
+                f64::INFINITY,
             );
             for c in &r.closed {
                 assert!(c.movement <= tolerance * (1. + 1e-9), "{r:?}");
@@ -445,6 +460,8 @@ mod tests {
                 false,
                 &BTreeSet::new(),
                 &[],
+                &[],
+                f64::INFINITY,
             );
             assert!(r.closed.is_empty());
             let r = close(
@@ -454,6 +471,8 @@ mod tests {
                 true,
                 &BTreeSet::new(),
                 &[],
+                &[],
+                f64::INFINITY,
             );
             assert_eq!(r.closed.len(), 2, "{:?}", r.rejected);
             assert!(r.closed.iter().all(|c| c.kind == "settled"));
@@ -471,7 +490,9 @@ mod tests {
                 0.05 * place.scale,
                 true,
                 &BTreeSet::new(),
-                &[]
+                &[],
+                &[],
+                f64::INFINITY
             )
             .closed
             .is_empty());
@@ -500,6 +521,8 @@ mod tests {
                 false,
                 &BTreeSet::new(),
                 &[],
+                &[],
+                f64::INFINITY,
             );
             assert_eq!(r.closed.len(), 2, "{:?}", r.rejected);
             // The slab edge now lies on the wall top: one shared edge.
@@ -535,6 +558,8 @@ mod tests {
                 true,
                 &BTreeSet::new(),
                 &[],
+                &[],
+                f64::INFINITY,
             );
             assert!(r.closed.is_empty(), "{:?}", r.closed);
             assert_eq!(m.vertices, before);

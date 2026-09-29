@@ -38,6 +38,18 @@ class ProfileTests(unittest.TestCase):
         # 0.1 m apart: not a gap at this element size.
         self.assertTrue(profile(model([xy(), wall(y=0.5, z0=-1, z1=-0.1)]))['passed'])
 
+    def test_proximity_explained_by_a_corner_edge(self):
+        # A slab vertex 47 mm from a wall, joined to the wall corner by a
+        # 58.7 mm edge at 53 degrees: a corner, not a gap.
+        ring = [[0, 0], [1, 0], [1, 1], [0.035, 0.047]]
+        r = profile(model([slab(ring), wall()]))
+        self.assertNotIn('gap', r['counts'])
+        self.assertEqual(r['explained_proximities'], 1)
+        # 26 mm from the wall along a 1 m edge at 1.5 degrees: a sliver gap.
+        ring = [[0, 0], [1, 0.026], [1, 1], [0, 1]]
+        r = profile(model([slab(ring), wall()]))
+        self.assertIn('gap', r['counts'])
+
     def test_scale_follows_element_size(self):
         data = model([xy(), wall(y=0.5, z0=-1, z1=-0.025)])
         self.assertTrue(profile(data, element_size=0.1)['passed'])

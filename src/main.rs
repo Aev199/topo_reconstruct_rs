@@ -219,7 +219,11 @@ fn run_v2_preview(
     let assembly_policy = assembly::Policy {
         closure_tolerance: 0.001,
         // A stacked wall moves by its offset when closing onto the lower axis.
-        junction_movement_limit: tolerances.stack_offset.max(0.05),
+        // A vertex may move by the largest rule tolerance plus the closure
+        // tolerance (a node within it counts as on a plane): an aligned wall
+        // is offset by at most the tolerance at its junction, and its slight
+        // non-parallelism elsewhere is measured against the closure tolerance.
+        junction_movement_limit: tolerances.stack_offset.max(0.05) + 0.001,
         precision: 1e-7,
         minimum_edge: 0.001,
     };

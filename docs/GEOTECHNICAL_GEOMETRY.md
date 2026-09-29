@@ -398,7 +398,7 @@ Command-line options (model units; 0 disables the rule):
 
 | Option | Default | Controls |
 |---|---:|---|
-| `--v2-stack-offset` | 0.05 | stacked-wall alignment tolerance; the vertex closure movement limit is raised to at least this value |
+| `--v2-stack-offset` | 0.05 | stacked-wall and wall-line alignment tolerance; the vertex closure movement limit is at least this value plus the 1 mm closure tolerance |
 | `--v2-wall-end-snap` | 0.05 | wall-end closure and redundant-vertex short-edge threshold |
 | `--v2-console-width` | 0.25 | maximum trimmed console width |
 
@@ -858,3 +858,73 @@ Two defects reproduced by the external audit on synthetic cases:
 
 Private fixtures unchanged in the metrics above (тест 6: 111 incidences
 applied instead of 115, same profile and audit results).
+
+## Walls in one line, coincident supports, corner proximities, 2026-09-29
+
+Residual zones of тест 6 after the frame gap closure, each solved by a
+general rule:
+
+1. Stack offset measured at the junction. A stacked pair offset by the
+   design value of 50 mm measured 49.97-50.03 mm along its junction and up
+   to 50.03 mm over the 9 m wall (coordinate noise and a 1e-5 rad tilt), so
+   the whole-wall maximum rejected it. Offsets between structures are now
+   measured at their contact (slab junction, touching wall ends) and
+   compared with the tolerance plus the closure tolerance (1 mm: a node
+   within it counts as on a plane). The vertex closure movement limit is
+   the tolerance plus the closure tolerance as well (51 mm by default).
+   Deformation joints must therefore be modelled wider than 51 mm.
+2. Walls in one line (`stacking::align_lines`, `aligned_wall_line`): a
+   vertical patch parallel to another one (frame angle), with source nodes
+   within the tolerance of it and offset at that contact by at most the
+   tolerance, adopts its plane, like a stacked wall: a wall line jogged by
+   25 mm, a low riser skewed 0.2 degrees off the wall it continues. The
+   group with fewer source elements (a wall with the stack it carries)
+   moves; if its vertices cannot, the other one moves. Never merged:
+   walls whose material overlaps in the common plane (an element centre of
+   one inside an element of the other: parallel walls side by side, a
+   double wall, a joint; `overlapping_parallel_walls`) and slabs (slabs at
+   different levels stay apart, user decision).
+3. Alignment safety: before a stacked or in-line alignment is committed,
+   every vertex it moves must close within the movement limit and budget
+   and no contour edge through a moved vertex may collapse below the
+   minimum edge (`contour_edge_collapse`), except edges between nodes that
+   end on the same supports (identified, rule 4). A rejected alignment is
+   kept and reported with its reason.
+4. Coincident supports: source nodes on the same set of two or more
+   supports closed within the minimum edge length of each other are one
+   vertex (`stacked_walls.coincident`, bar anchors excluded); typically the
+   corner of an aligned wall reaching the corner of the wall below, both
+   also slab nodes, which the stack identification skips.
+5. Gap closure is also bounded by the vertex movement limit from the frame
+   positions (`movement_beyond_limit`), so that a closure after an alignment
+   never exceeds the global limit the assembly checker enforces.
+6. PLAXIS profile: a vertex near a surface is not a gap when an edge from
+   it to a vertex of that surface is at least h/10 long and meets the
+   surface at 10 degrees or more: the proximity is a corner of the
+   geometry (a vertex along a wall meeting another wall at 53 degrees, the
+   middle vertex of an insert filling a 100 mm opening), counted in
+   `explained_proximities`. A sliver (an edge at 1.5 degrees) stays a gap.
+
+| After | скала1 | типовая секция | тест 5 | тест 6 |
+|---|---:|---:|---:|---:|
+| Stacked walls aligned | 0 | 0 | 8 | 26 -> 28 |
+| Walls in one line aligned | 0 | 0 | 0 | 1 |
+| Coincident support nodes identified | 0 | 0 | 0 | 12 |
+| PLAXIS profile items | 1 | 0 | 0 | 26 -> 4 |
+| Explained corner proximities | 0 | 0 | 0 | 5 |
+
+All four pass the assembly checker and the strict extended audit; trial
+mesh minimum angles unchanged (8.13, 20.21, 7.15, 7.09 degrees).
+
+Remaining:
+
+- тест 6, one zone: a low riser skewed 0.2 degrees off the wall line it
+  continues, ending at the corner of a stacked pair aligned by 50 mm.
+  Aligning the riser moves the corner 54 mm (the 50 mm stack alignment
+  along the riser plus 20 mm across it), above the 51 mm limit; kept
+  (`vertex_movement_limit`): one 19.4 mm edge and three 19.4 mm gaps.
+  Closing it needs a limit for compound moves (for example
+  sqrt(2) x tolerance at the junction of two aligned structures): a user
+  decision.
+- скала1: one 8-degree corner is a real feature (a wedge-shaped stiffness
+  zone of a wall under a slab), not simplified without evidence.

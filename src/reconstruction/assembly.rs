@@ -657,11 +657,24 @@ fn assemble_impl(
             source,
             policy,
             &owners,
+            &rings,
             &mut support_representatives,
             features.maximum_stack_offset,
         ),
         _ => stacking::Report::default(),
     };
+    if let Some(features) = features.filter(|f| f.maximum_stack_offset > 0.) {
+        stacking::align_lines(
+            mesh,
+            source,
+            policy,
+            &owners,
+            &rings,
+            &mut support_representatives,
+            features.maximum_stack_offset,
+            &mut stacked_walls,
+        );
+    }
     // Candidate points of an aligned wall are intentionally off its support.
     let aligned: BTreeSet<usize> = (0..source.surfaces.len())
         .filter(|&i| {
@@ -779,6 +792,54 @@ fn assemble_impl(
         {
             identified.insert(pair.upper_node, pair.lower_node);
             closed_points.insert(pair.upper_node, q);
+        }
+    }
+    // Source nodes on the same supports (a corner of three planes, a point
+    // of one junction line) closed within the minimum edge length are one
+    // vertex; typically an aligned wall's corner reaching the corner of the
+    // wall below. Bar anchors keep their own nodes.
+    let bar_nodes: BTreeSet<u32> = source
+        .axes
+        .iter()
+        .flat_map(|a| a.anchors.iter().map(|x| source.node_ids[x.node]))
+        .collect();
+    let mut by_supports = BTreeMap::<Vec<usize>, Vec<u32>>::new();
+    for &id in closed_points.keys() {
+        if identified.contains_key(&id) || bar_nodes.contains(&id) {
+            continue;
+        }
+        let Some(supports) = owners.get(&id) else {
+            continue;
+        };
+        let key: BTreeSet<usize> = supports
+            .iter()
+            .map(|&s| support_representatives[s])
+            .collect();
+        if key.len() >= 2 {
+            by_supports
+                .entry(key.into_iter().collect())
+                .or_default()
+                .push(id);
+        }
+    }
+    for ids in by_supports.values() {
+        let mut kept: Vec<u32> = vec![];
+        for &id in ids {
+            let q = closed_points[&id];
+            match kept
+                .iter()
+                .find(|k| closed_points[k].distance(q) < policy.minimum_edge)
+            {
+                Some(&k) => {
+                    stacked_walls.coincident.push(stacking::Identified {
+                        upper_node: id,
+                        lower_node: k,
+                        distance: closed_points[&k].distance(q),
+                    });
+                    identified.insert(id, k);
+                }
+                None => kept.push(id),
+            }
         }
     }
     for (&id, &q) in &closed_points {
@@ -994,6 +1055,11 @@ fn assemble_impl(
             features.close_offset_gaps,
             &fixed,
             &vertex_source_nodes,
+            &vertex_source_nodes
+                .iter()
+                .map(|n| source.candidate_points[lookup[n]])
+                .collect::<Vec<_>>(),
+            policy.junction_movement_limit,
         ),
         _ => gaps::Report::default(),
     };
