@@ -113,11 +113,12 @@ struct Args {
     #[arg(long, default_value_t = 0.05)]
     v2_gap_closure: f64,
 
-    /// v2, геотехнический режим: закрывать также зазоры поперёк плоскости
-    /// (например, верх стены ниже плиты). По умолчанию закрываются только
-    /// зазоры, где конструкции исходно в одной плоскости.
+    /// v2, геотехнический режим: не закрывать зазоры поперёк плоскости
+    /// (например, верх стены ниже плиты). По умолчанию они закрываются
+    /// (стена достраивается в своей плоскости); параллельные конструкции
+    /// (плиты на разных уровнях) не сводятся никогда.
     #[arg(long)]
-    v2_gap_offsets: bool,
+    v2_keep_gap_offsets: bool,
 }
 
 /// Geotechnical simplification tolerances of the v2 pipeline (model units).
@@ -290,7 +291,7 @@ fn main() {
         crack_width: args.v2_crack_width,
         edge_collapse: args.v2_edge_collapse,
         gap_closure: args.v2_gap_closure,
-        gap_offsets: args.v2_gap_offsets,
+        gap_offsets: !args.v2_keep_gap_offsets,
     };
     let mut config = ReconstructionConfig::default();
     for value in [

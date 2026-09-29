@@ -774,3 +774,13 @@ passes on all four fixtures, типовая секция is unchanged, debug and
 outputs are identical. The remaining short edge of тест 5 (12 mm, a slab
 tongue touching a wall end) is rejected by contour validation in both merge
 directions.
+
+Update 2026-09-29: offsets across a plane (a wall top below a slab) are
+closed by default (the wall extends within its own plane);
+`--v2-keep-gap-offsets` keeps them. Parallel structures (slabs at
+different levels) are never brought together: a vertex of a surface
+parallel to the other one (within 0.02 rad) is not a gap candidate. Result:
+тест 5 passes the PLAXIS profile (16 gaps closed, including the 12 mm
+edge); тест 6 keeps 49 gaps, 21 of them between parallel structures (kept
+by rule) and 28 that would need a surface to leave its plane (corners held
+by several planes, edges shared with a third structure).

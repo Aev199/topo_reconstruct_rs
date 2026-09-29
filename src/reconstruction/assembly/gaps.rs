@@ -16,7 +16,9 @@
 //! By default only gaps within one plane are closed: the vertex lies in the
 //! other surface's plane (within the minimum edge) and only its distance to
 //! that surface's contour is closed. An offset across the plane (a wall top
-//! 25 mm below a slab) is closed only on request (`offsets`).
+//! 25 mm below a slab) is closed too (`offsets`, the default), except
+//! between parallel structures: a vertex of a surface parallel to the other
+//! one (two slabs at different levels) never moves across to it.
 //! Junction insertion afterwards represents the new contacts.
 use super::cleanup::{self, Bars};
 use super::intersection;
@@ -257,10 +259,20 @@ pub fn close(
     fixed: &BTreeSet<usize>,
     source_nodes: &[u32],
 ) -> Report {
-    let eligible = |model: &Model, g: &Gap| {
+    // Planes parallel within the plane recognition angle (0.02 rad).
+    let parallel = |model: &Model, v: usize, s: usize| {
+        let n = DVec3::from_array(model.planes[model.surfaces[s].plane].normal);
+        cleanup::users(model, v).into_iter().any(|u| {
+            DVec3::from_array(model.planes[model.surfaces[u].plane].normal)
+                .cross(n)
+                .length()
+                < 0.02
+        })
+    };
+    let eligible = |model: &Model, v: usize, s: usize, g: &Gap| {
         g.distance >= model.minimum_edge
             && g.distance < tolerance
-            && (offsets || g.height.abs() <= model.minimum_edge)
+            && (g.height.abs() <= model.minimum_edge || (offsets && !parallel(model, v, s)))
     };
     let mut report = Report {
         tolerance,
@@ -287,7 +299,7 @@ pub fn close(
                 }
                 if let Some(g) = gap(model, v, s, &members) {
                     // Sub-millimetre touches are junction insertion's job.
-                    if eligible(model, &g) {
+                    if eligible(model, v, s, &g) {
                         gaps.push((g.distance, v, s));
                     }
                 }
@@ -304,7 +316,7 @@ pub fn close(
             let Some(g) = gap(model, v, s, &members) else {
                 continue;
             };
-            if !eligible(model, &g) {
+            if !eligible(model, v, s, &g) {
                 continue;
             }
             let _ = (g.height, g.outside);
@@ -428,6 +440,34 @@ mod tests {
             assert_eq!(shared, 1);
             let j = run(&mut m);
             assert!(j.issues.is_empty(), "{:?}", j.issues);
+        }
+    }
+
+    #[test]
+    fn slabs_at_different_levels_are_never_brought_together() {
+        for place in Placement::all() {
+            // Two parallel slabs 25 mm apart in height, overlapping in plan.
+            let upper = (
+                vec![vec![
+                    [1.9, 0., 0.025],
+                    [4., 0., 0.025],
+                    [4., 4., 0.025],
+                    [1.9, 4., 0.025],
+                ]],
+                [0., 0., 1.],
+            );
+            let mut m = build(&place, &[slab(0., 2.), upper]);
+            let before = m.vertices.clone();
+            let r = close(
+                &mut m,
+                &mut no_bars(),
+                0.05 * place.scale,
+                true,
+                &BTreeSet::new(),
+                &[],
+            );
+            assert!(r.closed.is_empty(), "{:?}", r.closed);
+            assert_eq!(m.vertices, before);
         }
     }
 }
