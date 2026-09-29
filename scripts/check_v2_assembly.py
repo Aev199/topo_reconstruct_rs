@@ -159,7 +159,12 @@ def check(data, baseline=None):
     assert sorted(generated) == list(range(len(source_nodes), len(vertices)))
     lookup = {n: i for i, n in enumerate(frame["node_ids"])}
     budget = {n: frame["policy"]["maximum_movement"] for n in source_nodes}
-    for axis in frame["axes"]:
+    # A bar collapsed as too short no longer bounds the movement of its nodes.
+    removed_axes = {c["source_axis"] for c in topology.get("short_bars", {}).get("collapsed", [])
+                    if c["removed"]}
+    for k, axis in enumerate(frame["axes"]):
+        if k in removed_axes:
+            continue
         limit = frame["policy"]["relative_movement"] * math.dist(
             *(frame["reference_points"][i] for i in axis["endpoints"])
         )
@@ -167,6 +172,11 @@ def check(data, baseline=None):
             n = frame["node_ids"][anchor["node"]]
             if n in budget:
                 budget[n] = min(budget[n], limit)
+    # A node dropped by a bar collapse takes the kept node's place: bounded
+    # by the global movement limit (the collapse tolerance is far below it).
+    for c in topology.get("short_bars", {}).get("collapsed", []):
+        if c["dropped_source_node"] in budget:
+            budget[c["dropped_source_node"]] = frame["policy"]["maximum_movement"]
     for n, point in zip(source_nodes, vertices):
         i = lookup[n]
         assert math.dist(point, frame["reference_points"][i]) <= budget[n] + epsilon
@@ -208,6 +218,10 @@ def check(data, baseline=None):
         for m in topology.get(key, {}).get("merged", []):
             if m["dropped_source_node"] is not None and m["kept_source_node"] is not None:
                 merged[m["dropped_source_node"]] = m["kept_source_node"]
+    # Collapsed short bars: their nodes merge and their elements are reported.
+    for c in topology.get("short_bars", {}).get("collapsed", []):
+        if c["dropped_source_node"] is not None and c["kept_source_node"] is not None:
+            merged[c["dropped_source_node"]] = c["kept_source_node"]
 
     def identity(node):
         seen = set()
@@ -219,9 +233,14 @@ def check(data, baseline=None):
     expected_bars = [s["element"] for a in frame["axes"] for s in a["spans"]]
     actual_bars = [s["element"] for a in bars["axes"] for s in a["spans"]]
     actual_bars += [e for i in bars["issues"] for e in i["source_elements"]]
+    actual_bars += [e for c in topology.get("short_bars", {}).get("collapsed", [])
+                    for e in c["elements"]]
     assert collections.Counter(expected_bars) == collections.Counter(actual_bars)
     assert len(actual_bars) == len(set(actual_bars))
+    collapsed = topology.get("short_bars", {}).get("collapsed", [])
+    collapsed_elements = {e for c in collapsed for e in c["elements"]}
     represented = [a["source_axis"] for a in bars["axes"]] + [i["source_axis"] for i in bars["issues"]]
+    represented += [c["source_axis"] for c in collapsed if c["removed"]]
     assert sorted(represented) == list(range(len(frame["axes"])))
     for axis in bars["axes"]:
         original = frame["axes"][axis["source_axis"]]
@@ -236,13 +255,14 @@ def check(data, baseline=None):
             assert 0 <= anchor["t"] <= 1
             interpolated = [x + (y - x) * anchor["t"] for x, y in zip(a, b)]
             assert math.dist(interpolated, vertices[anchor["vertex"]]) <= epsilon
-            parameters[anchor["source_node"]] = anchor["t"]
+            parameters[identity(anchor["source_node"])] = anchor["t"]
         original_parameters = {x["t"]: frame["node_ids"][x["node"]] for x in original["anchors"]}
-        assert len(axis["spans"]) == len(original["spans"])
-        for span, source in zip(axis["spans"], original["spans"]):
+        kept_spans = [s for s in original["spans"] if s["element"] not in collapsed_elements]
+        assert len(axis["spans"]) == len(kept_spans)
+        for span, source in zip(axis["spans"], kept_spans):
             assert (span["element"], span["stiffness"]) == (source["element"], source["stiffness"])
-            assert span["start_t"] == parameters[original_parameters[source["start_t"]]]
-            assert span["end_t"] == parameters[original_parameters[source["end_t"]]]
+            assert span["start_t"] == parameters[identity(original_parameters[source["start_t"]])]
+            assert span["end_t"] == parameters[identity(original_parameters[source["end_t"]])]
             assert 0 <= span["start_t"] < span["end_t"] <= 1
 
     for contact in bars["contacts"]:

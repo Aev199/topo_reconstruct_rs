@@ -13,6 +13,10 @@
 //!
 //! Every step is transactional and validated (planarity, valid contours,
 //! bars never bent), and every closure is reported with its source node.
+//! By default only gaps within one plane are closed: the vertex lies in the
+//! other surface's plane (within the minimum edge) and only its distance to
+//! that surface's contour is closed. An offset across the plane (a wall top
+//! 25 mm below a slab) is closed only on request (`offsets`).
 //! Junction insertion afterwards represents the new contacts.
 use super::cleanup::{self, Bars};
 use super::intersection;
@@ -249,9 +253,15 @@ pub fn close(
     model: &mut Model,
     bars: &mut Bars<'_>,
     tolerance: f64,
+    offsets: bool,
     fixed: &BTreeSet<usize>,
     source_nodes: &[u32],
 ) -> Report {
+    let eligible = |model: &Model, g: &Gap| {
+        g.distance >= model.minimum_edge
+            && g.distance < tolerance
+            && (offsets || g.height.abs() <= model.minimum_edge)
+    };
     let mut report = Report {
         tolerance,
         ..Default::default()
@@ -277,7 +287,7 @@ pub fn close(
                 }
                 if let Some(g) = gap(model, v, s, &members) {
                     // Sub-millimetre touches are junction insertion's job.
-                    if g.distance >= model.minimum_edge && g.distance < tolerance {
+                    if eligible(model, &g) {
                         gaps.push((g.distance, v, s));
                     }
                 }
@@ -294,7 +304,7 @@ pub fn close(
             let Some(g) = gap(model, v, s, &members) else {
                 continue;
             };
-            if g.distance < model.minimum_edge || g.distance >= tolerance {
+            if !eligible(model, &g) {
                 continue;
             }
             let _ = (g.height, g.outside);
@@ -344,10 +354,22 @@ mod tests {
         for place in Placement::all() {
             // The wall top is 25 mm below the slab.
             let mut m = build(&place, &[slab(0., 4.), wall(1., 3., -2., -0.025)]);
+            // Across the slab plane: kept unless offsets are requested.
+            let mut kept = m.clone();
+            let r = close(
+                &mut kept,
+                &mut no_bars(),
+                0.05 * place.scale,
+                false,
+                &BTreeSet::new(),
+                &[],
+            );
+            assert!(r.closed.is_empty());
             let r = close(
                 &mut m,
                 &mut no_bars(),
                 0.05 * place.scale,
+                true,
                 &BTreeSet::new(),
                 &[],
             );
@@ -365,6 +387,7 @@ mod tests {
                 &mut m,
                 &mut no_bars(),
                 0.05 * place.scale,
+                true,
                 &BTreeSet::new(),
                 &[]
             )
@@ -387,10 +410,12 @@ mod tests {
                 [1., 0., 0.],
             );
             let mut m = build(&place, &[slab(0., 2.), cross]);
+            // The wall top lies in the slab plane: a gap within one plane.
             let r = close(
                 &mut m,
                 &mut no_bars(),
                 0.05 * place.scale,
+                false,
                 &BTreeSet::new(),
                 &[],
             );

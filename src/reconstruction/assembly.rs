@@ -75,6 +75,8 @@ pub struct Report {
     pub bar_anchors: cleanup::MergeReport,
     /// Short edges between needed corners collapsed into one vertex.
     pub short_edge_merges: cleanup::MergeReport,
+    /// Bar pieces shorter than the edge collapse tolerance, collapsed.
+    pub short_bars: cleanup::BarCollapseReport,
     /// Gaps between structures closed for PLAXIS.
     pub gaps: gaps::Report,
     /// Region contours rebuilt across cracks of the source mesh.
@@ -965,6 +967,21 @@ fn assemble_impl(
         None => cleanup::MergeReport::default(),
     };
     let (_, _, fixed) = protected(&model, &axis_assembly);
+    // Bar pieces too short for a PLAXIS element collapse.
+    let short_bars = match features {
+        Some(features) if features.maximum_collapsed_edge > 0. => cleanup::collapse_short_bars(
+            &mut model,
+            &mut cleanup::Bars {
+                axes: &mut axis_assembly.axes,
+                contacts: &mut axis_assembly.contacts,
+            },
+            features.maximum_collapsed_edge,
+            &fixed,
+            &vertex_source_nodes,
+        ),
+        _ => cleanup::BarCollapseReport::default(),
+    };
+    let (_, _, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
     let gaps = match features {
         Some(features) if features.maximum_gap > 0. => gaps::close(
@@ -974,6 +991,7 @@ fn assemble_impl(
                 contacts: &mut axis_assembly.contacts,
             },
             features.maximum_gap,
+            features.close_offset_gaps,
             &fixed,
             &vertex_source_nodes,
         ),
@@ -1098,6 +1116,7 @@ fn assemble_impl(
         bar_ends,
         bar_anchors,
         short_edge_merges,
+        short_bars,
         gaps,
         cracks,
         issues,

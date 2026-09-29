@@ -739,3 +739,38 @@ rotate (e.g. an oblique wall end lying in the plane of another wall 26 mm
 beyond its end, which is held by a third wall; slabs 25 mm apart in height),
 or are near-parallel surfaces; they are reported in `topology.gaps.rejected`.
 The short bar pieces of скала1 are source bars (7-28 mm) joining beams.
+
+## PLAXIS decisions, 2026-09-29
+
+User decisions after the PLAXIS profile batch:
+
+1. Surfaces stay in their planes: no plane-level alignment to close gaps
+   (vertices only move within their own planes, as before).
+2. Bars shorter than the collapse tolerance collapse
+   (`cleanup::collapse_short_bars`, `--v2-edge-collapse`, 0.05 m): a whole
+   short bar disappears and its ends merge; a short piece between two nodes
+   of one axis collapses into the node of more connections; the axis stays
+   straight, its source elements are reported in `topology.short_bars`
+   and the assembly checker accounts for them.
+3. Gaps close only where the two structures lie in one plane in the source
+   (the vertex within the minimum edge of the other surface's plane).
+   Offsets across a plane (a wall top below a slab) are kept unless
+   `--v2-gap-offsets` is given. Deformation joints are modelled wider than
+   the 50 mm tolerance and are never closed.
+
+Short edge collapse now also tries the other end when one merge is
+rejected.
+
+| PLAXIS profile after | скала1 | типовая секция | тест 5 | тест 6 |
+|---|---:|---:|---:|---:|
+| Short bar pieces | 7 -> 0 | 0 | 0 | 0 |
+| Short edges | 0 | 0 | 1 | 4 |
+| Gaps < 50 mm (offsets kept) | 0 | 0 | 0 | 63 |
+| Sharp corners | 1 (8 degrees) | 0 | 0 | 0 |
+
+скала1 trial mesh: minimum angle 2.39 -> 8.13 degrees, triangles below 20
+degrees 73 -> 11 (the needles came from the short bars). The strict audit
+passes on all four fixtures, типовая секция is unchanged, debug and release
+outputs are identical. The remaining short edge of тест 5 (12 mm, a slab
+tongue touching a wall end) is rejected by contour validation in both merge
+directions.

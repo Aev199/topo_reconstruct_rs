@@ -36,6 +36,9 @@ pub struct FeaturePolicy {
     /// that is closed onto it (model units, default 0.05 m: a tenth of a
     /// 0.5 m PLAXIS element; 0 keeps every gap, e.g. for real joints).
     pub maximum_gap: f64,
+    /// Also close gaps across a plane (a wall top below a slab), not only
+    /// gaps within one plane (default false).
+    pub close_offset_gaps: bool,
 }
 impl Default for FeaturePolicy {
     fn default() -> Self {
@@ -48,6 +51,7 @@ impl Default for FeaturePolicy {
             maximum_crack_width: 0.01,
             maximum_collapsed_edge: 0.05,
             maximum_gap: 0.05,
+            close_offset_gaps: false,
         }
     }
 }

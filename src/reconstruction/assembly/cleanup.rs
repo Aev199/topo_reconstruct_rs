@@ -351,8 +351,17 @@ pub fn collapse_short_edges(
             s.dedup();
             s
         };
-        let kept_from = model.vertices[keep];
-        match merge(model, bars, drop, keep, tolerance, fixed) {
+        // Either end may stay: try the other when one is rejected.
+        let before = [model.vertices[drop], model.vertices[keep]];
+        let first = merge(model, bars, drop, keep, tolerance, fixed);
+        let (drop, keep, kept_from, result) = match first {
+            Ok(m) => (drop, keep, before[1], Ok(m)),
+            Err(reason) => match merge(model, bars, keep, drop, tolerance, fixed) {
+                Ok(m) => (keep, drop, before[0], Ok(m)),
+                Err(_) => (drop, keep, before[1], Err(reason)),
+            },
+        };
+        match result {
             Ok(movement) => report.merged.push(MergedVertex {
                 kind: "short_edge".into(),
                 dropped: drop,
@@ -364,6 +373,217 @@ pub fn collapse_short_edges(
                 kept_from,
                 surfaces,
             }),
+            Err(reason) => report.rejected.push(RejectedMerge {
+                vertices: [drop, keep],
+                source_nodes: [
+                    source_nodes.get(drop).copied(),
+                    source_nodes.get(keep).copied(),
+                ],
+                distance: d,
+                reason,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CollapsedBar {
+    /// Axis index before the collapse; `removed` if the whole axis vanished.
+    pub axis: usize,
+    pub source_axis: usize,
+    pub removed: bool,
+    pub dropped: usize,
+    pub kept: usize,
+    pub dropped_source_node: Option<u32>,
+    pub kept_source_node: Option<u32>,
+    pub length: f64,
+    /// Source bar elements of the collapsed piece.
+    pub elements: Vec<u32>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct BarCollapseReport {
+    pub tolerance: f64,
+    pub collapsed: Vec<CollapsedBar>,
+    pub rejected: Vec<RejectedMerge>,
+}
+
+/// Axis `i` without `drop`, whose piece to `keep` collapses; `None` when the
+/// whole axis collapses. Spans of the piece are returned as removed.
+fn shorten(axis: &Axis, drop: usize, keep: usize) -> (Option<Axis>, Vec<u32>) {
+    let t = |v: usize| axis.anchors.iter().find(|a| a.vertex == v).map(|a| a.t);
+    let (Some(td), Some(tk)) = (t(drop), t(keep)) else {
+        return (Some(axis.clone()), vec![]);
+    };
+    let (lo, hi) = (td.min(tk), td.max(tk));
+    let tol = 1e-9;
+    let mut removed = vec![];
+    let mut spans = vec![];
+    for span in &axis.spans {
+        if span.start_t >= lo - tol && span.end_t <= hi + tol {
+            removed.push(span.element);
+            continue;
+        }
+        let mut span = span.clone();
+        if (span.start_t - td).abs() <= tol {
+            span.start_t = tk;
+        }
+        if (span.end_t - td).abs() <= tol {
+            span.end_t = tk;
+        }
+        spans.push(span);
+    }
+    let anchors: Vec<_> = axis
+        .anchors
+        .iter()
+        .filter(|a| a.vertex != drop)
+        .cloned()
+        .collect();
+    if anchors.len() < 2 || spans.is_empty() {
+        return (None, removed);
+    }
+    let mut endpoints = axis.endpoints;
+    for e in endpoints.iter_mut() {
+        if *e == drop {
+            *e = keep;
+        }
+    }
+    // Parameters follow the new ends.
+    let t0 = t(endpoints[0]).unwrap();
+    let t1 = t(endpoints[1]).unwrap();
+    let map = |x: f64| ((x - t0) / (t1 - t0)).clamp(0., 1.);
+    let mut result = axis.clone();
+    result.endpoints = endpoints;
+    result.anchors = anchors
+        .into_iter()
+        .map(|mut a| {
+            a.t = map(a.t);
+            a
+        })
+        .collect();
+    result.spans = spans
+        .into_iter()
+        .map(|mut s| {
+            s.start_t = map(s.start_t);
+            s.end_t = map(s.end_t);
+            s
+        })
+        .collect();
+    (Some(result), removed)
+}
+
+/// Collapse bar pieces shorter than `tolerance` (short source bars joining
+/// beams, and close consecutive nodes of one axis): the node of fewer
+/// connections merges into the other, the piece's source elements are
+/// reported, and a bar whose whole length collapses disappears. Other bars
+/// and surfaces keep their planes and are never bent.
+pub fn collapse_short_bars(
+    model: &mut Model,
+    bars: &mut Bars<'_>,
+    tolerance: f64,
+    fixed: &BTreeSet<usize>,
+    source_nodes: &[u32],
+) -> BarCollapseReport {
+    let mut report = BarCollapseReport {
+        tolerance,
+        ..Default::default()
+    };
+    let mut tried = BTreeSet::new();
+    loop {
+        let mut best: Option<(f64, usize, usize, usize)> = None;
+        for (i, axis) in bars.axes.iter().enumerate() {
+            let mut anchors = axis.anchors.clone();
+            anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+            for w in anchors.windows(2) {
+                let (u, v) = (w[0].vertex, w[1].vertex);
+                let d = DVec3::from_array(model.vertices[u])
+                    .distance(DVec3::from_array(model.vertices[v]));
+                let key = (u.min(v), u.max(v));
+                if d < tolerance
+                    && !tried.contains(&key)
+                    && best.is_none_or(|b| (d, i, key.0) < (b.0, b.1, b.2.min(b.3)))
+                {
+                    best = Some((d, i, u, v));
+                }
+            }
+        }
+        let Some((d, i, u, v)) = best else {
+            return report;
+        };
+        tried.insert((u.min(v), u.max(v)));
+        let connections = |x: usize| {
+            users(model, x).len()
+                + bars
+                    .axes
+                    .iter()
+                    .filter(|a| a.anchors.iter().any(|y| y.vertex == x))
+                    .count()
+        };
+        let (drop, keep) =
+            if (connections(u), std::cmp::Reverse(u)) > (connections(v), std::cmp::Reverse(v)) {
+                (v, u)
+            } else {
+                (u, v)
+            };
+        let (shortened, elements) = shorten(&bars.axes[i], drop, keep);
+        let source_axis = bars.axes[i].source_axis;
+        let mut axes = bars.axes.clone();
+        let mut contacts: Vec<Contact> = bars
+            .contacts
+            .iter()
+            .filter(|c| {
+                let axis = match c {
+                    Contact::Point { axis, .. } | Contact::Interval { axis, .. } => *axis,
+                };
+                shortened.is_some() || axis != i
+            })
+            .cloned()
+            .collect();
+        let removed = shortened.is_none();
+        match shortened {
+            Some(axis) => axes[i] = axis,
+            None => {
+                axes.remove(i);
+                for c in contacts.iter_mut() {
+                    match c {
+                        Contact::Point { axis, .. } | Contact::Interval { axis, .. } => {
+                            if *axis > i {
+                                *axis -= 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut trial = model.clone();
+        let result = merge(
+            &mut trial,
+            &mut Bars {
+                axes: &mut axes,
+                contacts: &mut contacts,
+            },
+            drop,
+            keep,
+            tolerance,
+            fixed,
+        );
+        match result {
+            Ok(_) => {
+                *model = trial;
+                *bars.axes = axes;
+                *bars.contacts = contacts;
+                report.collapsed.push(CollapsedBar {
+                    axis: i,
+                    source_axis,
+                    removed,
+                    dropped: drop,
+                    kept: keep,
+                    dropped_source_node: source_nodes.get(drop).copied(),
+                    kept_source_node: source_nodes.get(keep).copied(),
+                    length: d,
+                    elements,
+                });
+            }
             Err(reason) => report.rejected.push(RejectedMerge {
                 vertices: [drop, keep],
                 source_nodes: [
@@ -888,6 +1108,98 @@ mod tests {
                     assert!(x.distance(p.lerp(q, anchor.t)) <= m.precision);
                 }
             }
+        }
+    }
+
+    fn spanned(ends: [usize; 2], nodes: &[(usize, f64)], first: u32) -> Axis {
+        Axis {
+            source_axis: 0,
+            endpoints: ends,
+            anchors: nodes
+                .iter()
+                .map(|&(vertex, t)| Anchor {
+                    source_node: 0,
+                    vertex,
+                    t,
+                })
+                .collect(),
+            spans: nodes
+                .windows(2)
+                .enumerate()
+                .map(|(k, w)| crate::reconstruction::recognize::SourceSpan {
+                    element: first + k as u32,
+                    stiffness: 1,
+                    start_t: w[0].1,
+                    end_t: w[1].1,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn short_bars_collapse_and_report_their_elements() {
+        for place in Placement::all() {
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            // Two beams joined by a 20 mm bar above the slab.
+            let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [1.99, 1., 1.]));
+            let (b0, b1) = (v(&mut m, [2.01, 1., 1.]), v(&mut m, [4., 1., 1.]));
+            // A long beam with two nodes 30 mm apart at x = 2.
+            let (c0, c1, c2, c3) = (
+                v(&mut m, [0., 3., 1.]),
+                v(&mut m, [2., 3., 1.]),
+                v(&mut m, [2.03, 3., 1.]),
+                v(&mut m, [4., 3., 1.]),
+            );
+            let mut axes = vec![
+                spanned([a0, a1], &[(a0, 0.), (a1, 1.)], 10),
+                spanned([a1, b0], &[(a1, 0.), (b0, 1.)], 20),
+                spanned([b0, b1], &[(b0, 0.), (b1, 1.)], 30),
+                spanned([c0, c3], &[(c0, 0.), (c1, 0.5), (c2, 0.5075), (c3, 1.)], 40),
+            ];
+            let mut contacts = vec![];
+            let r = collapse_short_bars(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut contacts,
+                },
+                0.05 * place.scale,
+                &BTreeSet::new(),
+                &[],
+            );
+            assert_eq!(r.collapsed.len(), 2, "{:?}", r.rejected);
+            // The joining bar is gone, its element reported; the beams meet.
+            assert_eq!(axes.len(), 3);
+            let joining = r.collapsed.iter().find(|c| c.removed).unwrap();
+            assert_eq!(joining.elements, vec![20]);
+            assert_eq!(axes[0].endpoints[1], axes[1].endpoints[0]);
+            // The long beam keeps three nodes, straight, with two elements.
+            let long = &axes[2];
+            assert_eq!(long.anchors.len(), 3);
+            assert_eq!(long.spans.len(), 2);
+            let inner = r.collapsed.iter().find(|c| !c.removed).unwrap();
+            assert_eq!(inner.elements, vec![41]);
+            let [p, q] = long.endpoints.map(|e| DVec3::from_array(m.vertices[e]));
+            for anchor in &long.anchors {
+                let x = DVec3::from_array(m.vertices[anchor.vertex]);
+                assert!(x.distance(p.lerp(q, anchor.t)) <= m.precision);
+            }
+            let covered: f64 = long.spans.iter().map(|s| s.end_t - s.start_t).sum();
+            assert!((covered - 1.).abs() < 1e-12);
+            // Nothing shorter than the tolerance is left; a 60 mm piece stays.
+            assert!(collapse_short_bars(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut contacts,
+                },
+                0.05 * place.scale,
+                &BTreeSet::new(),
+                &[],
+            )
+            .collapsed
+            .is_empty());
         }
     }
 

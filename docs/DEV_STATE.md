@@ -61,12 +61,10 @@ PLAXIS (`docs/GEOTECHNICAL_GEOMETRY.md`, "PLAXIS profile"):
 `scripts/check_plaxis_profile.py` is the readiness gate at a target element
 size of 0.5 m. типовая секция and тест 5 pass it. Remaining:
 
-1. тест 6: 49 gaps below 50 mm that need a whole surface to move or rotate
-   (plane-level alignment, like stacked walls), 4 short edges; 194 source
-   near misses of 25-50 mm were classified earlier (policy pending: joints
-   versus modelling offsets; `--v2-gap-closure 0` keeps all gaps);
-2. скала1: 7 short source bars (7-28 mm) joining beams, 1 contour corner of
-   8 degrees;
+1. тест 6: 63 gaps below 50 mm left by the user's rules (offsets across a
+   plane are kept; surfaces never leave their planes), 4 short edges;
+   тест 5: one 12 mm edge rejected by contour validation;
+2. скала1: one contour corner of 8 degrees;
 3. trial mesh quality on тест 6 (minimum 3.33 degrees); the final mesh
    should come from Gmsh or the target program (`docs/PRIOR_ART.md`);
 4. two junction diagnostics on тест 6 (a 19.6 mm near touch, one refused

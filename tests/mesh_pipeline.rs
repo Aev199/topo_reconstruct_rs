@@ -325,6 +325,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         cracks: vec![],
         short_edge_merges: assembly::cleanup::MergeReport::default(),
         gaps: assembly::gaps::Report::default(),
+        short_bars: assembly::cleanup::BarCollapseReport::default(),
         issues: vec![],
         maximum_closure_movement: 0.,
         rejected_vertices: BTreeMap::new(),
