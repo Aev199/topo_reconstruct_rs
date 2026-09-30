@@ -38,6 +38,100 @@ struct Facet {
     center: DVec3,
 }
 
+/// Split a connected group of facets that is not one plane into planar
+/// panels: repeatedly seed at the largest remaining facet (ties by centre,
+/// independent of IDs and order) and add neighbouring facets while every
+/// node stays within the distance tolerance of the panel plane and every
+/// facet normal within the angle tolerance of it.
+fn grow_panels(
+    group: &BTreeSet<u32>,
+    facets: &BTreeMap<u32, Facet>,
+    neighbors: &BTreeMap<u32, BTreeSet<u32>>,
+    mesh: &MeshData,
+    policy: &Policy,
+) -> Vec<BTreeSet<u32>> {
+    let area = |id: u32| {
+        let f = &facets[&id];
+        let p: Vec<DVec3> = f.nodes.iter().map(|n| mesh.nodes[n]).collect();
+        (1..p.len().saturating_sub(1))
+            .map(|i| (p[i] - p[0]).cross(p[i + 1] - p[0]).length() / 2.)
+            .sum::<f64>()
+    };
+    let mut remaining = group.clone();
+    let mut panels = vec![];
+    while !remaining.is_empty() {
+        let seed = *remaining
+            .iter()
+            .max_by(|&&a, &&b| {
+                area(a)
+                    .total_cmp(&area(b))
+                    .then_with(|| {
+                        let (ca, cb) = (facets[&a].center, facets[&b].center);
+                        cb.x.total_cmp(&ca.x)
+                            .then(cb.y.total_cmp(&ca.y))
+                            .then(cb.z.total_cmp(&ca.z))
+                    })
+            })
+            .unwrap();
+        let mut panel = BTreeSet::from([seed]);
+        let mut points: Vec<DVec3> = facets[&seed].nodes.iter().map(|n| mesh.nodes[n]).collect();
+        let mut normal = facets[&seed].normal;
+        let mut center = facets[&seed].center;
+        let mut frontier: Vec<u32> = neighbors.get(&seed).into_iter().flatten().copied().collect();
+        frontier.sort_unstable();
+        let mut refit_at = 2 * points.len();
+        while let Some(id) = frontier.pop() {
+            if panel.contains(&id) || !remaining.contains(&id) {
+                continue;
+            }
+            let f = &facets[&id];
+            let fits = normal.dot(f.normal).abs() >= policy.angle.cos()
+                && f.nodes
+                    .iter()
+                    .all(|n| normal.dot(mesh.nodes[n] - center).abs() <= policy.distance);
+            if !fits {
+                continue;
+            }
+            // Accept only if the refitted plane still holds every node.
+            let mut trial = points.clone();
+            trial.extend(f.nodes.iter().map(|n| mesh.nodes[n]));
+            if trial.len() >= refit_at {
+                let Some((n, _)) = fit(&trial, normal) else {
+                    continue;
+                };
+                let c = trial.iter().copied().sum::<DVec3>() / trial.len() as f64;
+                if trial.iter().any(|p| n.dot(*p - c).abs() > policy.distance)
+                    || panel
+                        .iter()
+                        .chain([&id])
+                        .any(|i| n.dot(facets[i].normal).abs() < policy.angle.cos())
+                {
+                    continue;
+                }
+                normal = n;
+                center = c;
+                refit_at = 2 * trial.len();
+            }
+            points = trial;
+            panel.insert(id);
+            let mut next: Vec<u32> = neighbors
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|n| remaining.contains(n) && !panel.contains(n))
+                .collect();
+            next.sort_unstable();
+            frontier.extend(next);
+        }
+        for id in &panel {
+            remaining.remove(id);
+        }
+        panels.push(panel);
+    }
+    panels
+}
+
 pub(super) fn fit(points: &[DVec3], reference: DVec3) -> Option<(DVec3, f64)> {
     if points.len() < 3 {
         return None;
@@ -278,13 +372,24 @@ pub fn recognize(mesh: &MeshData, policy: &Policy) -> Result<Report, &'static st
         if let Some(patch) = build(&group) {
             result.patches.push(patch);
         } else {
+            // Not one plane (a straight wall running into a curved one, a
+            // fold): split into planar panels by region growing from the
+            // largest facet, each within the distance and angle tolerances.
             result
                 .unmerged_components
                 .push(group.iter().copied().collect());
-            for id in group {
-                result
-                    .patches
-                    .push(build(&BTreeSet::from([id])).ok_or("failed to retain source facet")?);
+            for panel in grow_panels(&group, &facets, &neighbors, mesh, policy) {
+                match build(&panel) {
+                    Some(patch) => result.patches.push(patch),
+                    None => {
+                        for id in panel {
+                            result.patches.push(
+                                build(&BTreeSet::from([id]))
+                                    .ok_or("failed to retain source facet")?,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -391,7 +496,10 @@ mod tests {
             });
         }
         let r = recognize(&m, &policy()).unwrap();
-        assert_eq!(r.patches.len(), 29);
+        // Not one plane: planar panels within the tolerances.
+        assert!(r.patches.len() > 1);
+        assert!(r.patches.iter().all(|p| p.maximum_deviation <= policy().distance));
+        assert_eq!(r.patches.iter().map(|p| p.source_elements.len()).sum::<usize>(), 29);
         assert_eq!(r.unmerged_components.len(), 1);
         assert!(r.rejected.is_empty());
     }
@@ -403,5 +511,36 @@ mod tests {
         m.elements.reverse();
         let b = recognize(&m, &policy()).unwrap();
         assert_eq!(a.patches[0].source_elements, b.patches[0].source_elements);
+    }
+
+    #[test]
+    fn curved_strip_splits_into_planar_panels_not_single_facets() {
+        // 20 vertical quads 0.5 m wide along an arc turning 1 degree per
+        // quad (neighbours within the angle tolerance, the strip not planar).
+        let mut mesh = MeshData::default();
+        let (radius, step) = (0.5 / 1f64.to_radians(), 1f64.to_radians());
+        for k in 0..=20u32 {
+            let a = step * k as f64;
+            let p = DVec3::new(radius * a.sin(), radius * (1. - a.cos()), 0.);
+            mesh.nodes.insert(2 * k + 1, p);
+            mesh.nodes.insert(2 * k + 2, p + DVec3::Z * 3.);
+        }
+        for k in 0..20u32 {
+            mesh.elements.push(ElementData {
+                id: k + 1,
+                elem_type: 44,
+                stiff_id: 1,
+                nodes: vec![2 * k + 1, 2 * k + 3, 2 * k + 4, 2 * k + 2],
+            });
+        }
+        let r = recognize(&mesh, &policy()).unwrap();
+        assert_eq!(r.unmerged_components.len(), 1);
+        assert!(r.patches.len() > 1 && r.patches.len() < 20, "{}", r.patches.len());
+        let mut all: Vec<u32> = r.patches.iter().flat_map(|p| p.source_elements.clone()).collect();
+        all.sort_unstable();
+        assert_eq!(all, (1..=20).collect::<Vec<_>>());
+        for p in &r.patches {
+            assert!(p.maximum_deviation <= policy().distance);
+        }
     }
 }

@@ -1105,3 +1105,18 @@ bars (164 and 36 mm) of "для testa" turned 2.1-2.3 degrees within their
 budgets and were lost as `axis_direction_conflict`. "Для testa" is now
 fully built (trial mesh valid, external mesher gate passes). Regression:
 `short_bar_may_turn_as_far_as_its_end_budgets_allow`.
+
+Plane recognition: a connected group of coplanar-neighbour facets that is
+not one plane (a straight wall running into a curved one, a gently curved
+or warped slab) used to fall apart into single-element patches. It is now
+split into planar panels by region growing: seeded at the largest facet
+(ties by centre, independent of IDs and order), adding neighbours while all
+nodes stay within the plane distance (10 mm) and all facet normals within
+the recognition angle of the refitted panel plane. Regressions: the
+gradual-curvature test now checks planar panels, and
+`curved_strip_splits_into_planar_panels_not_single_facets`.
+
+скала1 had two such groups: 388 -> 59 surfaces, 579 -> 525 bar axes (fewer
+split points), trial triangles 23066 -> 22217, maximum frame movement
+1.5 -> 6.8 mm (within the plane distance); strict audit, assembly checker,
+PLAXIS profile and mesh angles unchanged. Other fixtures unchanged.
