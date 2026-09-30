@@ -59,6 +59,10 @@ impl Default for FeaturePolicy {
 
 #[derive(Debug, Serialize)]
 pub struct SimplifiedHole {
+    /// `collapsed_opening` (closed by the frame to zero width) or
+    /// `crack_void` (an enclosed void of the source mesh no wider than the
+    /// crack width: a sliver between non-conforming elements).
+    pub reason: String,
     pub patch: usize,
     pub source_elements: Vec<u32>,
     pub source_nodes: Vec<u32>,
@@ -147,15 +151,23 @@ pub(super) fn simplify(
             && super::super::validate_ring(&uv, precision).is_ok()
             && outer.contains(&hole)
             && !outer.exterior().intersects(hole.exterior());
-        if source_valid
-            && source_width <= policy.maximum_source_width
+        let collapsed = source_width <= policy.maximum_source_width
             && candidate_width <= precision
-            && candidate_area <= threshold
+            && candidate_area <= threshold;
+        let crack = source_width <= policy.maximum_crack_width;
+        if source_valid
+            && (collapsed || crack)
             && exterior_area > 0.
             && filled + source_area <= policy.maximum_filled_area_ratio * exterior_area
         {
             filled += source_area;
             changes.push(SimplifiedHole {
+                reason: if collapsed {
+                    "collapsed_opening"
+                } else {
+                    "crack_void"
+                }
+                .into(),
                 patch,
                 source_elements: ids.to_vec(),
                 source_nodes: ring.clone(),
@@ -224,8 +236,15 @@ mod tests {
     #[test]
     fn closure_is_bounded_and_rigid_transform_invariant() {
         for transform in [false, true] {
-            for (width, collapsed, expected) in [(0.01, true, 1), (0.01, false, 0), (0.2, true, 0)]
-            {
+            // Collapsed by the frame: filled up to the source width limit.
+            // Not collapsed: filled only as a crack void (within the crack
+            // width, 10 mm by default); a 20 mm opening stays.
+            for (width, collapsed, expected) in [
+                (0.01, true, 1),
+                (0.005, false, 1),
+                (0.02, false, 0),
+                (0.2, true, 0),
+            ] {
                 let (mesh, points, plane) = fixture(width, collapsed, transform);
                 let mut loops = vec![vec![0, 1, 2, 3], vec![4, 5, 6]];
                 let result = simplify(
@@ -238,8 +257,20 @@ mod tests {
                     0,
                     &[12],
                 );
-                assert_eq!(result.len(), expected);
+                assert_eq!(
+                    result.len(),
+                    expected,
+                    "width {width} collapsed {collapsed}"
+                );
                 assert_eq!(loops.len(), 2 - expected);
+                if expected == 1 {
+                    let reason = if collapsed {
+                        "collapsed_opening"
+                    } else {
+                        "crack_void"
+                    };
+                    assert_eq!(result[0].reason, reason);
+                }
             }
         }
     }

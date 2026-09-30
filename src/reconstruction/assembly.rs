@@ -204,7 +204,52 @@ fn split_pinched_regions(ids: &[u32], facets: &BTreeMap<u32, Vec<u32>>) -> Vec<V
         groups.push(group);
     }
     if groups.len() == 1 {
-        return groups;
+        // Every element touches a pinch (fans of triangles meeting at their
+        // centres): split the elements around the first pinch into fans,
+        // elements joined by an edge through that pinch node.
+        let p = *pinch.first().unwrap();
+        let mut fans = BTreeMap::<u32, BTreeSet<u32>>::new();
+        for (edge, owners) in &edges {
+            if let [a, b] = owners.as_slice() {
+                if edge.contains(&p) {
+                    fans.entry(*a).or_default().insert(*b);
+                    fans.entry(*b).or_default().insert(*a);
+                }
+            }
+        }
+        let mut remaining: BTreeSet<_> = ids.iter().copied().collect();
+        let mut parts = vec![];
+        while let Some(&seed) = remaining.first() {
+            let around = |id: u32| facets[&id].contains(&p);
+            let mut stack = vec![seed];
+            let mut part = vec![];
+            while let Some(id) = stack.pop() {
+                if remaining.remove(&id) {
+                    part.push(id);
+                    if around(id) {
+                        stack.extend(fans.get(&id).into_iter().flatten().copied());
+                    } else {
+                        stack.extend(
+                            neighbors
+                                .get(&id)
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .filter(|&n| !around(n)),
+                        );
+                    }
+                }
+            }
+            part.sort_unstable();
+            parts.push(part);
+        }
+        if parts.len() == 1 {
+            return parts;
+        }
+        return parts
+            .iter()
+            .flat_map(|g| split_pinched_regions(g, facets))
+            .collect();
     }
     groups
         .iter()
@@ -859,6 +904,50 @@ fn assemble_impl(
             }
         }
     }
+    // Consecutive contour nodes closed within the minimum edge length (a
+    // degenerate source element edge, 0.7 mm) are one vertex when the
+    // supports of one contain the other's: the kept node lies on every
+    // support of the dropped one. Bar anchors are never dropped.
+    let supports_of = |id: u32| -> BTreeSet<usize> {
+        owners
+            .get(&id)
+            .map(|s| s.iter().map(|&x| support_representatives[x]).collect())
+            .unwrap_or_default()
+    };
+    for ring in rings.values().flatten() {
+        for i in 0..ring.len() {
+            let root = |mut id: u32| {
+                while let Some(&k) = identified.get(&id) {
+                    id = k;
+                }
+                id
+            };
+            let (a, b) = (root(ring[i]), root(ring[(i + 1) % ring.len()]));
+            if a == b {
+                continue;
+            }
+            let (Some(&qa), Some(&qb)) = (closed_points.get(&a), closed_points.get(&b)) else {
+                continue;
+            };
+            if qa.distance(qb) >= policy.minimum_edge {
+                continue;
+            }
+            let (sa, sb) = (supports_of(a), supports_of(b));
+            let (keep, drop) = if sb.is_subset(&sa) && !bar_nodes.contains(&b) {
+                (a, b)
+            } else if sa.is_subset(&sb) && !bar_nodes.contains(&a) {
+                (b, a)
+            } else {
+                continue;
+            };
+            stacked_walls.coincident.push(stacking::Identified {
+                upper_node: drop,
+                lower_node: keep,
+                distance: qa.distance(qb),
+            });
+            identified.insert(drop, keep);
+        }
+    }
     for (&id, &q) in &closed_points {
         if identified.contains_key(&id) {
             continue;
@@ -873,8 +962,12 @@ fn assemble_impl(
         );
         vertex_source_nodes.push(id);
     }
-    for (&upper, lower) in &identified {
-        vertices.insert(upper, vertices[lower]);
+    for &upper in identified.keys() {
+        let mut lower = upper;
+        while let Some(&k) = identified.get(&lower) {
+            lower = k;
+        }
+        vertices.insert(upper, vertices[&lower]);
     }
     stacked_walls
         .identified
@@ -1250,6 +1343,121 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn contour_edge_below_the_minimum_edge_becomes_one_vertex() {
+        use crate::input::ElementData;
+        let policy = Policy {
+            closure_tolerance: 0.001,
+            junction_movement_limit: 0.05,
+            precision: 1e-7,
+            minimum_edge: 0.001,
+        };
+        // Two slab quads joined by a degenerate triangle whose top edge (a
+        // contour edge) is 0.5 mm long.
+        let mut mesh = MeshData::default();
+        for (id, p) in [
+            (1, [0., 0.]),
+            (2, [1., 0.]),
+            (3, [1., 1.]),
+            (4, [0., 1.]),
+            (5, [1.0005, 1.]),
+            (6, [2., 0.]),
+            (7, [2., 1.]),
+        ] {
+            mesh.nodes.insert(id, DVec3::new(p[0], p[1], 0.));
+        }
+        for (id, nodes) in [
+            (1, vec![1, 2, 3, 4]),
+            (2, vec![2, 5, 3]),
+            (3, vec![2, 6, 7, 5]),
+        ] {
+            mesh.elements.push(ElementData {
+                id,
+                elem_type: if nodes.len() == 3 { 42 } else { 44 },
+                stiff_id: 1,
+                nodes,
+            });
+        }
+        let f = planar_frame(&mesh, DVec3::Z);
+        let r = assemble(&mesh, &f, &policy).unwrap();
+        assert!(r.all_surface_patches_built, "{:?}", r.issues);
+        let pairs: Vec<_> = r
+            .stacked_walls
+            .coincident
+            .iter()
+            .map(|c| {
+                let mut p = [c.upper_node, c.lower_node];
+                p.sort_unstable();
+                p
+            })
+            .collect();
+        assert_eq!(pairs, vec![[3, 5]]);
+    }
+
+    #[test]
+    fn interleaved_fans_touching_at_their_centres_are_split_until_no_pinch() {
+        // Topology only (relabelled): two triangle fans around nodes 13 and 14
+        // of one property region, every element incident to a pinch node.
+        let faces: [&[u32]; 23] = [
+            &[16, 17, 13],
+            &[14, 18, 15, 19],
+            &[20, 14, 12],
+            &[12, 14, 15],
+            &[21, 18, 14],
+            &[11, 13, 1],
+            &[13, 6, 5],
+            &[13, 22, 6],
+            &[11, 1, 14],
+            &[1, 5, 14],
+            &[14, 5, 6],
+            &[14, 6, 22],
+            &[13, 17, 10],
+            &[13, 10, 3],
+            &[13, 3, 9],
+            &[13, 9, 4],
+            &[13, 4, 8],
+            &[13, 8, 21],
+            &[13, 21, 2],
+            &[13, 2, 7],
+            &[13, 7, 22],
+            &[21, 14, 2],
+            &[14, 22, 7],
+        ];
+        let facets: BTreeMap<u32, Vec<u32>> = faces
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (i as u32 + 1, f.to_vec()))
+            .collect();
+        let ids: Vec<u32> = facets.keys().copied().collect();
+        let parts = split_pinched_regions(&ids, &facets);
+        assert!(parts.len() > 1);
+        let mut all: Vec<u32> = parts.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, ids);
+        for part in &parts {
+            let mut counts = BTreeMap::<[u32; 2], usize>::new();
+            for id in part {
+                let f = &facets[id];
+                for i in 0..f.len() {
+                    let (a, b) = (f[i], f[(i + 1) % f.len()]);
+                    *counts.entry([a.min(b), a.max(b)]).or_default() += 1;
+                }
+            }
+            let mut degree = BTreeMap::<u32, usize>::new();
+            for (e, c) in counts {
+                if c == 1 {
+                    for n in e {
+                        *degree.entry(n).or_default() += 1;
+                    }
+                }
+            }
+            assert!(
+                degree.values().all(|&d| d == 2),
+                "pinched part {part:?}: {degree:?}"
+            );
+        }
     }
 
     #[test]

@@ -15,7 +15,8 @@
 //! its two mouth nodes become one contour point. Before that, contour pieces
 //! traversed from both sides (a zero-width crack along non-matching nodes of
 //! two meshes) are removed. Enclosed narrow voids of positive width are not
-//! cracks here: the collapsed-opening policy handles them. Nodes left off
+//! cracks here: the hole policy (`features::simplify`) fills those no wider
+//! than the crack width and keeps their nodes. Nodes left off
 //! the contour keep no contour vertex; every change is reported with its
 //! source nodes.
 use super::{planes, MeshData, PlaneFrame};
@@ -239,8 +240,8 @@ pub fn close(
         }
     }
     // A hole contour cut down to a line was a crack as a whole. Enclosed
-    // narrow voids of positive width are left to the collapsed-opening
-    // policy, which keeps their nodes.
+    // narrow voids of positive width are left to the hole policy, which
+    // fills those within the crack width and keeps their nodes.
     let mut kept = vec![];
     for (ring, is_outer) in rings {
         if ring.len() < 3 {

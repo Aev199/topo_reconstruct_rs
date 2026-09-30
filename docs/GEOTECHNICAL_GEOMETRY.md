@@ -1036,3 +1036,31 @@ and its trial mesh; remaining there: a bar crossing a slab without a node,
 two bars lying 73 mm in a surface without contact, a 0.37 um near touch,
 degenerate trial triangles, and bar nodes moved 20 mm by a bar-end merge
 and a gap closure beyond the 5 % bar budget of the assembly checker.
+
+Багратион concrete bedding (new fixture: one large slab, mixed triangles
+and quads, 2146 bars, 325 point elements), three more general rules:
+
+1. Crack voids: enclosed voids whose source width (distance of the ring
+   from its longest chord) is within the crack width are filled by the
+   hole policy (`simplified_holes`, reason `crack_void`), keeping their
+   nodes as interior points like collapsed openings (the crack module
+   closes voids only through a mouth of two nodes within the crack width;
+   needle-shaped slivers between non-conforming elements had none).
+   58 such voids in this fixture. Regression: the hole policy test now
+   fills a 5 mm void and keeps a 20 mm opening.
+2. Consecutive contour nodes closer than the minimum edge after closure (a
+   degenerate element edge of 0.7 mm) are one vertex when the supports of
+   one contain the other's; bar anchors are never dropped
+   (`stacked_walls.coincident`). Identification chains are resolved to one
+   vertex. Regression: `contour_edge_below_the_minimum_edge_becomes_one_vertex`
+   (fails without it with contour_ShortEdge).
+3. Pinched regions whose every element touches a pinch node (interleaved
+   triangle fans around two centres) are split into fans around a pinch
+   node (elements joined by an edge through it) when the incident /
+   non-incident split makes no progress. Regression:
+   `interleaved_fans_touching_at_their_centres_are_split_until_no_pinch`
+   (relabelled topology, no coordinates).
+
+Existing fixtures identical. Remaining in this fixture: two sliver fans
+(5 cm wide) whose contour pinches after a crack mouth identification, and
+a trial mesh with coinciding constraint vertices.
