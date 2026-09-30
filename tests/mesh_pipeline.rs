@@ -731,8 +731,10 @@ fn stacked_source() -> topo_reconstruct_rs::input::MeshData {
 }
 
 /// Two walls on one slab in one line, the second one 25 mm off the first
-/// line (a jog), end to end; or, with `overlap`, side by side over 1 m.
-fn wall_line_source(overlap: bool) -> topo_reconstruct_rs::input::MeshData {
+/// line (a jog). `lap` (25 mm units) is how far the second wall starts
+/// before the end of the first: 0 end to end, 1 a 25 mm strip where the ends
+/// overlap, 40 side by side over 1 m.
+fn wall_line_source(lap: i32) -> topo_reconstruct_rs::input::MeshData {
     use topo_reconstruct_rs::input::{ElementData, MeshData};
     let mut mesh = MeshData::default();
     let mut nodes = BTreeMap::new();
@@ -768,13 +770,11 @@ fn wall_line_source(overlap: bool) -> topo_reconstruct_rs::input::MeshData {
             );
         }
     }
-    let (a, b) = if overlap {
-        (0..160, 120..240)
-    } else {
-        (0..120, 120..240)
-    };
+    let b: Vec<i32> = std::iter::once(120 - lap)
+        .chain((160..=240).step_by(40))
+        .collect();
     for z in [0, 40] {
-        for x in a.clone().step_by(40) {
+        for x in (0..120).step_by(40) {
             add(
                 [
                     (x, 80, z),
@@ -785,13 +785,13 @@ fn wall_line_source(overlap: bool) -> topo_reconstruct_rs::input::MeshData {
                 20,
             );
         }
-        for x in b.clone().step_by(40) {
+        for w in b.windows(2) {
             add(
                 [
-                    (x, 81, z),
-                    (x + 40, 81, z),
-                    (x + 40, 81, z + 40),
-                    (x, 81, z + 40),
+                    (w[0], 81, z),
+                    (w[1], 81, z),
+                    (w[1], 81, z + 40),
+                    (w[0], 81, z + 40),
                 ],
                 30,
             );
@@ -811,12 +811,8 @@ fn walls_in_one_line_adopt_one_plane_but_side_by_side_walls_do_not() {
                 maximum_collapsed_edge: 0.05 * scale,
                 ..Default::default()
             };
-            let (topology, mesh) = run_with(
-                wall_line_source(false),
-                scale,
-                rotated,
-                Some(features.clone()),
-            );
+            let (topology, mesh) =
+                run_with(wall_line_source(0), scale, rotated, Some(features.clone()));
             let aligned = &topology.stacked_walls.aligned;
             assert_eq!(aligned.len(), 1, "{:?}", topology.stacked_walls.kept);
             assert_eq!(aligned[0].reason, "aligned_wall_line");
@@ -846,14 +842,23 @@ fn walls_in_one_line_adopt_one_plane_but_side_by_side_walls_do_not() {
                 }
             }
 
-            let (topology, _) = run_with(wall_line_source(true), scale, rotated, Some(features));
-            assert!(topology.stacked_walls.aligned.is_empty());
-            assert!(!topology.stacked_walls.kept.is_empty());
-            assert!(topology
-                .stacked_walls
-                .kept
-                .iter()
-                .all(|k| k.reason == "overlapping_parallel_walls"));
+            // Side by side over 1 m, or only a 25 mm strip where the ends
+            // overlap: aligned, the walls would overlap in one plane.
+            for lap in [40, 1] {
+                let (topology, _) = run_with(
+                    wall_line_source(lap),
+                    scale,
+                    rotated,
+                    Some(features.clone()),
+                );
+                assert!(topology.stacked_walls.aligned.is_empty(), "lap {lap}");
+                assert!(!topology.stacked_walls.kept.is_empty());
+                assert!(topology
+                    .stacked_walls
+                    .kept
+                    .iter()
+                    .all(|k| k.reason.starts_with("overlapping_parallel_walls")));
+            }
         }
     }
 }

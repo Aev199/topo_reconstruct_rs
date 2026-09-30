@@ -503,36 +503,55 @@ pub(super) fn align_lines(
             })
             .collect()
     };
-    // Material overlap: an element centre of one patch strictly inside an
-    // element of the other (both projected into the common plane).
-    let overlap = |a: usize, b: usize, plane: &PlaneFrame| {
+    // Material overlap in the common plane: intersections of the convex
+    // element polygons of both patches. Returns the overlap area and its
+    // width along the wall line (a strip at touching ends is narrow; walls
+    // side by side overlap along their length).
+    let overlap = |a: usize, b: usize, plane: &PlaneFrame| -> (f64, f64) {
         let (pa, pb) = (polygons(a, plane), polygons(b, plane));
-        let inside = |q: [f64; 2], poly: &[[f64; 2]]| {
-            let mut c = false;
-            for i in 0..poly.len() {
-                let (u, v) = (poly[i], poly[(i + 1) % poly.len()]);
-                if (u[1] > q[1]) != (v[1] > q[1])
-                    && q[0] < u[0] + (q[1] - u[1]) * (v[0] - u[0]) / (v[1] - u[1])
-                {
-                    c = !c;
+        let t3 = normal(plane).cross(up);
+        let o = plane.project([0., 0., 0.]);
+        let t = plane.project(t3.to_array());
+        let t = [t[0] - o[0], t[1] - o[1]];
+        let bbox = |p: &[[f64; 2]]| {
+            p.iter().fold(
+                [
+                    f64::INFINITY,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    f64::NEG_INFINITY,
+                ],
+                |b, q| {
+                    [
+                        b[0].min(q[0]),
+                        b[1].min(q[1]),
+                        b[2].max(q[0]),
+                        b[3].max(q[1]),
+                    ]
+                },
+            )
+        };
+        let boxes: Vec<_> = pb.iter().map(|p| bbox(p)).collect();
+        let (mut area, mut lo, mut hi) = (0., f64::INFINITY, f64::NEG_INFINITY);
+        for p in &pa {
+            let bp = bbox(p);
+            for (q, bq) in pb.iter().zip(&boxes) {
+                if bp[0] >= bq[2] || bq[0] >= bp[2] || bp[1] >= bq[3] || bq[1] >= bp[3] {
+                    continue;
+                }
+                let c = clip(p, q);
+                let x = polygon_area(&c);
+                if x > policy.precision * policy.precision {
+                    area += x;
+                    for v in &c {
+                        let s = v[0] * t[0] + v[1] * t[1];
+                        lo = f64::min(lo, s);
+                        hi = f64::max(hi, s);
+                    }
                 }
             }
-            c
-        };
-        let centre = |poly: &[[f64; 2]]| {
-            let k = poly.len() as f64;
-            let s = poly
-                .iter()
-                .fold([0., 0.], |s, p| [s[0] + p[0], s[1] + p[1]]);
-            [s[0] / k, s[1] / k]
-        };
-        let hit = |from: &[Vec<[f64; 2]>], into: &[Vec<[f64; 2]>]| {
-            from.iter().any(|p| {
-                let q = centre(p);
-                into.iter().any(|poly| inside(q, poly))
-            })
-        };
-        hit(&pa, &pb) || hit(&pb, &pa)
+        }
+        (area, if area > 0. { hi - lo } else { 0. })
     };
     let mut pairs: Vec<(f64, usize, usize, Vec<usize>)> = vec![];
     for (&(a, b), [ca, cb]) in &contacts {
@@ -564,8 +583,12 @@ pub(super) fn align_lines(
             source_elements: source.surfaces[u].source_elements.clone(),
             reason: String::new(),
         };
-        if overlap(u, l, &planes[l]) {
-            entry.reason = "overlapping_parallel_walls".into();
+        // Walls whose material overlaps in the common plane are never
+        // merged: side by side over their length, or only a strip where the
+        // ends overlap (no later stage removes a coplanar overlap).
+        let (area, width) = overlap(u, l, &planes[l]);
+        if width > policy.precision {
+            entry.reason = format!("overlapping_parallel_walls: area {area:e}, width {width:e}");
             report.kept.push(entry);
             continue;
         }
@@ -623,7 +646,18 @@ pub(super) fn align_lines(
 
 #[cfg(test)]
 mod tests {
-    use super::movement_limit;
+    use super::{clip, movement_limit, polygon_area};
+
+    #[test]
+    fn convex_clip_measures_overlap_in_either_orientation() {
+        let a = [[0., 0.], [2., 0.], [2., 3.], [0., 3.]];
+        let b = [[1.98, 0.], [4., 0.], [4., 3.], [1.98, 3.]];
+        assert!((polygon_area(&clip(&a, &b)) - 0.06).abs() < 1e-12);
+        let reversed: Vec<_> = b.iter().rev().copied().collect();
+        assert!((polygon_area(&clip(&a, &reversed)) - 0.06).abs() < 1e-12);
+        let apart = [[2., 0.], [4., 0.], [4., 3.], [2., 3.]];
+        assert!(polygon_area(&clip(&a, &apart)) < 1e-12);
+    }
 
     #[test]
     fn limit_grows_with_distinct_aligned_structures_only() {
@@ -638,4 +672,50 @@ mod tests {
         assert_eq!(k, 2);
         assert!((limit - 0.05 * 2f64.sqrt()).abs() < 1e-15);
     }
+}
+
+/// Area of a simple polygon (absolute).
+fn polygon_area(p: &[[f64; 2]]) -> f64 {
+    (0..p.len())
+        .map(|i| {
+            let (a, b) = (p[i], p[(i + 1) % p.len()]);
+            a[0] * b[1] - a[1] * b[0]
+        })
+        .sum::<f64>()
+        .abs()
+        / 2.
+}
+
+/// Intersection of two convex polygons (Sutherland-Hodgman).
+fn clip(subject: &[[f64; 2]], window: &[[f64; 2]]) -> Vec<[f64; 2]> {
+    let signed: f64 = (0..window.len())
+        .map(|i| {
+            let (a, b) = (window[i], window[(i + 1) % window.len()]);
+            a[0] * b[1] - a[1] * b[0]
+        })
+        .sum();
+    let orientation = signed.signum();
+    let mut out = subject.to_vec();
+    for i in 0..window.len() {
+        if out.is_empty() {
+            break;
+        }
+        let (a, b) = (window[i], window[(i + 1) % window.len()]);
+        let side = |p: [f64; 2]| {
+            orientation * ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]))
+        };
+        let input = std::mem::take(&mut out);
+        for k in 0..input.len() {
+            let (p, q) = (input[k], input[(k + 1) % input.len()]);
+            let (sp, sq) = (side(p), side(q));
+            if sp >= 0. {
+                out.push(p);
+            }
+            if (sp >= 0.) != (sq >= 0.) {
+                let r = sp / (sp - sq);
+                out.push([p[0] + (q[0] - p[0]) * r, p[1] + (q[1] - p[1]) * r]);
+            }
+        }
+    }
+    out
 }

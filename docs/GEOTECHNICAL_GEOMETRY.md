@@ -945,3 +945,26 @@ stack was kept before. Stacked walls aligned 28 -> 29, walls in one line
 
 All four pass the assembly checker and the strict extended audit; trial
 mesh minimum angles unchanged.
+
+## Audit fixes of 365464e, 2026-09-30
+
+1. A rejected gap closure left bar references changed: the merge had
+   already redirected bar ends, anchors and point contacts before the whole
+   operation was checked against the tolerance (a bar end re-pointed to a
+   slab corner 53.9 mm away while its vertex stayed). Gap closure is now
+   atomic: bar axes and contacts are restored whenever the operation is
+   rejected. Regression: `rejected_closure_leaves_bar_references_unchanged`
+   (fails without the restore with exactly the audited endpoints).
+2. The wall-line overlap test used element centres and missed partial
+   overlaps (ends overlapping by a 20 mm strip, 0.06 m2). It now intersects
+   the convex element polygons of both walls in the common plane and
+   rejects any overlap wider than the model precision along the wall line
+   (`overlapping_parallel_walls: area, width`). A probe showed that the
+   later stages do not remove such a strip with default settings either
+   (strict audit: coplanar overlap), so no overlap is tolerated. Probes of
+   0 / 20 mm end overlap, default and with edge collapse, wall-end snap and
+   console trimming disabled, all pass the strict audit. Regressions: the
+   wall-line test now includes a 25 mm end overlap; a unit test of the
+   convex clip.
+
+Private fixtures: outputs identical to 365464e (no end overlaps there).

@@ -330,6 +330,9 @@ pub fn close(
                 continue;
             }
             let _ = (g.height, g.outside);
+            // The operation is atomic: a merge redirects bar ends, anchors and
+            // point contacts, which are restored if it is rejected.
+            let saved = (bars.axes.clone(), bars.contacts.clone());
             let closed = close_one(model, bars, v, s, tolerance, fixed, &origin).and_then(
                 |(trial, kind, movement)| {
                     // Whole operation within the tolerance: the closed vertex
@@ -372,13 +375,16 @@ pub fn close(
                         movement,
                     });
                 }
-                Err(reason) => report.rejected.push(Rejected {
-                    vertex: v,
-                    source_node: source_nodes.get(v).copied(),
-                    surface: s,
-                    gap: g.distance,
-                    reason,
-                }),
+                Err(reason) => {
+                    (*bars.axes, *bars.contacts) = saved;
+                    report.rejected.push(Rejected {
+                        vertex: v,
+                        source_node: source_nodes.get(v).copied(),
+                        surface: s,
+                        gap: g.distance,
+                        reason,
+                    });
+                }
             }
         }
         if !changed {
@@ -443,6 +449,61 @@ mod tests {
                     .any(|x| x.reason.starts_with("movement_beyond_tolerance")),
                 "{r:?}"
             );
+        }
+    }
+
+    #[test]
+    fn rejected_closure_leaves_bar_references_unchanged() {
+        use super::super::bars::{Anchor, Axis};
+        for place in Placement::all() {
+            // A bar end 44.7 mm from the slab corner material: settling
+            // (40 mm) and merging into the corner reach 53.9 mm in total.
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let end = m.add_vertex(place.point([-0.02, 0.03, 0.04])).unwrap();
+            let top = m.add_vertex(place.point([-0.02, 0.03, 3.])).unwrap();
+            let mut axes = vec![Axis {
+                source_axis: 0,
+                endpoints: [end, top],
+                anchors: vec![
+                    Anchor {
+                        source_node: 1,
+                        vertex: end,
+                        t: 0.,
+                    },
+                    Anchor {
+                        source_node: 2,
+                        vertex: top,
+                        t: 1.,
+                    },
+                ],
+                spans: vec![],
+            }];
+            let mut contacts = vec![];
+            let before = m.vertices.clone();
+            let tolerance = 0.05 * place.scale;
+            let r = close(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut contacts,
+                },
+                tolerance,
+                true,
+                &BTreeSet::new(),
+                &[],
+                &[],
+                f64::INFINITY,
+            );
+            assert!(r.closed.is_empty(), "{r:?}");
+            assert!(
+                r.rejected
+                    .iter()
+                    .any(|x| x.reason.starts_with("movement_beyond_tolerance")),
+                "{r:?}"
+            );
+            assert_eq!(m.vertices, before);
+            assert_eq!(axes[0].endpoints, [end, top]);
+            assert!(axes[0].anchors.iter().map(|a| a.vertex).eq([end, top]));
         }
     }
 
