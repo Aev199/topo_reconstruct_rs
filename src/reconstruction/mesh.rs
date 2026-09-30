@@ -392,11 +392,29 @@ fn build_impl(
                 simplified_nodes.insert(vertex);
             }
         }
+        // A simplified-hole node merged onto another vertex (same point) is
+        // represented by that vertex.
+        let canonical = |n: usize| {
+            simplified_nodes
+                .iter()
+                .copied()
+                .find(|&m| m < n && point(&vertices[m]).distance(point(&vertices[n])) <= eps)
+                .unwrap_or(n)
+        };
+        let simplified_nodes: BTreeSet<usize> =
+            simplified_nodes.iter().map(|&n| canonical(n)).collect();
         nodes.extend(&simplified_nodes);
         for (edge, endpoints) in model.edges.iter().enumerate() {
-            if endpoints.iter().all(|n| simplified_nodes.contains(n)) {
+            if endpoints
+                .iter()
+                .all(|&n| simplified_nodes.contains(&canonical(n)))
+            {
                 for pair in edge_nodes[edge].windows(2) {
-                    let segment = key(pair[0].1, pair[1].1);
+                    let (a, b) = (canonical(pair[0].1), canonical(pair[1].1));
+                    if a == b || point(&vertices[a]).distance(point(&vertices[b])) <= eps {
+                        continue;
+                    }
+                    let segment = key(a, b);
                     constraints.insert(segment);
                     internal_constraint_edges.insert(segment);
                 }
@@ -500,6 +518,7 @@ fn build_impl(
         let mut cdt = ConstrainedDelaunayTriangulation::<Point2<f64>>::new();
         let mut handles = BTreeMap::new();
         let mut global = BTreeMap::new();
+        let mut aliases = BTreeSet::new();
         for n in nodes {
             if plane.distance(vertices[n]).abs() > eps {
                 return Err("nonplanar mesh constraint");
@@ -508,9 +527,19 @@ fn build_impl(
             let h = cdt
                 .insert(Point2::new(uv[0], uv[1]))
                 .map_err(|_| "invalid CDT vertex")?;
-            if global.insert(h.index(), n).is_some() {
+            if let Some(&first) = global.get(&h.index()) {
+                // A simplified-hole node merged onto a vertex already in the
+                // triangulation (same point) is an alias of it.
+                if simplified_nodes.contains(&n)
+                    && point(&vertices[first]).distance(point(&vertices[n])) <= eps
+                {
+                    aliases.insert(n);
+                    handles.insert(n, h);
+                    continue;
+                }
                 return Err("implicit vertex merge in CDT");
             }
+            global.insert(h.index(), n);
             handles.insert(n, h);
         }
         for &[a, b] in &constraints {
@@ -714,7 +743,10 @@ fn build_impl(
         if uses > 0 {
             failures.push(format!("edge_uses {uses}"));
         }
-        let unused: Vec<_> = handles.keys().filter(|n| !used.contains(n)).collect();
+        let unused: Vec<_> = handles
+            .keys()
+            .filter(|n| !used.contains(n) && !aliases.contains(*n))
+            .collect();
         if !unused.is_empty() {
             failures.push(format!(
                 "unused_vertices {} {:?}",

@@ -417,6 +417,13 @@ pub(super) fn synchronize(
                 }
             }
         }
+        if owners[edge_id].is_empty() {
+            // An orphaned edge (left by a merge or a removed crack void) is
+            // meshed only as a simplified-hole constraint; its ends may have
+            // been merged onto one point.
+            edge_nodes.push(chain);
+            continue;
+        }
         sorted(&mut chain, vertices, precision)?;
         let features = sizing.features(edge_id, &owners[edge_id]);
         edge_nodes.push(graded(

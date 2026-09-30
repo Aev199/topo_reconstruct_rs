@@ -356,7 +356,13 @@ def check(data, baseline=None):
                 used = {v for tri in mesh["triangles"] if tri["surface"] == surfaces[0]
                         for v in tri["vertices"]}
                 if mesh["topology_valid"]:
-                    assert all(source_nodes.index(n) in used for n in hole["source_nodes"])
+                    # A node merged onto another vertex is represented by a
+                    # used mesh vertex at the same point.
+                    points = [mesh["vertices"][v] for v in used]
+                    for n in hole["source_nodes"]:
+                        v = source_nodes.index(n)
+                        assert v in used or any(
+                            math.dist(vertices[v], p) <= epsilon for p in points)
 
     return result
 
