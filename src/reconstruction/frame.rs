@@ -148,6 +148,34 @@ fn equation(terms: Vec<(usize, f64)>, origin: ConstraintOrigin) -> Equation {
     }
 }
 
+/// Smallest extent of planar points across their principal direction.
+fn narrowest_extent(points: &[[f64; 2]]) -> f64 {
+    if points.len() < 2 {
+        return 0.;
+    }
+    let n = points.len() as f64;
+    let c = points
+        .iter()
+        .fold([0., 0.], |c, p| [c[0] + p[0] / n, c[1] + p[1] / n]);
+    let (mut sxx, mut syy, mut sxy) = (0., 0., 0.);
+    for p in points {
+        let (x, y) = (p[0] - c[0], p[1] - c[1]);
+        sxx += x * x;
+        syy += y * y;
+        sxy += x * y;
+    }
+    // Minor principal direction of the 2x2 covariance.
+    let angle = 0.5 * (2. * sxy).atan2(sxx - syy) + std::f64::consts::FRAC_PI_2;
+    let (s, co) = angle.sin_cos();
+    let (lo, hi) = points
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| {
+            let t = (p[0] - c[0]) * co + (p[1] - c[1]) * s;
+            (lo.min(t), hi.max(t))
+        });
+    hi - lo
+}
+
 /// Near-coplanar patches may meet at a vertex rather than a full source edge.
 /// Validate the entire connected family, never chain unbounded plane drift.
 fn support_families(mesh: &MeshData, report: &planes::Report) -> Vec<Vec<usize>> {
@@ -157,22 +185,49 @@ fn support_families(mesh: &MeshData, report: &planes::Report) -> Vec<Vec<usize>>
             owners.entry(n).or_default().push(i);
         }
     }
+    // Narrowest in-plane extent of each patch: the normal of a narrow patch
+    // (a triangle 0.1 m wide) is known only to about distance / width.
+    let widths: Vec<f64> = report
+        .patches
+        .iter()
+        .map(|p| {
+            let points: Vec<[f64; 2]> = p
+                .source_nodes
+                .iter()
+                .map(|n| p.plane.project(mesh.nodes[n].to_array()))
+                .collect();
+            narrowest_extent(&points)
+        })
+        .collect();
+    let within = |x: &planes::Patch, y: &planes::Patch| {
+        x.source_nodes
+            .iter()
+            .all(|n| y.plane.distance(mesh.nodes[n].to_array()).abs() <= report.policy.distance)
+    };
+    // Whether patch `i` may lie in a plane of normal `n` although its own
+    // fitted normal differs: always within the recognition angle, beyond it
+    // only as far as its width leaves the normal undetermined.
+    let tilt_allowed = |i: usize, n: DVec3| {
+        let own = DVec3::from_array(report.patches[i].plane.normal);
+        let sin = own.cross(n).length();
+        n.dot(own).abs() >= report.policy.angle.cos() || sin * widths[i] <= report.policy.distance
+    };
     let mut neighbors = vec![BTreeSet::new(); report.patches.len()];
     for ids in owners.values() {
         for (i, &a) in ids.iter().enumerate() {
             for &b in &ids[i + 1..] {
                 let x = &report.patches[a];
                 let y = &report.patches[b];
-                if DVec3::from_array(x.plane.normal)
-                    .dot(DVec3::from_array(y.plane.normal))
-                    .abs()
-                    >= report.policy.angle.cos()
-                    && x.source_nodes.iter().all(|n| {
-                        y.plane.distance(mesh.nodes[n].to_array()).abs() <= report.policy.distance
-                    })
-                    && y.source_nodes.iter().all(|n| {
-                        x.plane.distance(mesh.nodes[n].to_array()).abs() <= report.policy.distance
-                    })
+                let (nx, ny) = (
+                    DVec3::from_array(x.plane.normal),
+                    DVec3::from_array(y.plane.normal),
+                );
+                let parallel = nx.dot(ny).abs() >= report.policy.angle.cos();
+                // A narrow patch whose nodes lie in its neighbour's plane is
+                // coplanar with it even if its fitted normal is off.
+                if (parallel && within(x, y) && within(y, x))
+                    || (tilt_allowed(a, ny) && within(x, y))
+                    || (tilt_allowed(b, nx) && within(y, x))
                 {
                     neighbors[a].insert(b);
                     neighbors[b].insert(a);
@@ -208,11 +263,7 @@ fn support_families(mesh: &MeshData, report: &planes::Report) -> Vec<Vec<usize>>
             points
                 .iter()
                 .all(|p| n.dot(*p - center).abs() <= report.policy.distance)
-                && group.iter().all(|&i| {
-                    n.dot(DVec3::from_array(report.patches[i].plane.normal))
-                        .abs()
-                        >= report.policy.angle.cos()
-                })
+                && group.iter().all(|&i| tilt_allowed(i, n))
         });
         if valid {
             families.push(group.into_iter().collect());
@@ -1849,6 +1900,40 @@ mod tests {
             // With the recognised normals the tilted pair cannot converge.
             let plain = retry_with(&m, &axes, &planes, &policy(), 3, &[], false).unwrap();
             assert_eq!(plain.accepted, !regularized, "tilt {tilt}");
+        }
+    }
+
+    #[test]
+    fn narrow_patch_with_an_ill_defined_normal_joins_its_coplanar_neighbour() {
+        // A wall in x = 0 and a triangle of another stiffness filling a notch
+        // 0.105 m wide: its apex is 3 mm off the wall plane, so its fitted
+        // normal is tilted 1.7 degrees (beyond the recognition angle), yet all
+        // its nodes lie within the plane distance tolerance of the wall.
+        // A 1 m wide panel tilted the same way is a different plane.
+        for (width, grouped) in [(0.105, true), (1., false)] {
+            let mut m = MeshData::default();
+            strip(
+                &mut m,
+                1,
+                1,
+                DVec3::new(0., -2., 0.),
+                DVec3::ZERO,
+                DVec3::Z,
+                4,
+            );
+            // Nodes 9 (y=0, z=0) and 10 (y=0, z=1) are the wall's edge.
+            let apex = DVec3::new(width * 0.0298, width, 1.);
+            m.nodes.insert(100, apex);
+            m.elements.push(ElementData {
+                id: 100,
+                elem_type: 42,
+                stiff_id: 2,
+                nodes: vec![9, 100, 10],
+            });
+            let planes = planes_of(&m, 1.);
+            assert_eq!(planes.patches.len(), 2, "width {width}");
+            let families = support_families(&m, &planes);
+            assert_eq!(families.len() == 1, grouped, "width {width}: {families:?}");
         }
     }
 }

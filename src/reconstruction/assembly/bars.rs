@@ -67,6 +67,104 @@ pub struct Report {
     pub maximum_additional_movement: f64,
     /// No intersection-driven edge subdivision or mesh generation at this stage.
     pub mesh_constraints_complete: bool,
+    /// Surface vertices on a bar axis made anchors of that bar.
+    pub imprinted: Vec<Imprint>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Imprint {
+    pub axis: usize,
+    pub vertex: usize,
+    pub source_node: u32,
+    pub t: f64,
+}
+
+/// A surface vertex lying on a bar axis inside its span (a bar running
+/// along a slab edge from a slab corner, a bar passing a wall corner) is a
+/// shared node: it becomes an anchor of the bar, so the bar and the surface
+/// meet at one vertex instead of an unshared contact. Only vertices with a
+/// source node are imprinted (their identity is the source node).
+pub fn imprint_surface_vertices(
+    model: &Model,
+    axes: &mut [Axis],
+    source_nodes: &[u32],
+) -> Vec<Imprint> {
+    let precision = model.precision;
+    let used: BTreeSet<usize> = (0..model.surfaces.len())
+        .flat_map(|s| model.surface_edges(s).collect::<Vec<_>>())
+        .flat_map(|e| model.edges[e])
+        .filter(|&v| v < source_nodes.len())
+        .collect();
+    let cell = 1.0_f64.max(precision);
+    let key = |p: DVec3| {
+        (
+            (p.x / cell).floor() as i64,
+            (p.y / cell).floor() as i64,
+            (p.z / cell).floor() as i64,
+        )
+    };
+    let mut grid = BTreeMap::<(i64, i64, i64), Vec<usize>>::new();
+    for &v in &used {
+        grid.entry(key(DVec3::from_array(model.vertices[v])))
+            .or_default()
+            .push(v);
+    }
+    let mut out = vec![];
+    for (i, axis) in axes.iter_mut().enumerate() {
+        let a = DVec3::from_array(model.vertices[axis.endpoints[0]]);
+        let b = DVec3::from_array(model.vertices[axis.endpoints[1]]);
+        let d = b - a;
+        let length = d.length();
+        if length <= precision {
+            continue;
+        }
+        let (lo, hi) = (key(a.min(b) - precision), key(a.max(b) + precision));
+        let mut found = vec![];
+        for x in lo.0..=hi.0 {
+            for y in lo.1..=hi.1 {
+                for z in lo.2..=hi.2 {
+                    for &v in grid.get(&(x, y, z)).into_iter().flatten() {
+                        if axis.anchors.iter().any(|x| x.vertex == v) {
+                            continue;
+                        }
+                        let p = DVec3::from_array(model.vertices[v]);
+                        let t = (p - a).dot(d) / (length * length);
+                        if t * length > precision
+                            && (1. - t) * length > precision
+                            && (a + d * t).distance(p) <= precision
+                        {
+                            found.push((t, v));
+                        }
+                    }
+                }
+            }
+        }
+        found.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        found.dedup_by(|x, y| x.1 == y.1);
+        for (t, v) in found {
+            // Not next to an existing anchor (that would be a coincident node).
+            if axis
+                .anchors
+                .iter()
+                .any(|x| (x.t - t).abs() * length <= precision)
+            {
+                continue;
+            }
+            axis.anchors.push(Anchor {
+                source_node: source_nodes[v],
+                vertex: v,
+                t,
+            });
+            out.push(Imprint {
+                axis: i,
+                vertex: v,
+                source_node: source_nodes[v],
+                t,
+            });
+        }
+        axis.anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+    }
+    out
 }
 
 fn polygon(contours: &[Vec<[f64; 2]>]) -> Polygon<f64> {
@@ -756,6 +854,54 @@ mod tests {
         input::ElementData,
         reconstruction::{assembly, planes, recognize},
     };
+
+    #[test]
+    fn surface_corner_on_a_bar_axis_becomes_a_bar_anchor() {
+        use super::super::junctions::tests::{build, slab, Placement};
+        for place in Placement::all() {
+            for (offset, imprinted) in [(0., true), (1e-5, false)] {
+                // A bar from x = -1 to x = 2 passes the slab corner (0, 0, 0)
+                // and runs along its edge; offset by 10 um it only passes by.
+                let mut m = build(&place, &[slab(0., 4.)]);
+                let corner = (0..m.vertices.len())
+                    .find(|&v| {
+                        DVec3::from_array(m.vertices[v])
+                            .distance(DVec3::from_array(place.point([0., 0., 0.])))
+                            < 1e-9 * place.scale
+                    })
+                    .unwrap();
+                let a = m.add_vertex(place.point([-1., offset, 0.])).unwrap();
+                let b = m.add_vertex(place.point([2., offset, 0.])).unwrap();
+                let mut axes = vec![Axis {
+                    source_axis: 0,
+                    endpoints: [a, b],
+                    anchors: vec![
+                        Anchor {
+                            source_node: 1,
+                            vertex: a,
+                            t: 0.,
+                        },
+                        Anchor {
+                            source_node: 2,
+                            vertex: b,
+                            t: 1.,
+                        },
+                    ],
+                    spans: vec![],
+                }];
+                let source_nodes: Vec<u32> =
+                    (0..m.vertices.len() as u32).map(|v| 100 + v).collect();
+                let r = imprint_surface_vertices(&m, &mut axes, &source_nodes);
+                assert_eq!(r.len(), usize::from(imprinted), "{r:?}");
+                if imprinted {
+                    let anchors: Vec<_> = axes[0].anchors.iter().map(|x| x.vertex).collect();
+                    assert_eq!(anchors, vec![a, corner, b]);
+                    assert!((axes[0].anchors[1].t - 1. / 3.).abs() < 1e-9);
+                    assert_eq!(axes[0].anchors[1].source_node, 100 + corner as u32);
+                }
+            }
+        }
+    }
 
     #[test]
     fn axis_leaving_a_boundary_at_a_nearly_collinear_vertex_is_cut_there() {

@@ -1008,3 +1008,31 @@ cut at every contour vertex within precision of the axis. Regression:
 without the cut). The mesh coverage blocker now names the failed condition
 and the first offending edges and vertices. Existing fixtures: identical
 (one cut parameter differs by 1e-12).
+
+"Для testa" (new fixture), two more general rules:
+
+1. Narrow patches: the fitted normal of a narrow patch is known only to
+   about plane distance / width. A single triangle of another stiffness
+   filling a notch 0.105 m wide, 3 mm off the wall plane, had a normal
+   tilted 1.7 degrees (beyond the 1.15-degree recognition angle); as its
+   own support family, the frame pulled all three nodes onto the line
+   where the two nearly equal planes meet (one node moved 99 mm, the notch
+   became a zero-width slit, the wall contour was invalid). Patches sharing
+   nodes now form one support family also when the tilt of one of them
+   times its narrowest in-plane extent is within the plane distance and
+   all its nodes lie within that distance of the other plane; the family
+   fit check uses the same criterion. Regression:
+   `narrow_patch_with_an_ill_defined_normal_joins_its_coplanar_neighbour`
+   (fails without it; a 1 m panel tilted the same way stays separate).
+2. Surface vertices on a bar axis (a bar passing a slab corner and running
+   along its edge) become anchors of the bar (`axis_assembly.imprinted`,
+   vertices with a source node only). Otherwise the bar-surface contact
+   interval started at a generated mesh vertex coinciding with the corner
+   and the trial mesh failed. Regression:
+   `surface_corner_on_a_bar_axis_becomes_a_bar_anchor`.
+
+Existing fixtures: identical outputs. "Для testa" now builds all surfaces
+and its trial mesh; remaining there: a bar crossing a slab without a node,
+two bars lying 73 mm in a surface without contact, a 0.37 um near touch,
+degenerate trial triangles, and bar nodes moved 20 mm by a bar-end merge
+and a gap closure beyond the 5 % bar budget of the assembly checker.

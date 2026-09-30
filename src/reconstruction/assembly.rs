@@ -1176,6 +1176,8 @@ fn assemble_impl(
     };
     timer.lap("short_edges");
     model.refresh_orphaned_edges();
+    axis_assembly.imprinted =
+        bars::imprint_surface_vertices(&model, &mut axis_assembly.axes, &vertex_source_nodes);
     bars::refresh_contacts(&model, &axis_assembly.axes, &mut axis_assembly.contacts);
     Ok(Report {
         policy: policy.clone(),
