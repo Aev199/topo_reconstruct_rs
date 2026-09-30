@@ -332,6 +332,12 @@ fn location(uv: [f64; 2], contours: &[Vec<[f64; 2]>], precision: f64) -> Option<
         .then_some(Location::Interior)
 }
 
+/// Largest turn of a bar whose two ends moved within `budgets` (sum of
+/// both), never less than the recognition `angle`.
+fn allowed_turn(angle: f64, budgets: f64, length: f64) -> f64 {
+    angle.max((budgets / length).min(1.).asin())
+}
+
 /// Clip a coplanar axis to the material, including holes and nonconvex outlines.
 fn intervals(
     a: [f64; 2],
@@ -469,9 +475,16 @@ fn propose(
     } else {
         raw.normalize()
     };
-    if direction.length_squared() < 0.5
-        || direction.dot(reference.normalize()) < source.policy.angle.cos()
-    {
+    // With both ends fixed by accepted geometry the chord turns by what
+    // their accepted movements allow: a short bar whose ends moved within
+    // their budgets may turn beyond the recognition angle.
+    let allowed = if fixed.len() >= 2 {
+        let budgets = movement_budget(mesh, source, i) + movement_budget(mesh, source, j);
+        allowed_turn(source.policy.angle, budgets, reference_length)
+    } else {
+        source.policy.angle
+    };
+    if direction.length_squared() < 0.5 || direction.dot(reference.normalize()) < allowed.cos() {
         return fail("axis_direction_conflict", ends.to_vec());
     }
     let mut origin = if let Some((_, p)) = fixed.first() {
@@ -988,6 +1001,18 @@ mod tests {
         input::ElementData,
         reconstruction::{assembly, planes, recognize},
     };
+
+    #[test]
+    fn short_bar_may_turn_as_far_as_its_end_budgets_allow() {
+        let angle = 0.02;
+        // A long bar: the recognition angle governs.
+        assert_eq!(allowed_turn(angle, 0.01, 10.), angle);
+        // A 164 mm bar whose ends may move 8.2 mm each: about 5.7 degrees.
+        let turn = allowed_turn(angle, 2. * 0.05 * 0.164, 0.164);
+        assert!((turn - 0.1f64.asin()).abs() < 1e-12 && turn > 2.3f64.to_radians());
+        // Budgets beyond the length never exceed a right angle.
+        assert_eq!(allowed_turn(angle, 1., 0.1), std::f64::consts::FRAC_PI_2);
+    }
 
     #[test]
     fn bar_passing_through_a_slab_shares_a_crossing_vertex() {

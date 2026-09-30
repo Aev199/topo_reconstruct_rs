@@ -1097,3 +1097,11 @@ Existing fixtures: all audits unchanged; straightening moved 2 / 2 / 20
 vertices by at most 0.73 mm (скала1, тест 5, тест 6), triangle counts
 within 3. "Для testa" now passes the assembly checker and the strict audit;
 remaining there: two bar direction conflicts, trial mesh angles.
+
+Bar assembly: a bar whose both ends are fixed by accepted geometry may turn
+by what the accepted end movements allow, `max(angle, asin((budget_a +
+budget_b) / length))`, instead of the recognition angle only: two short
+bars (164 and 36 mm) of "для testa" turned 2.1-2.3 degrees within their
+budgets and were lost as `axis_direction_conflict`. "Для testa" is now
+fully built (trial mesh valid, external mesher gate passes). Regression:
+`short_bar_may_turn_as_far_as_its_end_budgets_allow`.
