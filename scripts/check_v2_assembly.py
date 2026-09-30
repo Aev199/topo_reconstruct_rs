@@ -205,6 +205,12 @@ def check(data, baseline=None):
     expected_shells = [e for s in frame["surfaces"] for e in s["source_elements"]]
     actual_shells = [e for s in model["surfaces"] for e in s["source_elements"]]
     actual_shells += [e for issue in topology["issues"] for e in issue["source_elements"]]
+    # Regions no wider than a crack are left out with their elements.
+    slivers = topology.get("removed_slivers", [])
+    if slivers:
+        crack = topology["feature_policy"]["maximum_crack_width"]
+        assert all(0 < s["width"] <= crack + 1e-12 for s in slivers)
+    actual_shells += [e for s in slivers for e in s["source_elements"]]
     assert collections.Counter(expected_shells) == collections.Counter(actual_shells)
     assert len(actual_shells) == len(set(actual_shells))
     assert len(model["edges"]) == len(set(tuple(e) for e in model["edges"]))
@@ -260,12 +266,23 @@ def check(data, baseline=None):
     actual_bars += [e for i in bars["issues"] for e in i["source_elements"]]
     actual_bars += [e for c in topology.get("short_bars", {}).get("collapsed", [])
                     for e in c["elements"]]
+    # A bar through exactly the vertices of a kept bar with the same
+    # stiffness sequence is represented once; its elements are reported.
+    duplicates = topology.get("short_bars", {}).get("duplicates", [])
+    actual_bars += [e for d in duplicates for e in d["elements"]]
     assert collections.Counter(expected_bars) == collections.Counter(actual_bars)
     assert len(actual_bars) == len(set(actual_bars))
     collapsed = topology.get("short_bars", {}).get("collapsed", [])
     collapsed_elements = {e for c in collapsed for e in c["elements"]}
     represented = [a["source_axis"] for a in bars["axes"]] + [i["source_axis"] for i in bars["issues"]]
     represented += [c["source_axis"] for c in collapsed if c["removed"]]
+    represented += [d["source_axis"] for d in duplicates]
+    kept_axes = {a["source_axis"]: a for a in bars["axes"]}
+    for d in duplicates:
+        kept = kept_axes[d["kept_source_axis"]]
+        removed = frame["axes"][d["source_axis"]]
+        assert sorted(s["stiffness"] for s in kept["spans"]) == sorted(
+            s["stiffness"] for s in removed["spans"] if s["element"] in d["elements"])
     assert sorted(represented) == list(range(len(frame["axes"])))
     # Generated crossings of a bar with a surface carry no source node; each
     # is reported with its axis and lies on the plane of its surface.

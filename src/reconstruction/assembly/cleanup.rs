@@ -495,11 +495,88 @@ pub struct CollapsedBar {
     pub elements: Vec<u32>,
 }
 
+/// A bar through exactly the vertices of another bar with the same
+/// stiffness sequence (overlapping source bars): represented once.
+#[derive(Debug, Serialize)]
+pub struct DuplicateBar {
+    pub source_axis: usize,
+    pub kept_source_axis: usize,
+    pub elements: Vec<u32>,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct BarCollapseReport {
     pub tolerance: f64,
     pub collapsed: Vec<CollapsedBar>,
     pub rejected: Vec<RejectedMerge>,
+    pub duplicates: Vec<DuplicateBar>,
+}
+
+/// Remove every bar whose anchors are, in order along it, the vertices of
+/// an earlier kept bar (lowest source axis) with the same stiffness sequence.
+/// Contacts of a removed bar go with it; the kept bar carries its own.
+pub fn remove_duplicate_bars(bars: &mut Bars<'_>) -> Vec<DuplicateBar> {
+    let key = |axis: &Axis| {
+        let mut anchors = axis.anchors.clone();
+        anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+        let mut vertices: Vec<usize> = anchors.iter().map(|a| a.vertex).collect();
+        let mut spans = axis.spans.clone();
+        spans.sort_by(|x, y| x.start_t.total_cmp(&y.start_t));
+        let mut stiffness: Vec<u32> = spans.iter().map(|s| s.stiffness).collect();
+        if vertices.first() > vertices.last() {
+            vertices.reverse();
+            stiffness.reverse();
+        }
+        (vertices, stiffness)
+    };
+    let mut order: Vec<usize> = (0..bars.axes.len()).collect();
+    order.sort_by_key(|&k| bars.axes[k].source_axis);
+    let mut kept = std::collections::BTreeMap::new();
+    let mut removed = vec![false; bars.axes.len()];
+    let mut duplicates = vec![];
+    for k in order {
+        let axis = &bars.axes[k];
+        match kept.entry(key(axis)) {
+            std::collections::btree_map::Entry::Vacant(e) => {
+                e.insert(axis.source_axis);
+            }
+            std::collections::btree_map::Entry::Occupied(e) => {
+                removed[k] = true;
+                duplicates.push(DuplicateBar {
+                    source_axis: axis.source_axis,
+                    kept_source_axis: *e.get(),
+                    elements: axis.spans.iter().map(|s| s.element).collect(),
+                });
+            }
+        }
+    }
+    if duplicates.is_empty() {
+        return duplicates;
+    }
+    let mut index = vec![None; bars.axes.len()];
+    let mut next = 0;
+    for (k, gone) in removed.iter().enumerate() {
+        if !gone {
+            index[k] = Some(next);
+            next += 1;
+        }
+    }
+    let mut k = 0;
+    bars.axes.retain(|_| {
+        k += 1;
+        !removed[k - 1]
+    });
+    bars.contacts.retain_mut(|c| {
+        let (Contact::Point { axis, .. } | Contact::Interval { axis, .. }) = c;
+        match index[*axis] {
+            Some(i) => {
+                *axis = i;
+                true
+            }
+            None => false,
+        }
+    });
+    duplicates
 }
 
 /// Axis `i` without `drop`, whose piece to `keep` collapses; `None` when the
@@ -619,36 +696,45 @@ pub fn collapse_short_bars(
             } else {
                 (u, v)
             };
-        let (shortened, elements) = shorten(&bars.axes[i], drop, keep);
-        let source_axis = bars.axes[i].source_axis;
-        let mut axes = bars.axes.clone();
+        // Every bar with this piece between consecutive anchors loses it
+        // (duplicate pieces of coincident bars collapse together).
+        let consecutive = |axis: &Axis| {
+            let mut anchors = axis.anchors.clone();
+            anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+            anchors.windows(2).any(|w| {
+                let pair = (w[0].vertex, w[1].vertex);
+                pair == (drop, keep) || pair == (keep, drop)
+            })
+        };
+        let affected: Vec<usize> = (0..bars.axes.len())
+            .filter(|&k| k == i || consecutive(&bars.axes[k]))
+            .collect();
+        let mut collapsed = vec![];
+        let mut axes = vec![];
+        let mut index = vec![None; bars.axes.len()];
+        for (k, axis) in bars.axes.iter().enumerate() {
+            if !affected.contains(&k) {
+                index[k] = Some(axes.len());
+                axes.push(axis.clone());
+                continue;
+            }
+            let (shortened, elements) = shorten(axis, drop, keep);
+            collapsed.push((k, axis.source_axis, shortened.is_none(), elements));
+            if let Some(axis) = shortened {
+                index[k] = Some(axes.len());
+                axes.push(axis);
+            }
+        }
         let mut contacts: Vec<Contact> = bars
             .contacts
             .iter()
-            .filter(|c| {
-                let axis = match c {
-                    Contact::Point { axis, .. } | Contact::Interval { axis, .. } => *axis,
-                };
-                shortened.is_some() || axis != i
+            .filter_map(|c| {
+                let mut c = c.clone();
+                let (Contact::Point { axis, .. } | Contact::Interval { axis, .. }) = &mut c;
+                *axis = index[*axis]?;
+                Some(c)
             })
-            .cloned()
             .collect();
-        let removed = shortened.is_none();
-        match shortened {
-            Some(axis) => axes[i] = axis,
-            None => {
-                axes.remove(i);
-                for c in contacts.iter_mut() {
-                    match c {
-                        Contact::Point { axis, .. } | Contact::Interval { axis, .. } => {
-                            if *axis > i {
-                                *axis -= 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
         let mut trial = model.clone();
         let result = merge(
             &mut trial,
@@ -666,17 +752,19 @@ pub fn collapse_short_bars(
                 *model = trial;
                 *bars.axes = axes;
                 *bars.contacts = contacts;
-                report.collapsed.push(CollapsedBar {
-                    axis: i,
-                    source_axis,
-                    removed,
-                    dropped: drop,
-                    kept: keep,
-                    dropped_source_node: source_nodes.get(drop).copied(),
-                    kept_source_node: source_nodes.get(keep).copied(),
-                    length: d,
-                    elements,
-                });
+                for (axis, source_axis, removed, elements) in collapsed {
+                    report.collapsed.push(CollapsedBar {
+                        axis,
+                        source_axis,
+                        removed,
+                        dropped: drop,
+                        kept: keep,
+                        dropped_source_node: source_nodes.get(drop).copied(),
+                        kept_source_node: source_nodes.get(keep).copied(),
+                        length: d,
+                        elements,
+                    });
+                }
             }
             Err(reason) => report.rejected.push(RejectedMerge {
                 vertices: [drop, keep],
@@ -885,27 +973,50 @@ pub fn merge_bar_ends(
     };
     let mut tried = BTreeSet::new();
     loop {
-        let mut best: Option<(f64, usize, usize)> = None;
+        // The closest pair of ends of two bars (not ends of one bar), first
+        // in axis order among equals; ends are found through a grid.
+        let cell = tolerance.max(model.precision);
+        let key = |v: usize| model.vertices[v].map(|x| (x / cell).floor() as i64);
+        let mut grid = std::collections::BTreeMap::<[i64; 3], Vec<(usize, usize, usize)>>::new();
         for (i, a) in bars.axes.iter().enumerate() {
-            for b in bars.axes.iter().skip(i + 1) {
-                for &u in &a.endpoints {
-                    for &w in &b.endpoints {
-                        if u == w
-                            || tried.contains(&(u.min(w), u.max(w)))
-                            || a.endpoints.contains(&w)
-                            || b.endpoints.contains(&u)
-                        {
-                            continue;
-                        }
-                        let d = DVec3::from_array(model.vertices[u])
-                            .distance(DVec3::from_array(model.vertices[w]));
-                        if d <= tolerance && best.is_none_or(|x| d < x.0) {
-                            best = Some((d, u, w));
+            for (k, &u) in a.endpoints.iter().enumerate() {
+                grid.entry(key(u)).or_default().push((i, k, u));
+            }
+        }
+        let mut best: Option<(f64, [usize; 4], usize, usize)> = None;
+        for (i, a) in bars.axes.iter().enumerate() {
+            for (k, &u) in a.endpoints.iter().enumerate() {
+                let c = key(u);
+                for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            for &(j, l, w) in grid
+                                .get(&[c[0] + dx, c[1] + dy, c[2] + dz])
+                                .into_iter()
+                                .flatten()
+                            {
+                                let b = &bars.axes[j];
+                                if j <= i
+                                    || u == w
+                                    || tried.contains(&(u.min(w), u.max(w)))
+                                    || a.endpoints.contains(&w)
+                                    || b.endpoints.contains(&u)
+                                {
+                                    continue;
+                                }
+                                let d = DVec3::from_array(model.vertices[u])
+                                    .distance(DVec3::from_array(model.vertices[w]));
+                                let order = [i, j, k, l];
+                                if d <= tolerance && best.is_none_or(|x| (d, order) < (x.0, x.1)) {
+                                    best = Some((d, order, u, w));
+                                }
+                            }
                         }
                     }
                 }
             }
         }
+        let best = best.map(|(d, _, u, w)| (d, u, w));
         let Some((d, u, w)) = best else {
             return report;
         };
@@ -1295,6 +1406,73 @@ mod tests {
             .collapsed
             .is_empty());
         }
+    }
+
+    #[test]
+    fn duplicate_short_pieces_between_the_same_nodes_collapse_together() {
+        // Two beams from different far nodes both end with a 7 mm piece
+        // between the same two nodes (overlapping source bars): the piece
+        // collapses on both at once instead of being rejected as a collapse.
+        for place in Placement::all() {
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            let (a, b) = (v(&mut m, [2., 1., 1.]), v(&mut m, [2.007, 1., 1.]));
+            let (f0, f1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [4., 1., 1.]));
+            let mut axes = vec![
+                spanned([f0, b], &[(f0, 0.), (a, 2. / 2.007), (b, 1.)], 10),
+                spanned([f1, a], &[(f1, 0.), (b, 0.9965), (a, 1.)], 20),
+            ];
+            let mut contacts = vec![];
+            let r = collapse_short_bars(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut contacts,
+                },
+                0.05 * place.scale,
+                &BTreeSet::new(),
+                &[],
+            );
+            assert!(r.rejected.is_empty(), "{:?}", r.rejected);
+            assert_eq!(r.collapsed.len(), 2);
+            assert_eq!(axes.len(), 2);
+            assert!(axes
+                .iter()
+                .all(|a| a.anchors.len() == 2 && a.spans.len() == 1));
+            assert_eq!(axes[0].endpoints[1], axes[1].endpoints[1]);
+        }
+    }
+
+    #[test]
+    fn bar_through_the_vertices_of_another_bar_is_kept_once() {
+        let mut m = build(&Placement::all()[0], &[slab(0., 4.)]);
+        let a = m.add_vertex([0., 1., 1.]).unwrap();
+        let b = m.add_vertex([2., 1., 1.]).unwrap();
+        let c = m.add_vertex([4., 1., 1.]).unwrap();
+        let mut first = spanned([a, b], &[(a, 0.), (b, 1.)], 10);
+        first.source_axis = 5;
+        // Reversed, and with a source axis numbered lower.
+        let mut second = spanned([b, a], &[(b, 0.), (a, 1.)], 20);
+        second.source_axis = 3;
+        let mut other = spanned([b, c], &[(b, 0.), (c, 1.)], 30);
+        other.source_axis = 4;
+        let mut stiffer = spanned([a, b], &[(a, 0.), (b, 1.)], 40);
+        stiffer.source_axis = 6;
+        stiffer.spans[0].stiffness = 2;
+        let mut axes = vec![first, second, other, stiffer];
+        let mut contacts = vec![];
+        let duplicates = remove_duplicate_bars(&mut Bars {
+            axes: &mut axes,
+            contacts: &mut contacts,
+        });
+        assert_eq!(duplicates.len(), 1);
+        assert_eq!(
+            (duplicates[0].source_axis, duplicates[0].kept_source_axis),
+            (5, 3)
+        );
+        assert_eq!(duplicates[0].elements, vec![10]);
+        let left: Vec<usize> = axes.iter().map(|a| a.source_axis).collect();
+        assert_eq!(left, vec![3, 4, 6]);
     }
 
     #[test]

@@ -80,6 +80,7 @@ fn run_with(
             minimum_length: 0.01 * scale,
             residual_tolerance: 1e-8 * scale,
             iterations: 1000,
+            panel_tolerance: 0.,
         },
     )
     .unwrap();
@@ -324,6 +325,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         bar_ends: assembly::cleanup::MergeReport::default(),
         bar_anchors: assembly::cleanup::MergeReport::default(),
         cracks: vec![],
+        removed_slivers: vec![],
         short_edge_merges: assembly::cleanup::MergeReport::default(),
         gaps: assembly::gaps::Report::default(),
         short_bars: assembly::cleanup::BarCollapseReport::default(),
@@ -904,4 +906,64 @@ fn stacked_wall_adopts_axis_of_the_wall_below() {
     // The conservative assembly keeps both walls where the source put them.
     let (topology, _) = run_input(stacked_source(), 1., false);
     assert!(topology.stacked_walls.aligned.is_empty());
+}
+
+/// A 2 m x 2 m slab and, on its edge, a needle triangle of the same
+/// stiffness 2 mm high whose nodes are not slab nodes (a degenerate sliver
+/// of the source mesh).
+fn sliver_source() -> topo_reconstruct_rs::input::MeshData {
+    use topo_reconstruct_rs::input::{ElementData, MeshData};
+    let mut mesh = MeshData::default();
+    for j in 0..3 {
+        for i in 0..3 {
+            mesh.nodes
+                .insert(1 + i + 3 * j, DVec3::new(i as f64, j as f64, 0.));
+        }
+    }
+    for j in 0..2 {
+        for i in 0..2 {
+            let a = 1 + i + 3 * j;
+            mesh.elements.push(ElementData {
+                id: mesh.elements.len() as u32 + 1,
+                elem_type: 44,
+                stiff_id: 1,
+                nodes: vec![a, a + 1, a + 4, a + 3],
+            });
+        }
+    }
+    mesh.nodes.insert(20, DVec3::new(0.2, 2., 0.));
+    mesh.nodes.insert(21, DVec3::new(0.7, 2., 0.));
+    mesh.nodes.insert(22, DVec3::new(0.45, 2.002, 0.));
+    mesh.elements.push(ElementData {
+        id: 5,
+        elem_type: 42,
+        stiff_id: 1,
+        nodes: vec![20, 21, 22],
+    });
+    mesh
+}
+
+#[test]
+fn region_no_wider_than_a_crack_is_removed_with_provenance() {
+    for scale in [0.1, 1., 10.] {
+        for rotated in [false, true] {
+            let features = assembly::FeaturePolicy {
+                maximum_crack_width: 0.01 * scale,
+                ..Default::default()
+            };
+            let (topology, mesh) = run_with(sliver_source(), scale, rotated, Some(features));
+            assert_eq!(topology.removed_slivers.len(), 1);
+            let sliver = &topology.removed_slivers[0];
+            assert_eq!(sliver.source_elements, vec![5]);
+            assert!((sliver.width - 0.002 * scale).abs() < 1e-6 * scale);
+            assert!(sliver.mean_width < sliver.width);
+            assert_eq!(topology.surface_stiffness.len(), 1);
+            assert!(topology.issues.is_empty());
+            assert!(
+                mesh.topology_valid && mesh.source_coverage_complete,
+                "scale={scale} rotated={rotated}: {:?}",
+                mesh.blockers
+            );
+        }
+    }
 }

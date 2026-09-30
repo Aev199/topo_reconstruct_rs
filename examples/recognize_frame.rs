@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         minimum_length: 0.03,
         residual_tolerance: 1e-7,
         iterations,
+        panel_tolerance: 0.,
     };
     if sliding_steps > 0 {
         let result = frame::solve_sliding(&mesh, &axes, &planes, &policy, sliding_steps)?;

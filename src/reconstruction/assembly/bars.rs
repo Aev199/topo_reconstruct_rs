@@ -1163,6 +1163,7 @@ mod tests {
                 minimum_length: 0.03,
                 residual_tolerance: 1e-7,
                 iterations: 100,
+                panel_tolerance: 0.,
             },
         )
         .unwrap()
@@ -1533,6 +1534,7 @@ mod tests {
         let source = frame::Report {
             sliding_parameters: None,
             virtual_incidences: Default::default(),
+            budget_cache: Default::default(),
             regularized_directions: false,
             nonlinear_steps: 0,
             candidate_parameters_valid: true,
@@ -1544,6 +1546,7 @@ mod tests {
                 minimum_length: 0.03,
                 residual_tolerance: 1e-7,
                 iterations: 10,
+                panel_tolerance: 0.,
             },
             accepted: true,
             candidate_constraints_satisfied: true,

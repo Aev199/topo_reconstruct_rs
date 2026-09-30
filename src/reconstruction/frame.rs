@@ -18,6 +18,11 @@ pub struct Policy {
     pub minimum_length: f64,
     pub residual_tolerance: f64,
     pub iterations: usize,
+    /// Two support families sharing a node that their intersection line
+    /// lies farther from than this (nearly parallel walls, one kinked) become
+    /// one panel if all their nodes lie within this of one plane. Zero
+    /// disables.
+    pub panel_tolerance: f64,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Anchor {
@@ -119,6 +124,36 @@ pub struct Report {
     pub short_axis_indices: Vec<usize>,
     /// Gaps closed in the solve by virtual plane incidences.
     pub virtual_incidences: gaps::Report,
+    #[serde(skip)]
+    pub budget_cache: BudgetCache,
+}
+/// Lazily computed per-node movement budgets; a clone starts empty, so a
+/// copied report whose policy or axes are then changed recomputes them.
+#[derive(Debug, Default)]
+pub struct BudgetCache(std::sync::OnceLock<Vec<f64>>);
+impl Clone for BudgetCache {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+impl Report {
+    /// Movement budget of every node: the maximum movement, capped by the
+    /// relative movement of each axis through it. Computed once.
+    pub fn movement_budgets(&self) -> &[f64] {
+        self.budget_cache.0.get_or_init(|| {
+            let mut budgets = vec![self.policy.maximum_movement; self.node_ids.len()];
+            for axis in &self.axes {
+                let [a, b] = axis
+                    .endpoints
+                    .map(|e| DVec3::from_array(self.reference_points[e]));
+                let cap = self.policy.relative_movement * a.distance(b);
+                for anchor in &axis.anchors {
+                    budgets[anchor.node] = budgets[anchor.node].min(cap);
+                }
+            }
+            budgets
+        })
+    }
 }
 struct Equation {
     origin: ConstraintOrigin,
@@ -174,6 +209,102 @@ fn narrowest_extent(points: &[[f64; 2]]) -> f64 {
             (lo.min(t), hi.max(t))
         });
     hi - lo
+}
+
+/// Merge support families whose common nodes cannot lie on one line of
+/// their intersection direction: spread more than `tolerance` across it
+/// (nearly parallel walls, e.g. an upper wall kinked by a few degrees over a
+/// straight lower wall, both through the nodes of the slab edge; the solve
+/// would pull those nodes onto the far kink line). Plane offsets are free
+/// in the solve, so common nodes along one line (a corner) are consistent.
+/// They become one panel when every node of both lies within `tolerance`
+/// of one plane; pairs are taken by the smallest merged deviation first.
+fn merge_kinked_families(
+    mesh: &MeshData,
+    report: &planes::Report,
+    mut families: Vec<Vec<usize>>,
+    tolerance: f64,
+) -> Vec<Vec<usize>> {
+    if tolerance <= 0. {
+        return families;
+    }
+    let points = |members: &[usize]| -> Vec<DVec3> {
+        members
+            .iter()
+            .flat_map(|&i| report.patches[i].source_nodes.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|n| mesh.nodes[&n])
+            .collect()
+    };
+    let plane = |members: &[usize]| -> Option<(DVec3, DVec3, f64)> {
+        let p = points(members);
+        let (n, _) = planes::fit(
+            &p,
+            DVec3::from_array(report.patches[members[0]].plane.normal),
+        )?;
+        let c = p.iter().copied().sum::<DVec3>() / p.len() as f64;
+        let deviation = p.iter().map(|x| n.dot(*x - c).abs()).fold(0., f64::max);
+        Some((n, c, deviation))
+    };
+    loop {
+        let mut owner = vec![0; report.patches.len()];
+        for (f, members) in families.iter().enumerate() {
+            for &i in members {
+                owner[i] = f;
+            }
+        }
+        let fitted: Vec<_> = families.iter().map(|m| plane(m)).collect();
+        let mut node_families = BTreeMap::<u32, BTreeSet<usize>>::new();
+        for (i, p) in report.patches.iter().enumerate() {
+            for &n in &p.source_nodes {
+                node_families.entry(n).or_default().insert(owner[i]);
+            }
+        }
+        let mut common = BTreeMap::<(usize, usize), Vec<DVec3>>::new();
+        for (n, fs) in &node_families {
+            let fs: Vec<usize> = fs.iter().copied().collect();
+            for (k, &f) in fs.iter().enumerate() {
+                for &g in &fs[k + 1..] {
+                    common.entry((f, g)).or_default().push(mesh.nodes[n]);
+                }
+            }
+        }
+        let kinked: Vec<(usize, usize)> = common
+            .into_iter()
+            .filter(|((f, g), nodes)| {
+                let (Some(a), Some(b)) = (fitted[*f], fitted[*g]) else {
+                    return false;
+                };
+                let u = a.0.cross(b.0);
+                if u.length() <= 1e-12 {
+                    return true;
+                }
+                let u = u.normalize();
+                let across: Vec<DVec3> = nodes.iter().map(|p| *p - u * u.dot(*p)).collect();
+                let c = across.iter().copied().sum::<DVec3>() / across.len() as f64;
+                across.iter().any(|q| q.distance(c) > tolerance)
+            })
+            .map(|(pair, _)| pair)
+            .collect();
+        let best = kinked
+            .into_iter()
+            .filter_map(|(f, g)| {
+                let mut union: Vec<usize> =
+                    families[f].iter().chain(&families[g]).copied().collect();
+                union.sort_unstable();
+                let (_, _, deviation) = plane(&union)?;
+                (deviation <= tolerance).then_some((deviation, f, g))
+            })
+            .min_by(|x, y| x.0.total_cmp(&y.0).then((x.1, x.2).cmp(&(y.1, y.2))));
+        let Some((_, f, g)) = best else {
+            return families;
+        };
+        let moved = std::mem::take(&mut families[g]);
+        families[f].extend(moved);
+        families[f].sort_unstable();
+        families.remove(g);
+    }
 }
 
 /// Near-coplanar patches may meet at a vertex rather than a full source edge.
@@ -754,7 +885,12 @@ fn solve_impl(
             spans: a.spans.clone(),
         });
     }
-    let plane_families = support_families(mesh, planes);
+    let plane_families = merge_kinked_families(
+        mesh,
+        planes,
+        support_families(mesh, planes),
+        policy.panel_tolerance,
+    );
     let mut plane_to_family = vec![0; planes.patches.len()];
     let mut normals = vec![];
     let mut pending: Vec<(DVec3, Vec<DVec3>)> = vec![];
@@ -1075,6 +1211,7 @@ fn solve_impl(
         regularized_directions: snap,
         equation_count: equations.len(),
         virtual_incidences: gaps::Report::default(),
+        budget_cache: Default::default(),
     })
 }
 
@@ -1345,6 +1482,7 @@ mod tests {
                         minimum_length: 0.03 * scale,
                         residual_tolerance: 1e-8 * scale,
                         iterations: 2000,
+                        panel_tolerance: 0.,
                     },
                 )
                 .unwrap();
@@ -1432,6 +1570,7 @@ mod tests {
             minimum_length: 0.03,
             residual_tolerance: 1e-8,
             iterations: 2000,
+            panel_tolerance: 0.,
         }
     }
     fn run(m: &MeshData, p: &Policy) -> Report {
@@ -2040,5 +2179,67 @@ mod tests {
         let mut all: Vec<usize> = families.iter().flatten().copied().collect();
         all.sort_unstable();
         assert_eq!(all, vec![0, 1, 2]);
+    }
+
+    /// A straight lower wall (plane y = 0) and, above the slab line z = 0,
+    /// an upper wall that continues it to x = 0 and then kinks by about two
+    /// degrees; the kinked facet shares the slab line node at x = 0.5
+    /// (8 mm off the lower wall) with the lower wall, 50 cm from the kink.
+    fn kinked_upper_wall(transform: impl Fn(DVec3) -> DVec3) -> MeshData {
+        let mut m = MeshData::default();
+        let points = [
+            (1, [-1., 0., -3.]),
+            (2, [0., 0., -3.]),
+            (3, [0.5, 0., -3.]),
+            (4, [-1., 0., 0.]),
+            (5, [0., 0., 0.]),
+            (6, [0.5, 0.008, 0.]),
+            (7, [-1., 0., 3.]),
+            (8, [0., 0., 3.]),
+            (9, [0.5, 0.021, 3.]),
+        ];
+        for (id, p) in points {
+            m.nodes.insert(id, transform(DVec3::from_array(p)));
+        }
+        for (id, stiff, nodes) in [
+            (1, 1, vec![1, 2, 5, 4]),
+            (2, 1, vec![2, 3, 6, 5]),
+            (3, 2, vec![4, 5, 8, 7]),
+            (4, 2, vec![5, 6, 9, 8]),
+        ] {
+            m.elements.push(ElementData {
+                id,
+                elem_type: 44,
+                stiff_id: stiff,
+                nodes,
+            });
+        }
+        m
+    }
+
+    #[test]
+    fn kinked_wall_sharing_nodes_off_the_kink_becomes_one_panel() {
+        let rotation = glam::DQuat::from_axis_angle(DVec3::Z, 0.7);
+        let shift = DVec3::new(30., -12., 4.);
+        for rotated in [false, true] {
+            let transform = |p: DVec3| if rotated { rotation * p + shift } else { p };
+            let mut m = kinked_upper_wall(transform);
+            if rotated {
+                m.elements.reverse();
+            }
+            let planes = planes_of(&m, 1.);
+            assert!(planes.patches.len() >= 2, "{}", planes.patches.len());
+            let mut p = policy();
+            let without = run(&m, &p);
+            assert!(!without.accepted);
+            p.panel_tolerance = 0.05;
+            let with = run(&m, &p);
+            assert!(with.accepted, "{:?}", with.movement_failures);
+            assert_eq!(with.plane_families.len(), 1, "{:?}", with.plane_families);
+            assert!(with.maximum_movement <= 0.05);
+            // A tolerance below the kink deviation keeps the families apart.
+            p.panel_tolerance = 0.002;
+            assert!(run(&m, &p).plane_families.len() > 1);
+        }
     }
 }

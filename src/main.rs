@@ -210,6 +210,13 @@ fn run_v2_preview(
             minimum_length: 0.03,
             residual_tolerance: 1e-7,
             iterations,
+            // Nearly parallel walls through common nodes may be joined into
+            // one panel within the tolerance for aligning walls in one line.
+            panel_tolerance: if preserve_details {
+                0.
+            } else {
+                tolerances.stack_offset
+            },
         },
         3,
         gap_tolerance,

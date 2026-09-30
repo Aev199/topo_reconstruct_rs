@@ -38,6 +38,17 @@ pub struct RejectedElement {
     pub element: u32,
     pub reason: String,
 }
+/// A bar overlapping a shorter collinear bar of the same stiffness from a
+/// shared node: the overlap is represented once, by the shorter bar, and the
+/// longer one starts at the shorter one's far node.
+#[derive(Debug, Clone, Serialize)]
+pub struct MergedOverlap {
+    pub element: u32,
+    pub covered_by: u32,
+    pub shared_node: u32,
+    pub split_node: u32,
+    pub offset: f64,
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub policy: Policy,
@@ -45,6 +56,88 @@ pub struct Report {
     pub rejected: Vec<RejectedElement>,
     pub unmerged_components: Vec<Vec<u32>>,
     pub non_bar_elements: Vec<u32>,
+    pub merged_overlaps: Vec<MergedOverlap>,
+}
+
+/// Replace, until none is left, every bar that runs from a node along a
+/// shorter bar of the same stiffness (the shorter one's far node within the
+/// line tolerance of it, strictly inside) by its part beyond that far node.
+/// Per bar the split nearest its far end is taken first; the fixed point
+/// does not depend on IDs or order.
+fn merge_overlaps(
+    mesh: &MeshData,
+    elements: &mut BTreeMap<u32, ElementData>,
+    policy: &Policy,
+) -> Vec<MergedOverlap> {
+    let mut merged = vec![];
+    loop {
+        let mut adjacency = BTreeMap::<u32, Vec<u32>>::new();
+        for (&id, e) in elements.iter() {
+            for &n in &e.nodes {
+                adjacency.entry(n).or_default().push(id);
+            }
+        }
+        let far = |id: u32, n: u32| {
+            let e = &elements[&id];
+            if e.nodes[0] == n {
+                e.nodes[1]
+            } else {
+                e.nodes[0]
+            }
+        };
+        let mut changes = BTreeMap::<u32, MergedOverlap>::new();
+        for (&a, ids) in &adjacency {
+            let pa = mesh.nodes[&a];
+            for &j in ids {
+                let d = far(j, a);
+                let line = mesh.nodes[&d] - pa;
+                let length = line.length();
+                let dir = line / length;
+                let best = ids
+                    .iter()
+                    .filter(|&&i| i != j && elements[&i].stiff_id == elements[&j].stiff_id)
+                    .filter_map(|&i| {
+                        let b = far(i, a);
+                        let v = mesh.nodes[&b] - pa;
+                        let t = v.dot(dir);
+                        let offset = (v - dir * t).length();
+                        (b != d
+                            && t > policy.numerical_precision
+                            && t < length - policy.numerical_precision
+                            && v.normalize().dot(dir) >= policy.angle.cos()
+                            && offset <= policy.line_tolerance)
+                            .then_some((t, i, b, offset))
+                    })
+                    .max_by(|x, y| {
+                        let (p, q) = (mesh.nodes[&x.2], mesh.nodes[&y.2]);
+                        x.0.total_cmp(&y.0)
+                            .then(p.x.total_cmp(&q.x))
+                            .then(p.y.total_cmp(&q.y))
+                            .then(p.z.total_cmp(&q.z))
+                    });
+                if let Some((_, i, b, offset)) = best {
+                    changes.entry(j).or_insert(MergedOverlap {
+                        element: j,
+                        covered_by: i,
+                        shared_node: a,
+                        split_node: b,
+                        offset,
+                    });
+                }
+            }
+        }
+        if changes.is_empty() {
+            return merged;
+        }
+        for (j, change) in changes {
+            for n in &mut elements.get_mut(&j).unwrap().nodes {
+                if *n == change.shared_node {
+                    *n = change.split_node;
+                }
+            }
+            merged.push(change);
+        }
+    }
 }
 
 /// Connected near-collinear FE paths are accepted only when the whole path fits
@@ -68,9 +161,9 @@ pub fn recognize(mesh: &MeshData, policy: &Policy) -> Result<Report, &'static st
         rejected: vec![],
         unmerged_components: vec![],
         non_bar_elements: vec![],
+        merged_overlaps: vec![],
     };
-    let mut elements = BTreeMap::<u32, &ElementData>::new();
-    let mut adjacency = BTreeMap::<u32, Vec<u32>>::new();
+    let mut owned = BTreeMap::<u32, ElementData>::new();
     let mut incidence = BTreeMap::<u32, Vec<u32>>::new();
     let mut ids = BTreeSet::new();
     for e in &mesh.elements {
@@ -102,14 +195,19 @@ pub fn recognize(mesh: &MeshData, policy: &Policy) -> Result<Report, &'static st
             });
             continue;
         }
-        elements.insert(e.id, e);
-        for &n in &e.nodes {
-            adjacency.entry(n).or_default().push(e.id);
-        }
+        owned.insert(e.id, e.clone());
     }
     for ids in incidence.values_mut() {
         ids.sort_unstable();
         ids.dedup();
+    }
+    report.merged_overlaps = merge_overlaps(mesh, &mut owned, policy);
+    let elements: BTreeMap<u32, &ElementData> = owned.iter().map(|(&id, e)| (id, e)).collect();
+    let mut adjacency = BTreeMap::<u32, Vec<u32>>::new();
+    for (&id, e) in &elements {
+        for &n in &e.nodes {
+            adjacency.entry(n).or_default().push(id);
+        }
     }
     let other = |e: &ElementData, n| {
         if e.nodes[0] == n {
@@ -446,6 +544,66 @@ mod tests {
         }
     }
 
+    #[test]
+    fn bar_overlapping_a_shorter_collinear_bar_is_represented_once() {
+        // From node 1 a 1.7 m bar and a 2.5 m bar of the same stiffness,
+        // the shorter one's far end 4 mm off the longer one; two further
+        // bars continue the longer one. Invariant to transformation, IDs
+        // and order.
+        let points = [
+            [0., 0., 0.],
+            [1.7, 0.004, 0.],
+            [2.5, 0., 0.],
+            [0.8, 0.002, 0.],
+        ];
+        let base = |transform: &dyn Fn(DVec3) -> DVec3, reverse: bool| {
+            let mut m = mesh(&points, &[[1, 2], [1, 3], [1, 4]]);
+            for e in &mut m.elements {
+                e.stiff_id = 7;
+            }
+            for p in m.nodes.values_mut() {
+                *p = transform(*p);
+            }
+            if reverse {
+                m.elements.reverse();
+                for e in &mut m.elements {
+                    e.nodes.reverse();
+                }
+            }
+            recognize(&m, &policy()).unwrap()
+        };
+        let rotation = glam::DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.9);
+        for (transform, reverse) in [
+            (&(|p| p) as &dyn Fn(DVec3) -> DVec3, false),
+            (&(|p| rotation * p + DVec3::new(10., -5., 2.)), true),
+        ] {
+            let r = base(transform, reverse);
+            assert_eq!(r.axes.len(), 1, "{:?}", r.axes);
+            let axis = &r.axes[0];
+            let mut ends = axis.endpoint_nodes;
+            ends.sort_unstable();
+            assert_eq!(ends, [1, 3]);
+            let mut elements: Vec<_> = axis.spans.iter().map(|s| s.element).collect();
+            elements.sort_unstable();
+            assert_eq!(elements, vec![1, 2, 3]);
+            let merged: BTreeSet<_> = r
+                .merged_overlaps
+                .iter()
+                .map(|m| (m.element, m.covered_by, m.shared_node, m.split_node))
+                .collect();
+            assert_eq!(merged, BTreeSet::from([(1, 3, 1, 4), (2, 1, 1, 2)]));
+        }
+    }
+    #[test]
+    fn overlapping_bars_of_different_stiffness_stay_separate() {
+        let m = mesh(
+            &[[0., 0., 0.], [1., 0., 0.], [2., 0., 0.]],
+            &[[1, 2], [1, 3]],
+        );
+        let r = recognize(&m, &policy()).unwrap();
+        assert!(r.merged_overlaps.is_empty());
+        assert_eq!(r.axes.len(), 2);
+    }
     #[test]
     fn invalid_source_is_accounted_for() {
         let m = mesh(&[[0., 0., 0.], [1., 0., 0.]], &[[1, 2], [1, 1], [2, 9]]);

@@ -70,6 +70,7 @@ type MaterialIndex = (BTreeMap<(i64, i64), Vec<usize>>, Vec<Vec<DVec2>>);
 /// region has no crack. `rings` are the source boundary rings of the region.
 pub fn close(
     mesh: &MeshData,
+    elements: &BTreeMap<u32, &crate::input::ElementData>,
     ids: &[u32],
     rings: &[Vec<u32>],
     plane: &PlaneFrame,
@@ -108,7 +109,6 @@ pub fn close(
         .enumerate()
         .map(|(k, r)| (r.clone(), k == outer))
         .collect();
-    let elements: BTreeMap<_, _> = mesh.elements.iter().map(|e| (e.id, e)).collect();
     let mut owners = BTreeMap::<u32, BTreeSet<u32>>::new();
     let mut facets = BTreeMap::new();
     for id in ids {
@@ -589,9 +589,11 @@ mod tests {
     ) -> (Vec<Vec<u32>>, Option<Closure>, MeshData, PlaneFrame) {
         let (mesh, plane, ids) = mesh(place, quads);
         let precision = 1e-7 * place.scale;
-        let rings = super::super::boundary(&mesh, &ids, &plane, precision).unwrap();
+        let elements: BTreeMap<_, _> = mesh.elements.iter().map(|e| (e.id, e)).collect();
+        let rings = super::super::boundary(&mesh, &elements, &ids, &plane, precision).unwrap();
         match close(
             &mesh,
+            &elements,
             &ids,
             &rings,
             &plane,

@@ -41,6 +41,18 @@ pub struct RegionSplit {
     pub parts: Vec<Vec<u32>>,
 }
 #[derive(Debug, Serialize)]
+pub struct RemovedSliver {
+    pub patch: usize,
+    pub stiffness: u32,
+    pub source_elements: Vec<u32>,
+    pub area: f64,
+    /// Twice the area over the perimeter: the width of a strip, half the
+    /// height of a triangle.
+    pub mean_width: f64,
+    /// Largest smallest extent of a source facet of the region.
+    pub width: f64,
+}
+#[derive(Debug, Serialize)]
 pub struct Report {
     pub policy: Policy,
     /// This stage assembles surface property regions; axes and inter-surface
@@ -83,6 +95,9 @@ pub struct Report {
     pub gaps: gaps::Report,
     /// Region contours rebuilt across cracks of the source mesh.
     pub cracks: Vec<cracks::Closure>,
+    /// Property regions no wider than a crack (degenerate source slivers),
+    /// left out of the geometry (geotechnical).
+    pub removed_slivers: Vec<RemovedSliver>,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -92,11 +107,11 @@ pub struct Report {
 
 fn boundary(
     mesh: &MeshData,
+    elements: &BTreeMap<u32, &crate::input::ElementData>,
     ids: &[u32],
     plane: &PlaneFrame,
     precision: f64,
 ) -> Result<Vec<Vec<u32>>, &'static str> {
-    let elements: BTreeMap<_, _> = mesh.elements.iter().map(|e| (e.id, e)).collect();
     let mut counts = BTreeMap::<[u32; 2], usize>::new();
     for id in ids {
         let e = elements.get(id).ok_or("missing_source_element")?;
@@ -460,16 +475,8 @@ impl Timer {
     }
 }
 
-fn movement_budget(mesh: &MeshData, source: &frame::Report, index: usize) -> f64 {
-    let mut budget = source.policy.maximum_movement;
-    for axis in &source.axes {
-        if axis.anchors.iter().any(|a| a.node == index) {
-            let a = mesh.nodes[&source.node_ids[axis.endpoints[0]]];
-            let b = mesh.nodes[&source.node_ids[axis.endpoints[1]]];
-            budget = budget.min(source.policy.relative_movement * a.distance(b));
-        }
-    }
-    budget
+fn movement_budget(_mesh: &MeshData, source: &frame::Report, index: usize) -> f64 {
+    source.movement_budgets()[index]
 }
 
 /// Apply the crack mouths identified in any region of a patch to the rings
@@ -510,6 +517,50 @@ fn share_crack_mouths(
             }
         }
     }
+}
+
+/// Area, mean width (twice the area over the boundary length) and largest
+/// facet width (the smallest extent of a convex facet, attained across one
+/// of its edges) of a property region; `None` for an invalid facet.
+fn region_width(
+    mesh: &MeshData,
+    elements: &BTreeMap<u32, &crate::input::ElementData>,
+    ids: &[u32],
+    plane: &PlaneFrame,
+    precision: f64,
+) -> Option<(f64, f64, f64)> {
+    let mut area = 0.;
+    let mut widest: f64 = 0.;
+    let mut edges = BTreeMap::<[u32; 2], usize>::new();
+    for id in ids {
+        let ns = planes::ordered_facet_nodes(mesh, elements.get(id)?, plane, precision)?;
+        area += ring_area(&ns, plane, |n| mesh.nodes[&n].to_array());
+        let uv: Vec<[f64; 2]> = ns
+            .iter()
+            .map(|n| plane.project(mesh.nodes[n].to_array()))
+            .collect();
+        let width = (0..uv.len())
+            .map(|i| {
+                let (a, b) = (uv[i], uv[(i + 1) % uv.len()]);
+                let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+                let length = dx.hypot(dy);
+                uv.iter()
+                    .map(|p| ((p[0] - a[0]) * dy - (p[1] - a[1]) * dx).abs() / length)
+                    .fold(0., f64::max)
+            })
+            .fold(f64::INFINITY, f64::min);
+        widest = widest.max(width);
+        for i in 0..ns.len() {
+            let (a, b) = (ns[i], ns[(i + 1) % ns.len()]);
+            *edges.entry([a.min(b), a.max(b)]).or_default() += 1;
+        }
+    }
+    let perimeter: f64 = edges
+        .iter()
+        .filter(|(_, &count)| count == 1)
+        .map(|([a, b], _)| mesh.nodes[a].distance(mesh.nodes[b]))
+        .sum();
+    (perimeter > 0.).then(|| (area, 2. * area / perimeter, widest))
 }
 
 fn ring_area(ring: &[u32], plane: &PlaneFrame, point: impl Fn(u32) -> [f64; 3]) -> f64 {
@@ -594,18 +645,43 @@ fn assemble_impl(
     let mut rings = BTreeMap::new();
     let mut pinched_region_splits = vec![];
     let mut timer = Timer::new();
-    let regions = property_regions(mesh, source, policy.precision, &mut pinched_region_splits)?;
+    let mut regions = property_regions(mesh, source, policy.precision, &mut pinched_region_splits)?;
+    // A region no wider than a crack, facet by facet and on average, is a
+    // degenerate sliver of the source mesh (needle triangles along a line),
+    // not a structure.
+    let elements: BTreeMap<_, _> = mesh.elements.iter().map(|e| (e.id, e)).collect();
+    let mut removed_slivers = vec![];
+    if let Some(width) = features.map(|f| f.maximum_crack_width).filter(|&w| w > 0.) {
+        regions.retain(|(patch, stiffness, ids)| {
+            let plane = &source.candidate_planes[*patch];
+            match region_width(mesh, &elements, ids, plane, policy.precision) {
+                Some((area, mean, widest)) if mean <= width && widest <= width => {
+                    removed_slivers.push(RemovedSliver {
+                        patch: *patch,
+                        stiffness: *stiffness,
+                        source_elements: ids.clone(),
+                        area,
+                        mean_width: mean,
+                        width: widest,
+                    });
+                    false
+                }
+                _ => true,
+            }
+        });
+    }
     timer.lap("property_regions");
     let mut cracks = vec![];
     for (i, (patch, _, ids)) in regions.iter().enumerate() {
         let plane = &source.candidate_planes[*patch];
-        let result = boundary(mesh, ids, plane, policy.precision).map(|r| {
+        let result = boundary(mesh, &elements, ids, plane, policy.precision).map(|r| {
             // A crack of the source mesh is left out of the region contour.
             let closed = features
                 .filter(|f| f.maximum_crack_width > 0.)
                 .and_then(|f| {
                     cracks::close(
                         mesh,
+                        &elements,
                         ids,
                         &r,
                         plane,
@@ -1154,6 +1230,11 @@ fn assemble_impl(
         ),
         _ => cleanup::BarCollapseReport::default(),
     };
+    let mut short_bars = short_bars;
+    short_bars.duplicates = cleanup::remove_duplicate_bars(&mut cleanup::Bars {
+        axes: &mut axis_assembly.axes,
+        contacts: &mut axis_assembly.contacts,
+    });
     let (_, _, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
     let gaps = match features {
@@ -1317,6 +1398,7 @@ fn assemble_impl(
         bar_anchors,
         short_edge_merges,
         short_bars,
+        removed_slivers,
         gaps,
         cracks,
         issues,
@@ -1362,6 +1444,7 @@ mod tests {
                 minimum_length: 0.03,
                 residual_tolerance: 1e-7,
                 iterations: 100,
+                panel_tolerance: 0.,
             },
         )
         .unwrap()
@@ -1516,7 +1599,13 @@ mod tests {
         let f = planar_frame(&mesh, DVec3::Z);
         let ids: Vec<_> = mesh.elements.iter().map(|e| e.id).collect();
         assert_eq!(
-            boundary(&mesh, &ids, &f.candidate_planes[0], 1e-7),
+            boundary(
+                &mesh,
+                &mesh.elements.iter().map(|e| (e.id, e)).collect(),
+                &ids,
+                &f.candidate_planes[0],
+                1e-7
+            ),
             Err("ambiguous_boundary")
         );
         let base = assemble(&mesh, &f, &policy).unwrap();
@@ -2144,7 +2233,14 @@ mod tests {
         }
         let plane = PlaneFrame::new([0., 0., 7.], [0., 0., 1.]).unwrap();
         let ids: Vec<_> = mesh.elements.iter().map(|e| e.id).collect();
-        let original = boundary(&mesh, &ids, &plane, 1e-8).unwrap();
+        let original = boundary(
+            &mesh,
+            &mesh.elements.iter().map(|e| (e.id, e)).collect(),
+            &ids,
+            &plane,
+            1e-8,
+        )
+        .unwrap();
         assert_eq!(original.len(), 2);
         assert_eq!(
             original.iter().map(Vec::len).collect::<BTreeSet<_>>(),
@@ -2153,7 +2249,17 @@ mod tests {
         for e in &mut mesh.elements {
             e.nodes.swap(2, 3);
         }
-        assert_eq!(boundary(&mesh, &ids, &plane, 1e-8).unwrap(), original);
+        assert_eq!(
+            boundary(
+                &mesh,
+                &mesh.elements.iter().map(|e| (e.id, e)).collect(),
+                &ids,
+                &plane,
+                1e-8
+            )
+            .unwrap(),
+            original
+        );
         let mut model = Model::new(1e-8, 0.01).unwrap();
         let p = model.add_plane(plane);
         let vertices: BTreeMap<_, _> = mesh
@@ -2239,6 +2345,7 @@ mod tests {
                 minimum_length: 0.03,
                 residual_tolerance: 1e-7,
                 iterations: 100,
+                panel_tolerance: 0.,
             },
         )
         .unwrap();
