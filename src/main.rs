@@ -220,7 +220,9 @@ fn run_v2_preview(
             // A short bar lying in a wall or slab follows its plane.
             flatten_short_axes: !preserve_details,
         },
-        3,
+        // Doubling iteration budgets: 1, 2, 4 and 8 times the base (a
+        // curved-wall model needed about 4800 iterations).
+        4,
         gap_tolerance,
         0.001,
     )?;

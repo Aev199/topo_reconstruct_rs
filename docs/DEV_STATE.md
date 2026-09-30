@@ -1,6 +1,6 @@
 # Development state
 
-Updated: 2026-09-29
+Updated: 2026-09-30
 Repository baseline reviewed through the surface-junction batch (see git log).
 
 This file is intentionally short. It is the entry point for the next development
@@ -65,15 +65,24 @@ PLAXIS (`docs/GEOTECHNICAL_GEOMETRY.md`, "PLAXIS profile"):
 size of 0.5 m. типовая секция and тест 5 pass it. Remaining:
 
 New fixtures (2026-09-30): test slab, АЖТ tests, скала seismic and "для
-testa" build fully (assembly checker, strict audit, trial mesh). Open:
+testa" build fully (assembly checker, strict audit, trial mesh). Duplicate
+bars, sliver regions and kinked walls are handled by general rules
+(`docs/GEOTECHNICAL_GEOMETRY.md`, 2026-09-30 batch). Open:
 
-- Багратион bedding: main slab builds; open are duplicate collinear bars
-  with equal stiffness (the short one lies on the long one: user decision
-  on merging), 1 mm wide sliver regions overlapping the slab along a seam
-  (user decision: absorb as cracks), two 5 cm sliver fans;
-- ЖК Остров: frame does not converge (residual 0.9 mm) around curved walls
-  made of facets 2 degrees apart, some tilted 0.3-2 degrees from vertical;
-- Багратион v4: runtime (single-threaded stage taking hours; profiling).
+- Багратион bedding: all surfaces build, overlapping bars 8 -> 0, coplanar
+  overlaps 8 -> 0 (17 needle regions <= 6.6 mm removed), trial mesh builds.
+  Open: 18 bars lying in the slab plane along the former seam without a
+  contact (micrometre to 0.5 m), one bar anchor outside its surface, trial
+  mesh angles (external mesher gate still false);
+- ЖК Остров: kinked walls merged into panels, the 175 mm frame movement and
+  all 24 contour issues are gone, the frame converges with an 8x iteration
+  budget (about 4800 iterations, maximum movement 68 mm). Open: trial mesh
+  "constraint crossing requires explicit shared vertex";
+- Багратион v4: runtime hours -> about 9 minutes (quadratic stages
+  removed). Open: frame not accepted (one node of a 32.8 mm bar moves
+  2.1 mm, budget 1.64 mm = 5 % of its length, just above the 30 mm short
+  axis threshold), 24 surface issues, many bars on unbuilt regions. The
+  global geometry audit takes over 30 minutes on it.
 
 Previous fixtures:
 
