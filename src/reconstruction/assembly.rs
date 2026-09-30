@@ -63,6 +63,8 @@ pub struct Report {
     pub consoles: consoles::Report,
     /// Walls aligned to the plane of the wall carrying them (geotechnical).
     pub stacked_walls: stacking::Report,
+    /// Contour vertices moved onto the plane their edge runs along.
+    pub straightened_edges: Vec<cleanup::Straightened>,
     /// Redundant collinear vertices removed at short edges (geotechnical).
     pub short_edges: cleanup::Report,
     /// Duplicated vertices merged before junction insertion (geotechnical).
@@ -1192,6 +1194,18 @@ fn assemble_impl(
     }
     let (interior, locked, fixed) = protected(&model, &axis_assembly);
     timer.lap("gaps");
+    let straightened_edges = if features.is_some() {
+        cleanup::straighten_edges(
+            &mut model,
+            &axis_assembly.axes,
+            policy.minimum_edge,
+            source.policy.angle.sin(),
+            &fixed,
+            &vertex_source_nodes,
+        )
+    } else {
+        vec![]
+    };
     let junctions = junctions::insert(
         &mut model,
         &junctions::Context {
@@ -1270,7 +1284,14 @@ fn assemble_impl(
     timer.lap("short_edges");
     model.refresh_orphaned_edges();
     axis_assembly.imprinted =
-        bars::imprint_surface_vertices(&model, &mut axis_assembly.axes, &vertex_source_nodes);
+        bars::imprint_surface_vertices(&mut model, &mut axis_assembly.axes, &vertex_source_nodes);
+    if features.is_some() {
+        let crossings = bars::imprint_crossings(&mut model, &mut axis_assembly.axes);
+        junctions
+            .generated_vertices
+            .extend(crossings.iter().map(|c| c.vertex));
+        axis_assembly.imprinted.extend(crossings);
+    }
     bars::refresh_contacts(&model, &axis_assembly.axes, &mut axis_assembly.contacts);
     Ok(Report {
         policy: policy.clone(),
@@ -1288,6 +1309,7 @@ fn assemble_impl(
         junctions,
         consoles,
         stacked_walls,
+        straightened_edges,
         short_edges,
         coincident_vertices: coincident,
         wall_ends,

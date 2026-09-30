@@ -12,7 +12,7 @@
 //! geotechnical model is deliberately simplified, and every merge is
 //! recorded with its source nodes.
 use super::bars::{Axis, Contact};
-use crate::reconstruction::Model;
+use crate::reconstruction::{Model, PlaneFrame};
 use glam::DVec3;
 use serde::Serialize;
 use std::collections::BTreeSet;
@@ -208,6 +208,100 @@ pub(super) fn merge(
         }
     }
     Ok(movement)
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Straightened {
+    pub vertex: usize,
+    pub source_node: Option<u32>,
+    /// Surface whose plane the edge runs along.
+    pub along_surface: usize,
+    pub distance: f64,
+}
+
+/// A contour edge running along another surface's plane from one of its
+/// vertices, with the far end off that plane by less than `limit` (a slab
+/// edge continuing a wall base line, 4 um off after the frame solve) is
+/// straightened: the far end moves onto that plane, keeping its own planes.
+/// Otherwise the junction line and the contour edge are two lines
+/// micrometres apart. Only near-collinear edges qualify (offset over length
+/// below `angle`); fixed vertices never move.
+pub(super) fn straighten_edges(
+    model: &mut Model,
+    axes: &[Axis],
+    limit: f64,
+    angle: f64,
+    fixed: &BTreeSet<usize>,
+    source_nodes: &[u32],
+) -> Vec<Straightened> {
+    let mut owners = std::collections::BTreeMap::<usize, BTreeSet<usize>>::new();
+    for s in 0..model.surfaces.len() {
+        for e in model.surface_edges(s).collect::<Vec<_>>() {
+            for v in model.edges[e] {
+                owners.entry(v).or_default().insert(s);
+            }
+        }
+    }
+    let mut out = vec![];
+    let contour: Vec<(usize, usize, usize)> = (0..model.surfaces.len())
+        .flat_map(|s| {
+            model.surfaces[s]
+                .boundaries
+                .iter()
+                .flatten()
+                .map(move |u| (s, u.edge))
+                .collect::<Vec<_>>()
+        })
+        .flat_map(|(s, e)| {
+            let [a, b] = model.edges[e];
+            [(s, a, b), (s, b, a)]
+        })
+        .collect();
+    for (s, a, b) in contour {
+        if fixed.contains(&b) {
+            continue;
+        }
+        let (pa, pb) = (
+            DVec3::from_array(model.vertices[a]),
+            DVec3::from_array(model.vertices[b]),
+        );
+        let length = pa.distance(pb);
+        let own_b = owners.get(&b).cloned().unwrap_or_default();
+        let normal_s = DVec3::from_array(model.planes[model.surfaces[s].plane].normal);
+        for &w in owners.get(&a).into_iter().flatten() {
+            if own_b.contains(&w) {
+                continue;
+            }
+            let plane_w = model.planes[model.surfaces[w].plane].clone();
+            if DVec3::from_array(plane_w.normal).cross(normal_s).length() < 1e-9 {
+                continue;
+            }
+            let d = plane_w.distance(pb.to_array()).abs();
+            if d <= model.precision || d >= limit || d > length * angle {
+                continue;
+            }
+            let mut planes: Vec<PlaneFrame> = own_b
+                .iter()
+                .map(|&u| model.planes[model.surfaces[u].plane].clone())
+                .collect();
+            planes.push(plane_w);
+            let refs: Vec<&PlaneFrame> = planes.iter().collect();
+            let Some(q) = super::intersection(pb, &refs, model.precision) else {
+                continue;
+            };
+            if q.distance(pb) >= limit || move_with_axes(model, axes, b, q, limit).is_err() {
+                continue;
+            }
+            out.push(Straightened {
+                vertex: b,
+                source_node: source_nodes.get(b).copied(),
+                along_surface: w,
+                distance: q.distance(pb),
+            });
+            break;
+        }
+    }
+    out
 }
 
 /// Merge distinct vertices closer than `tolerance` (duplicated source nodes).
@@ -1631,6 +1725,55 @@ mod tests {
             let r = remove_short_edges(&mut m, 0.05 * place.scale, &BTreeSet::new(), &[]);
             assert!(r.removed.is_empty());
             assert_eq!(before, serde_json::to_string(&m).unwrap());
+        }
+    }
+
+    #[test]
+    fn slab_edge_continuing_a_wall_base_is_straightened_onto_the_wall_plane() {
+        use super::super::junctions::tests::{build, Placement};
+        for place in Placement::all() {
+            for (off, straightened) in [(4e-6, true), (0.002, false)] {
+                // A wall in x = 0 over y 0..1 stands on a slab whose edge
+                // continues the wall base to y = 3, its far end `off` away.
+                let wall = (
+                    vec![vec![[0., 0., 0.], [0., 1., 0.], [0., 1., 1.], [0., 0., 1.]]],
+                    [1., 0., 0.],
+                );
+                let slab = (
+                    vec![vec![
+                        [0., 0., 0.],
+                        [0., 1., 0.],
+                        [off, 3., 0.],
+                        [4., 3., 0.],
+                        [4., 0., 0.],
+                    ]],
+                    [0., 0., 1.],
+                );
+                let mut m = build(&place, &[wall, slab]);
+                let far = (0..m.vertices.len())
+                    .find(|&v| {
+                        DVec3::from_array(m.vertices[v])
+                            .distance(DVec3::from_array(place.point([off, 3., 0.])))
+                            < 1e-9 * place.scale
+                    })
+                    .unwrap();
+                let r = straighten_edges(
+                    &mut m,
+                    &[],
+                    0.001 * place.scale,
+                    0.02,
+                    &BTreeSet::new(),
+                    &[],
+                );
+                assert_eq!(r.len(), usize::from(straightened), "off {off}: {r:?}");
+                let wall_plane = &m.planes[m.surfaces[0].plane];
+                let d = wall_plane.distance(m.vertices[far]).abs();
+                if straightened {
+                    assert!(d <= m.precision, "{d}");
+                } else {
+                    assert!(d > 0.0019 * place.scale);
+                }
+            }
         }
     }
 }

@@ -1064,3 +1064,36 @@ and quads, 2146 bars, 325 point elements), three more general rules:
 Existing fixtures identical. Remaining in this fixture: two sliver fans
 (5 cm wide) whose contour pinches after a crack mouth identification, and
 a trial mesh with coinciding constraint vertices.
+
+"Для testa" and ЖК Остров (new fixtures), bar and micro-offset rules:
+
+1. Bar crossings: a bar passing through a surface inside its material
+   (away from its anchors and from surface vertices by the minimum edge)
+   shares a generated vertex with it (`axis_assembly.imprinted`, kind
+   `crossing`, anchor source node `NO_SOURCE_NODE` = 4294967295); a
+   crossing on a contour or junction edge splits that edge. Geotechnical
+   mode only. The assembly checker accepts such anchors when reported.
+   Regression: `bar_passing_through_a_slab_shares_a_crossing_vertex`.
+2. Surface vertices within the minimum edge of a bar axis (a slab edge
+   1 um off a beam along it, after direction regularisation) move onto the
+   axis when they stay on all their planes (bar nodes never move) and
+   become bar anchors. Regression: the imprint test covers 0 / 10 um / 2 mm.
+3. Gap closure starts at the model precision (was 10 x precision), so
+   sub-micrometre touches between precision and 1 um are closed too.
+4. Contour edges running along another surface's plane from one end (a
+   slab edge continuing a wall base line) are straightened: the far end
+   (within the minimum edge and the recognition angle of the edge) moves
+   onto that plane (`straightened_edges`). Otherwise the junction line and
+   the contour edge were two lines micrometres apart and the trial mesh
+   had degenerate triangles. Regression:
+   `slab_edge_continuing_a_wall_base_is_straightened_onto_the_wall_plane`.
+5. Assembly checker: a node moved by a recorded closure (gap closure,
+   bar/wall end merge) may move by that closure's tolerance beyond its
+   frame budget (5 % of a 150 mm bar forbade closing a 20 mm gap at its
+   end); gap merges record the node merged into (`kept_source_node`) and
+   count as identities.
+
+Existing fixtures: all audits unchanged; straightening moved 2 / 2 / 20
+vertices by at most 0.73 mm (скала1, тест 5, тест 6), triangle counts
+within 3. "Для testa" now passes the assembly checker and the strict audit;
+remaining there: two bar direction conflicts, trial mesh angles.

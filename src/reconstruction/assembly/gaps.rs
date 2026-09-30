@@ -37,6 +37,8 @@ pub struct Closure {
     pub gap: f64,
     /// Movement of the vertex (or of the merged vertex).
     pub movement: f64,
+    /// For "merged": the source node of the vertex it was merged into.
+    pub kept_source_node: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,7 +134,7 @@ fn close_one(
     tolerance: f64,
     fixed: &BTreeSet<usize>,
     origin: &[[f64; 3]],
-) -> Result<(Model, String, f64), String> {
+) -> Result<(Model, String, f64, Option<usize>), String> {
     let mut trial = model.clone();
     let from = DVec3::from_array(model.vertices[v]);
     // Movements are measured from the position before gap closure, so that
@@ -169,12 +171,12 @@ fn close_one(
         let mut merged = trial.clone();
         if cleanup::merge(&mut merged, bars, v, w, tolerance, fixed).is_ok() {
             let reach = DVec3::from_array(merged.vertices[w]).distance(start);
-            return Ok((merged, "merged".into(), reach));
+            return Ok((merged, "merged".into(), reach, Some(w)));
         }
     }
     if outside(&trial, s, plane.project(p.to_array())) <= trial.precision {
         let movement = p.distance(start);
-        return Ok((trial, "settled".into(), movement));
+        return Ok((trial, "settled".into(), movement, None));
     }
     // 2a. Into a nearby contour vertex of the surface.
     let nearest = members
@@ -186,7 +188,7 @@ fn close_one(
         let mut merged = trial.clone();
         if let Ok(movement) = cleanup::merge(&mut merged, bars, v, w, tolerance, fixed) {
             let reach = DVec3::from_array(merged.vertices[w]).distance(start);
-            return Ok((merged, "merged".into(), movement.max(reach)));
+            return Ok((merged, "merged".into(), movement.max(reach), Some(w)));
         }
     }
     // 2b. Onto a nearby contour edge: the vertex slides along its own planes
@@ -241,7 +243,7 @@ fn close_one(
         if cleanup::move_with_axes(&mut moved, bars.axes, v, c, tolerance).is_ok()
             && moved.split_edge(e, v).is_ok()
         {
-            return Ok((moved, "onto_edge".into(), movement));
+            return Ok((moved, "onto_edge".into(), movement, None));
         }
     }
     let Some((_, e)) = nearest_edge else {
@@ -251,7 +253,7 @@ fn close_one(
         .split_edge_within(e, v, tolerance)
         .map_err(|error| format!("bend_{error:?}"))?;
     let movement = p.distance(start);
-    Ok((trial, "bent_edge".into(), movement))
+    Ok((trial, "bent_edge".into(), movement, None))
 }
 
 /// Close gaps narrower than `tolerance` between surface vertices (and bar
@@ -277,7 +279,7 @@ pub fn close(
         })
     };
     let eligible = |model: &Model, v: usize, s: usize, g: &Gap| {
-        g.distance > model.precision * 10.
+        g.distance > model.precision
             && g.distance < tolerance
             && (g.height.abs() <= model.minimum_edge || (offsets && !parallel(model, v, s)))
     };
@@ -334,7 +336,7 @@ pub fn close(
             // point contacts, which are restored if it is rejected.
             let saved = (bars.axes.clone(), bars.contacts.clone());
             let closed = close_one(model, bars, v, s, tolerance, fixed, &origin).and_then(
-                |(trial, kind, movement)| {
+                |(trial, kind, movement, kept)| {
                     // Whole operation within the tolerance: the closed vertex
                     // and every vertex it moved, from their original places.
                     let drift = (0..origin.len().min(trial.vertices.len()))
@@ -358,12 +360,12 @@ pub fn close(
                     } else if total > limit + model.precision {
                         Err(format!("movement_beyond_limit: {total:e}"))
                     } else {
-                        Ok((trial, kind, drift))
+                        Ok((trial, kind, drift, kept))
                     }
                 },
             );
             match closed {
-                Ok((trial, kind, movement)) => {
+                Ok((trial, kind, movement, kept)) => {
                     *model = trial;
                     changed = true;
                     report.closed.push(Closure {
@@ -373,6 +375,7 @@ pub fn close(
                         surface: s,
                         gap: g.distance,
                         movement,
+                        kept_source_node: kept.and_then(|w| source_nodes.get(w).copied()),
                     });
                 }
                 Err(reason) => {

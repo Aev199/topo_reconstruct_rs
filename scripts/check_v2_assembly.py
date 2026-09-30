@@ -177,6 +177,19 @@ def check(data, baseline=None):
     for c in topology.get("short_bars", {}).get("collapsed", []):
         if c["dropped_source_node"] in budget:
             budget[c["dropped_source_node"]] = frame["policy"]["maximum_movement"]
+    # A node moved by a recorded geotechnical closure (a gap closed onto a
+    # surface, a bar or wall end merged onto another structure) may move by
+    # that closure's tolerance beyond its frame budget (5 % of a short bar
+    # would forbid closing a 20 mm gap at its end).
+    features = topology.get("feature_policy") or {}
+    closures = [(c["source_node"], features.get("maximum_gap", 0.))
+                for c in topology.get("gaps", {}).get("closed", [])]
+    for key in ("bar_ends", "wall_ends"):
+        closures += [(m["dropped_source_node"], features.get("maximum_wall_end_snap", 0.))
+                     for m in topology.get(key, {}).get("merged", [])]
+    for n, tolerance in closures:
+        if n in budget:
+            budget[n] = budget[n] + tolerance
     # A node where several aligned structures meet may move by the vector sum
     # of their alignments (sqrt(k) times the limit), as reported.
     limits = {r["source_node"]: r["limit"]
@@ -225,6 +238,11 @@ def check(data, baseline=None):
         for m in topology.get(key, {}).get("merged", []):
             if m["dropped_source_node"] is not None and m["kept_source_node"] is not None:
                 merged[m["dropped_source_node"]] = m["kept_source_node"]
+    # A gap closed by merging a vertex into a surface vertex.
+    for c in topology.get("gaps", {}).get("closed", []):
+        if c["kind"] == "merged" and c.get("source_node") is not None \
+                and c.get("kept_source_node") is not None:
+            merged[c["source_node"]] = c["kept_source_node"]
     # Collapsed short bars: their nodes merge and their elements are reported.
     for c in topology.get("short_bars", {}).get("collapsed", []):
         if c["dropped_source_node"] is not None and c["kept_source_node"] is not None:
@@ -249,7 +267,15 @@ def check(data, baseline=None):
     represented = [a["source_axis"] for a in bars["axes"]] + [i["source_axis"] for i in bars["issues"]]
     represented += [c["source_axis"] for c in collapsed if c["removed"]]
     assert sorted(represented) == list(range(len(frame["axes"])))
-    for axis in bars["axes"]:
+    # Generated crossings of a bar with a surface carry no source node; each
+    # is reported with its axis and lies on the plane of its surface.
+    no_source = 4294967295
+    crossings = {(c["axis"], c["vertex"]): c for c in bars.get("imprinted", [])
+                 if c["kind"] == "crossing"}
+    for (k, v), c in crossings.items():
+        assert c["source_node"] == no_source
+        assert abs(distance(model["surfaces"][c["surface"]], vertices[v])) <= epsilon
+    for k, axis in enumerate(bars["axes"]):
         original = frame["axes"][axis["source_axis"]]
         assert len(axis["endpoints"]) == 2
         a, b = (vertices[v] for v in axis["endpoints"])
@@ -258,10 +284,13 @@ def check(data, baseline=None):
             identity(frame["node_ids"][i]) for i in original["endpoints"]]
         parameters = {}
         for anchor in axis["anchors"]:
-            assert identity(source_nodes[anchor["vertex"]]) == identity(anchor["source_node"])
             assert 0 <= anchor["t"] <= 1
             interpolated = [x + (y - x) * anchor["t"] for x, y in zip(a, b)]
             assert math.dist(interpolated, vertices[anchor["vertex"]]) <= epsilon
+            if anchor["source_node"] == no_source:
+                assert (k, anchor["vertex"]) in crossings
+                continue
+            assert identity(source_nodes[anchor["vertex"]]) == identity(anchor["source_node"])
             parameters[identity(anchor["source_node"])] = anchor["t"]
         original_parameters = {x["t"]: frame["node_ids"][x["node"]] for x in original["anchors"]}
         kept_spans = [s for s in original["spans"] if s["element"] not in collapsed_elements]

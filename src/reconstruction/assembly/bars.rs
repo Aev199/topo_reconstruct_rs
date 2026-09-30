@@ -14,6 +14,8 @@ pub use repair::{Change as BoundaryChange, Repair as BoundaryRepair};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Anchor {
+    /// Source node of the anchor; `NO_SOURCE_NODE` for a generated crossing
+    /// of the bar with a surface (reported in `Report::imprinted`).
     pub source_node: u32,
     pub vertex: usize,
     pub t: f64,
@@ -71,12 +73,127 @@ pub struct Report {
     pub imprinted: Vec<Imprint>,
 }
 
+/// Anchor source node of a generated bar-surface crossing.
+pub const NO_SOURCE_NODE: u32 = u32::MAX;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Imprint {
     pub axis: usize,
     pub vertex: usize,
+    /// `NO_SOURCE_NODE` for a crossing.
     pub source_node: u32,
     pub t: f64,
+    /// `surface_vertex` (a surface vertex on the axis) or `crossing` (the
+    /// bar passes through the surface).
+    pub kind: String,
+    pub surface: Option<usize>,
+}
+
+/// A bar passing through a surface (its axis crosses the surface plane
+/// inside the material, away from its anchors) shares a generated vertex
+/// with it: the vertex becomes an anchor of the bar and, when it falls on a
+/// contour or junction edge of the surface, splits that edge. Crossings
+/// within the minimum edge length of a bar anchor or of a surface vertex are
+/// left alone (they are gaps or near touches, handled elsewhere).
+pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
+    let precision = model.precision;
+    let minimum = model.minimum_edge;
+    let boxes: Vec<(DVec3, DVec3)> = (0..model.surfaces.len())
+        .map(|s| {
+            model
+                .surface_edges(s)
+                .flat_map(|e| model.edges[e])
+                .map(|v| DVec3::from_array(model.vertices[v]))
+                .fold(
+                    (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
+                    |(lo, hi), p| (lo.min(p), hi.max(p)),
+                )
+        })
+        .collect();
+    let mut out = vec![];
+    for i in 0..axes.len() {
+        let [ea, eb] = axes[i].endpoints;
+        let a = DVec3::from_array(model.vertices[ea]);
+        let b = DVec3::from_array(model.vertices[eb]);
+        let d = b - a;
+        let length = d.length();
+        if length <= minimum {
+            continue;
+        }
+        let (lo, hi) = (a.min(b), a.max(b));
+        for s in 0..model.surfaces.len() {
+            let (slo, shi) = boxes[s];
+            if (hi + precision).cmplt(slo).any() || (lo - precision).cmpgt(shi).any() {
+                continue;
+            }
+            let plane = model.planes[model.surfaces[s].plane].clone();
+            let (da, db) = (plane.distance(a.to_array()), plane.distance(b.to_array()));
+            if da.abs() <= precision || db.abs() <= precision || da.signum() == db.signum() {
+                continue;
+            }
+            let t = da / (da - db);
+            let p = a + d * t;
+            let p = p - DVec3::from_array(plane.normal) * plane.distance(p.to_array());
+            if axes[i]
+                .anchors
+                .iter()
+                .any(|x| (x.t - t).abs() * length < minimum)
+            {
+                continue;
+            }
+            let uv = plane.project(p.to_array());
+            let Some(_) = location(uv, &model.surfaces[s].contours, precision) else {
+                continue;
+            };
+            let near_vertex = model
+                .surface_edges(s)
+                .flat_map(|e| model.edges[e])
+                .any(|v| DVec3::from_array(model.vertices[v]).distance(p) < minimum);
+            if near_vertex {
+                continue;
+            }
+            let mut trial = model.clone();
+            let Ok(v) = trial.add_vertex(p.to_array()) else {
+                continue;
+            };
+            // On a contour or junction edge of the surface: split it.
+            let on_edge: Vec<usize> = trial
+                .surface_edges(s)
+                .filter(|&e| {
+                    let [x, y] = trial.edges[e];
+                    let (px, py) = (
+                        DVec3::from_array(trial.vertices[x]),
+                        DVec3::from_array(trial.vertices[y]),
+                    );
+                    let q = py - px;
+                    let u = (p - px).dot(q) / q.length_squared();
+                    u > 0. && u < 1. && (px + q * u).distance(p) <= precision
+                })
+                .collect();
+            if on_edge
+                .iter()
+                .any(|&e| trial.split_edge_within(e, v, precision).is_err())
+            {
+                continue;
+            }
+            *model = trial;
+            axes[i].anchors.push(Anchor {
+                source_node: NO_SOURCE_NODE,
+                vertex: v,
+                t,
+            });
+            axes[i].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+            out.push(Imprint {
+                axis: i,
+                vertex: v,
+                source_node: NO_SOURCE_NODE,
+                t,
+                kind: "crossing".into(),
+                surface: Some(s),
+            });
+        }
+    }
+    out
 }
 
 /// A surface vertex lying on a bar axis inside its span (a bar running
@@ -85,15 +202,23 @@ pub struct Imprint {
 /// meet at one vertex instead of an unshared contact. Only vertices with a
 /// source node are imprinted (their identity is the source node).
 pub fn imprint_surface_vertices(
-    model: &Model,
+    model: &mut Model,
     axes: &mut [Axis],
     source_nodes: &[u32],
 ) -> Vec<Imprint> {
     let precision = model.precision;
+    // A vertex nearly on the axis (within the minimum edge, e.g. a slab
+    // edge 1 um off a beam along it) is moved onto the axis when it stays
+    // on all its planes; bar nodes themselves never move here.
+    let snap = model.minimum_edge;
     let used: BTreeSet<usize> = (0..model.surfaces.len())
         .flat_map(|s| model.surface_edges(s).collect::<Vec<_>>())
         .flat_map(|e| model.edges[e])
         .filter(|&v| v < source_nodes.len())
+        .collect();
+    let bar_nodes: BTreeSet<usize> = axes
+        .iter()
+        .flat_map(|a| a.anchors.iter().map(|x| x.vertex))
         .collect();
     let cell = 1.0_f64.max(precision);
     let key = |p: DVec3| {
@@ -110,28 +235,29 @@ pub fn imprint_surface_vertices(
             .push(v);
     }
     let mut out = vec![];
-    for (i, axis) in axes.iter_mut().enumerate() {
-        let a = DVec3::from_array(model.vertices[axis.endpoints[0]]);
-        let b = DVec3::from_array(model.vertices[axis.endpoints[1]]);
+    for i in 0..axes.len() {
+        let a = DVec3::from_array(model.vertices[axes[i].endpoints[0]]);
+        let b = DVec3::from_array(model.vertices[axes[i].endpoints[1]]);
         let d = b - a;
         let length = d.length();
         if length <= precision {
             continue;
         }
-        let (lo, hi) = (key(a.min(b) - precision), key(a.max(b) + precision));
+        let (lo, hi) = (key(a.min(b) - snap), key(a.max(b) + snap));
         let mut found = vec![];
         for x in lo.0..=hi.0 {
             for y in lo.1..=hi.1 {
                 for z in lo.2..=hi.2 {
                     for &v in grid.get(&(x, y, z)).into_iter().flatten() {
-                        if axis.anchors.iter().any(|x| x.vertex == v) {
+                        if axes[i].anchors.iter().any(|x| x.vertex == v) {
                             continue;
                         }
                         let p = DVec3::from_array(model.vertices[v]);
                         let t = (p - a).dot(d) / (length * length);
-                        if t * length > precision
-                            && (1. - t) * length > precision
-                            && (a + d * t).distance(p) <= precision
+                        let off = (a + d * t).distance(p);
+                        if t * length > snap
+                            && (1. - t) * length > snap
+                            && (off <= precision || (off <= snap && !bar_nodes.contains(&v)))
                         {
                             found.push((t, v));
                         }
@@ -143,14 +269,20 @@ pub fn imprint_surface_vertices(
         found.dedup_by(|x, y| x.1 == y.1);
         for (t, v) in found {
             // Not next to an existing anchor (that would be a coincident node).
-            if axis
+            if axes[i]
                 .anchors
                 .iter()
-                .any(|x| (x.t - t).abs() * length <= precision)
+                .any(|x| (x.t - t).abs() * length <= snap)
             {
                 continue;
             }
-            axis.anchors.push(Anchor {
+            let q = a + d * t;
+            if DVec3::from_array(model.vertices[v]).distance(q) > precision
+                && model.move_vertex(v, q.to_array()).is_err()
+            {
+                continue;
+            }
+            axes[i].anchors.push(Anchor {
                 source_node: source_nodes[v],
                 vertex: v,
                 t,
@@ -160,9 +292,11 @@ pub fn imprint_surface_vertices(
                 vertex: v,
                 source_node: source_nodes[v],
                 t,
+                kind: "surface_vertex".into(),
+                surface: None,
             });
         }
-        axis.anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+        axes[i].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
     }
     out
 }
@@ -856,12 +990,60 @@ mod tests {
     };
 
     #[test]
+    fn bar_passing_through_a_slab_shares_a_crossing_vertex() {
+        use super::super::junctions::tests::{build, slab, Placement};
+        for place in Placement::all() {
+            // Through the material, through the edge x = 0, and past it.
+            for (x, crossing, on_edge) in [(1., true, false), (0., true, true), (-1., false, false)]
+            {
+                let mut m = build(&place, &[slab(0., 4.)]);
+                let before = m.surface_edges(0).count();
+                let a = m.add_vertex(place.point([x, 2., -1.])).unwrap();
+                let b = m.add_vertex(place.point([x, 2., 1.])).unwrap();
+                let mut axes = vec![Axis {
+                    source_axis: 0,
+                    endpoints: [a, b],
+                    anchors: vec![
+                        Anchor {
+                            source_node: 1,
+                            vertex: a,
+                            t: 0.,
+                        },
+                        Anchor {
+                            source_node: 2,
+                            vertex: b,
+                            t: 1.,
+                        },
+                    ],
+                    spans: vec![],
+                }];
+                let r = imprint_crossings(&mut m, &mut axes);
+                assert_eq!(r.len(), usize::from(crossing), "x {x}: {r:?}");
+                if crossing {
+                    let c = &r[0];
+                    assert_eq!((c.kind.as_str(), c.surface), ("crossing", Some(0)));
+                    assert!((c.t - 0.5).abs() < 1e-9);
+                    assert_eq!(axes[0].anchors[1].source_node, NO_SOURCE_NODE);
+                    let p = DVec3::from_array(m.vertices[c.vertex]);
+                    assert!(
+                        p.distance(DVec3::from_array(place.point([x, 2., 0.])))
+                            < 1e-9 * place.scale
+                    );
+                    // On the edge, the contour edge is split at the crossing.
+                    assert_eq!(m.surface_edges(0).count(), before + usize::from(on_edge));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn surface_corner_on_a_bar_axis_becomes_a_bar_anchor() {
         use super::super::junctions::tests::{build, slab, Placement};
         for place in Placement::all() {
-            for (offset, imprinted) in [(0., true), (1e-5, false)] {
+            for (offset, imprinted) in [(0., true), (1e-5, true), (0.002, false)] {
                 // A bar from x = -1 to x = 2 passes the slab corner (0, 0, 0)
-                // and runs along its edge; offset by 10 um it only passes by.
+                // and runs along its edge. 10 um off, the corner moves onto
+                // the axis (within the minimum edge); 2 mm off, it stays.
                 let mut m = build(&place, &[slab(0., 4.)]);
                 let corner = (0..m.vertices.len())
                     .find(|&v| {
@@ -891,11 +1073,19 @@ mod tests {
                 }];
                 let source_nodes: Vec<u32> =
                     (0..m.vertices.len() as u32).map(|v| 100 + v).collect();
-                let r = imprint_surface_vertices(&m, &mut axes, &source_nodes);
+                let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes);
                 assert_eq!(r.len(), usize::from(imprinted), "{r:?}");
                 if imprinted {
                     let anchors: Vec<_> = axes[0].anchors.iter().map(|x| x.vertex).collect();
                     assert_eq!(anchors, vec![a, corner, b]);
+                    let (pa, pb) = (
+                        DVec3::from_array(m.vertices[a]),
+                        DVec3::from_array(m.vertices[b]),
+                    );
+                    let pc = DVec3::from_array(m.vertices[corner]);
+                    assert!(
+                        (pc - pa).cross(pb - pa).length() / (pb - pa).length() < 1e-9 * place.scale
+                    );
                     assert!((axes[0].anchors[1].t - 1. / 3.).abs() < 1e-9);
                     assert_eq!(axes[0].anchors[1].source_node, 100 + corner as u32);
                 }

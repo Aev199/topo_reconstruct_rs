@@ -317,6 +317,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         junctions: assembly::junctions::Report::default(),
         consoles: assembly::consoles::Report::default(),
         stacked_walls: assembly::stacking::Report::default(),
+        straightened_edges: vec![],
         short_edges: assembly::cleanup::Report::default(),
         coincident_vertices: assembly::cleanup::MergeReport::default(),
         wall_ends: assembly::cleanup::MergeReport::default(),
