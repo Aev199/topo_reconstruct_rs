@@ -63,21 +63,24 @@ fn grow_panels(
         let seed = *remaining
             .iter()
             .max_by(|&&a, &&b| {
-                area(a)
-                    .total_cmp(&area(b))
-                    .then_with(|| {
-                        let (ca, cb) = (facets[&a].center, facets[&b].center);
-                        cb.x.total_cmp(&ca.x)
-                            .then(cb.y.total_cmp(&ca.y))
-                            .then(cb.z.total_cmp(&ca.z))
-                    })
+                area(a).total_cmp(&area(b)).then_with(|| {
+                    let (ca, cb) = (facets[&a].center, facets[&b].center);
+                    cb.x.total_cmp(&ca.x)
+                        .then(cb.y.total_cmp(&ca.y))
+                        .then(cb.z.total_cmp(&ca.z))
+                })
             })
             .unwrap();
         let mut panel = BTreeSet::from([seed]);
         let mut points: Vec<DVec3> = facets[&seed].nodes.iter().map(|n| mesh.nodes[n]).collect();
         let mut normal = facets[&seed].normal;
         let mut center = facets[&seed].center;
-        let mut frontier: Vec<u32> = neighbors.get(&seed).into_iter().flatten().copied().collect();
+        let mut frontier: Vec<u32> = neighbors
+            .get(&seed)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
         frontier.sort_unstable();
         let mut refit_at = 2 * points.len();
         while let Some(id) = frontier.pop() {
@@ -498,8 +501,17 @@ mod tests {
         let r = recognize(&m, &policy()).unwrap();
         // Not one plane: planar panels within the tolerances.
         assert!(r.patches.len() > 1);
-        assert!(r.patches.iter().all(|p| p.maximum_deviation <= policy().distance));
-        assert_eq!(r.patches.iter().map(|p| p.source_elements.len()).sum::<usize>(), 29);
+        assert!(r
+            .patches
+            .iter()
+            .all(|p| p.maximum_deviation <= policy().distance));
+        assert_eq!(
+            r.patches
+                .iter()
+                .map(|p| p.source_elements.len())
+                .sum::<usize>(),
+            29
+        );
         assert_eq!(r.unmerged_components.len(), 1);
         assert!(r.rejected.is_empty());
     }
@@ -535,8 +547,16 @@ mod tests {
         }
         let r = recognize(&mesh, &policy()).unwrap();
         assert_eq!(r.unmerged_components.len(), 1);
-        assert!(r.patches.len() > 1 && r.patches.len() < 20, "{}", r.patches.len());
-        let mut all: Vec<u32> = r.patches.iter().flat_map(|p| p.source_elements.clone()).collect();
+        assert!(
+            r.patches.len() > 1 && r.patches.len() < 20,
+            "{}",
+            r.patches.len()
+        );
+        let mut all: Vec<u32> = r
+            .patches
+            .iter()
+            .flat_map(|p| p.source_elements.clone())
+            .collect();
         all.sort_unstable();
         assert_eq!(all, (1..=20).collect::<Vec<_>>());
         for p in &r.patches {

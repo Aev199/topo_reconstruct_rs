@@ -249,27 +249,68 @@ fn support_families(mesh: &MeshData, report: &planes::Report) -> Vec<Vec<usize>>
             }
         }
         seen.extend(group.iter().copied());
-        let nodes: BTreeSet<_> = group
-            .iter()
-            .flat_map(|&i| report.patches[i].source_nodes.iter().copied())
-            .collect();
-        let points: Vec<_> = nodes.iter().map(|id| mesh.nodes[id]).collect();
-        let fitted = planes::fit(
-            &points,
-            DVec3::from_array(report.patches[seed].plane.normal),
-        );
-        let valid = fitted.is_some_and(|(n, _)| {
-            let center = points.iter().copied().sum::<DVec3>() / points.len() as f64;
-            points
+        let valid = |set: &BTreeSet<usize>| {
+            let first = *set.first().unwrap();
+            let nodes: BTreeSet<_> = set
                 .iter()
-                .all(|p| n.dot(*p - center).abs() <= report.policy.distance)
-                && group.iter().all(|&i| tilt_allowed(i, n))
-        });
-        if valid {
+                .flat_map(|&i| report.patches[i].source_nodes.iter().copied())
+                .collect();
+            let points: Vec<_> = nodes.iter().map(|id| mesh.nodes[id]).collect();
+            planes::fit(
+                &points,
+                DVec3::from_array(report.patches[first].plane.normal),
+            )
+            .is_some_and(|(n, _)| {
+                let center = points.iter().copied().sum::<DVec3>() / points.len() as f64;
+                points
+                    .iter()
+                    .all(|p| n.dot(*p - center).abs() <= report.policy.distance)
+                    && set.iter().all(|&i| tilt_allowed(i, n))
+            })
+        };
+        if valid(&group) {
             families.push(group.into_iter().collect());
-        } else {
-            families.extend(group.into_iter().map(|i| vec![i]));
+            continue;
         }
+        // Not one plane (a narrow patch bridging two facets of a curved
+        // wall): larger patches first, each joins the neighbouring family
+        // it fits best (least tilt) if that family stays one plane.
+        let size = |i: usize| report.patches[i].source_nodes.len();
+        let mut order: Vec<usize> = group.iter().copied().collect();
+        order.sort_by(|&a, &b| size(b).cmp(&size(a)).then(a.cmp(&b)));
+        let mut member = BTreeMap::<usize, usize>::new();
+        let mut split: Vec<BTreeSet<usize>> = vec![];
+        for i in order {
+            let own = DVec3::from_array(report.patches[i].plane.normal);
+            let mut options: Vec<(f64, usize)> = neighbors[i]
+                .iter()
+                .filter_map(|j| member.get(j).copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|f| {
+                    let n =
+                        DVec3::from_array(report.patches[*split[f].first().unwrap()].plane.normal);
+                    (own.cross(n).length(), f)
+                })
+                .collect();
+            options.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            let joined = options.into_iter().find(|&(_, f)| {
+                let mut trial = split[f].clone();
+                trial.insert(i);
+                valid(&trial)
+            });
+            match joined {
+                Some((_, f)) => {
+                    split[f].insert(i);
+                    member.insert(i, f);
+                }
+                None => {
+                    member.insert(i, split.len());
+                    split.push(BTreeSet::from([i]));
+                }
+            }
+        }
+        families.extend(split.into_iter().map(|f| f.into_iter().collect()));
     }
     families
 }
@@ -737,10 +778,23 @@ fn solve_impl(
             .0
         };
         let cosine = old.dot(up);
-        let normal = if cosine.abs() >= policy.angle.cos() {
+        let snapped = if cosine.abs() >= policy.angle.cos() {
             up * cosine.signum()
         } else if cosine.abs() <= policy.angle.sin() {
             (old - up * cosine).normalize()
+        } else {
+            old
+        };
+        // Horizontal slabs and vertical walls, if every node of the family
+        // stays within the plane distance (a large slightly tilted family,
+        // 1 degree over 9 m, would move nodes by 16 cm).
+        let mean = points.iter().copied().sum::<DVec3>() / points.len() as f64;
+        let normal = if snapped == old
+            || points
+                .iter()
+                .all(|p| snapped.dot(*p - mean).abs() <= planes.policy.distance)
+        {
+            snapped
         } else {
             old
         };
@@ -1935,5 +1989,56 @@ mod tests {
             let families = support_families(&m, &planes);
             assert_eq!(families.len() == 1, grouped, "width {width}: {families:?}");
         }
+    }
+
+    #[test]
+    fn narrow_patch_bridging_two_facets_joins_one_family_only() {
+        // Two 1 m wide wall facets meeting at a vertical edge at 3 degrees
+        // (separate planes), and a narrow triangle of another stiffness
+        // touching both near that edge: all three do not fit one plane, so
+        // the triangle joins one facet's family instead of all becoming
+        // separate families.
+        let turn = 3f64.to_radians();
+        let mut m = MeshData::default();
+        // Facet A: nodes 1..=6, node 5 = (0, 0, 0), node 6 = (0, 0, 3).
+        strip(
+            &mut m,
+            1,
+            1,
+            DVec3::new(-1., 0., 0.),
+            DVec3::ZERO,
+            DVec3::Z * 3.,
+            2,
+        );
+        // Facet B shares the edge 5-6.
+        let far = DVec3::new(turn.cos(), turn.sin(), 0.);
+        for (id, p) in [(7, far * 0.5), (9, far)] {
+            m.nodes.insert(id, p);
+            m.nodes.insert(id + 1, p + DVec3::Z * 3.);
+        }
+        for (id, nodes) in [(3, vec![5, 7, 8, 6]), (4, vec![7, 9, 10, 8])] {
+            m.elements.push(ElementData {
+                id,
+                elem_type: 44,
+                stiff_id: 2,
+                nodes,
+            });
+        }
+        // A 3 mm wide triangle on the shared edge, its fitted normal ill
+        // defined (tilted about 10 degrees from both facets).
+        m.nodes.insert(11, DVec3::new(-0.003, 0.0005, 0.4));
+        m.elements.push(ElementData {
+            id: 5,
+            elem_type: 42,
+            stiff_id: 3,
+            nodes: vec![5, 11, 6],
+        });
+        let planes = planes_of(&m, 1.);
+        assert_eq!(planes.patches.len(), 3);
+        let families = support_families(&m, &planes);
+        assert_eq!(families.len(), 2, "{families:?}");
+        let mut all: Vec<usize> = families.iter().flatten().copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, vec![0, 1, 2]);
     }
 }
