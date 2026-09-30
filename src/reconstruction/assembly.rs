@@ -728,9 +728,20 @@ fn assemble_impl(
         let reference = *mesh.nodes.get(&id).ok_or("missing reference node")?;
         // Cumulative movement from immutable input, including local axis budgets.
         let budget = movement_budget(mesh, source, i);
-        if movement > policy.junction_movement_limit
-            || q.distance(reference) > budget + policy.precision
-        {
+        let (limit, k) = stacking::movement_limit(
+            policy.junction_movement_limit,
+            supports,
+            |s| stacked_walls.shifted.contains(&s),
+            |s| support_representatives[s],
+        );
+        if k >= 2 && movement > policy.junction_movement_limit && movement <= limit {
+            stacked_walls.raised_limits.push(stacking::RaisedLimit {
+                source_node: id,
+                aligned_supports: k,
+                limit,
+            });
+        }
+        if movement > limit || q.distance(reference) > budget + policy.precision {
             rejected_vertices.insert(
                 id,
                 format!(
@@ -786,8 +797,14 @@ fn assemble_impl(
                     <= policy.precision
             })
         });
+        let (limit, _) = stacking::movement_limit(
+            policy.junction_movement_limit,
+            owners.get(&pair.upper_node).map_or(&[][..], |v| &v[..]),
+            |s| stacked_walls.shifted.contains(&s),
+            |s| support_representatives[s],
+        );
         if on_supports
-            && p.distance(q) <= policy.junction_movement_limit
+            && p.distance(q) <= limit
             && q.distance(reference) <= movement_budget(mesh, source, i) + policy.precision
         {
             identified.insert(pair.upper_node, pair.lower_node);

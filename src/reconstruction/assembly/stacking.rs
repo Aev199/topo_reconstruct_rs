@@ -41,6 +41,39 @@ pub struct Report {
     /// the minimum edge length of each other: one vertex, the second node
     /// takes the first node's vertex (`upper_node` takes `lower_node`).
     pub coincident: Vec<Identified>,
+    /// Source nodes at the junction of two or more aligned structures, whose
+    /// closure movement limit is raised (see `movement_limit`).
+    pub raised_limits: Vec<RaisedLimit>,
+    /// Patches whose plane was replaced by an alignment.
+    #[serde(skip)]
+    pub shifted: BTreeSet<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RaisedLimit {
+    pub source_node: u32,
+    /// Distinct aligned structures the node lies on.
+    pub aligned_supports: usize,
+    pub limit: f64,
+}
+
+/// Closure movement limit of a node: each alignment moves a structure by at
+/// most the tolerance, so a node where `k` independently aligned structures
+/// meet moves by up to their vector sum, bounded by sqrt(k) times the limit
+/// (user decision: such corners are closed).
+pub(super) fn movement_limit(
+    limit: f64,
+    supports: &[usize],
+    shifted: impl Fn(usize) -> bool,
+    group: impl Fn(usize) -> usize,
+) -> (f64, usize) {
+    let k = supports
+        .iter()
+        .filter(|&&s| shifted(s))
+        .map(|&s| group(s))
+        .collect::<BTreeSet<_>>()
+        .len();
+    (limit * (k.max(1) as f64).sqrt(), k)
 }
 
 struct Link {
@@ -90,6 +123,7 @@ fn fits(
     owners: &BTreeMap<u32, Vec<usize>>,
     rings: &BTreeMap<usize, Vec<Vec<u32>>>,
     representatives: &[usize],
+    shifted: &BTreeSet<usize>,
     moved: usize,
     target: usize,
 ) -> Result<(), &'static str> {
@@ -121,7 +155,13 @@ fn fits(
         let Some(q) = intersection(p, &refs, policy.precision) else {
             return Err("inconsistent_supports");
         };
-        if p.distance(q) > policy.junction_movement_limit
+        let (limit, _) = movement_limit(
+            policy.junction_movement_limit,
+            supports,
+            |s| shifted.contains(&s) || representatives[s] == moved,
+            remap,
+        );
+        if p.distance(q) > limit
             || q.distance(mesh.nodes[&id]) > movement_budget(mesh, source, i) + policy.precision
         {
             return Err("vertex_movement_limit");
@@ -335,6 +375,7 @@ pub(super) fn align(
             owners,
             rings,
             representatives,
+            &report.shifted,
             moved,
             target,
         );
@@ -343,9 +384,10 @@ pub(super) fn align(
             report.kept.push(entry);
             continue;
         }
-        for r in representatives.iter_mut() {
+        for (j, r) in representatives.iter_mut().enumerate() {
             if *r == moved {
                 *r = target;
+                report.shifted.insert(j);
             }
         }
         // One-to-one identification of nearly coincident junction nodes.
@@ -549,6 +591,7 @@ pub(super) fn align_lines(
                 owners,
                 rings,
                 representatives,
+                &report.shifted,
                 representatives[a],
                 representatives[b],
             );
@@ -563,9 +606,10 @@ pub(super) fn align_lines(
             continue;
         };
         let (moved, target) = (representatives[a], representatives[b]);
-        for r in representatives.iter_mut() {
+        for (j, r) in representatives.iter_mut().enumerate() {
             if *r == moved {
                 *r = target;
+                report.shifted.insert(j);
             }
         }
         entry.upper = a;
@@ -574,5 +618,24 @@ pub(super) fn align_lines(
         entry.source_elements = source.surfaces[a].source_elements.clone();
         entry.reason = "aligned_wall_line".into();
         report.aligned.push(entry);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::movement_limit;
+
+    #[test]
+    fn limit_grows_with_distinct_aligned_structures_only() {
+        let group = |s: usize| [0, 1, 1, 3][s];
+        // No aligned support, or one: the plain limit.
+        assert_eq!(movement_limit(0.05, &[0, 3], |_| false, group), (0.05, 0));
+        assert_eq!(movement_limit(0.05, &[0, 3], |s| s == 0, group), (0.05, 1));
+        // Two aligned supports of one group are one structure.
+        assert_eq!(movement_limit(0.05, &[1, 2], |s| s > 0, group), (0.05, 1));
+        // Two independent aligned structures: their vector sum.
+        let (limit, k) = movement_limit(0.05, &[0, 1, 3], |s| s != 3, group);
+        assert_eq!(k, 2);
+        assert!((limit - 0.05 * 2f64.sqrt()).abs() < 1e-15);
     }
 }

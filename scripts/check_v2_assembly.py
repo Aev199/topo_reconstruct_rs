@@ -177,10 +177,17 @@ def check(data, baseline=None):
     for c in topology.get("short_bars", {}).get("collapsed", []):
         if c["dropped_source_node"] in budget:
             budget[c["dropped_source_node"]] = frame["policy"]["maximum_movement"]
+    # A node where several aligned structures meet may move by the vector sum
+    # of their alignments (sqrt(k) times the limit), as reported.
+    limits = {r["source_node"]: r["limit"]
+              for r in topology.get("stacked_walls", {}).get("raised_limits", [])}
+    base_limit = topology["policy"]["junction_movement_limit"]
+    for r in limits.values():
+        assert base_limit < r <= base_limit * math.sqrt(3) + epsilon
     for n, point in zip(source_nodes, vertices):
         i = lookup[n]
         assert math.dist(point, frame["reference_points"][i]) <= budget[n] + epsilon
-        assert math.dist(point, frame["candidate_points"][i]) <= topology["policy"]["junction_movement_limit"] + epsilon
+        assert math.dist(point, frame["candidate_points"][i]) <= limits.get(n, base_limit) + epsilon
 
     expected_shells = [e for s in frame["surfaces"] for e in s["source_elements"]]
     actual_shells = [e for s in model["surfaces"] for e in s["source_elements"]]

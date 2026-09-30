@@ -916,15 +916,32 @@ general rule:
 All four pass the assembly checker and the strict extended audit; trial
 mesh minimum angles unchanged (8.13, 20.21, 7.15, 7.09 degrees).
 
-Remaining:
+Remaining after this batch: see "Compound alignment movements" below.
 
-- тест 6, one zone: a low riser skewed 0.2 degrees off the wall line it
-  continues, ending at the corner of a stacked pair aligned by 50 mm.
-  Aligning the riser moves the corner 54 mm (the 50 mm stack alignment
-  along the riser plus 20 mm across it), above the 51 mm limit; kept
-  (`vertex_movement_limit`): one 19.4 mm edge and three 19.4 mm gaps.
-  Closing it needs a limit for compound moves (for example
-  sqrt(2) x tolerance at the junction of two aligned structures): a user
-  decision.
-- скала1: one 8-degree corner is a real feature (a wedge-shaped stiffness
-  zone of a wall under a slab), not simplified without evidence.
+## Compound alignment movements, 2026-09-30
+
+User decisions: corners where two aligned structures meet are closed; the
+8-degree corner of скала1 stays (it separates two stiffness zones).
+
+Each alignment (stacked wall, wall in one line) moves a structure by at
+most the tolerance; a node where `k` independently aligned structures meet
+moves by their vector sum. Its closure movement limit is
+`junction_movement_limit x sqrt(k)` (`stacking::movement_limit`; 72 mm for
+two structures at the default 51 mm), used by the alignment check, vertex
+closure and stacked identification. Nodes that need it are reported in
+`stacked_walls.raised_limits` (node, number of aligned structures, limit);
+the assembly checker applies the reported limit to them and requires it to
+be above the plain limit and at most sqrt(3) times it.
+
+тест 6: 27 nodes use it: the riser corner at the aligned stack (54 mm) and
+the vertical corner edges of a top-floor wall stacked 50 mm onto the wall
+below between two perpendicular walls aligned themselves (55.9 mm); that
+stack was kept before. Stacked walls aligned 28 -> 29, walls in one line
+1 -> 2.
+
+| PLAXIS profile | скала1 | типовая секция | тест 5 | тест 6 |
+|---|---:|---:|---:|---:|
+| Items | 1 (kept) | 0 | 0 | 4 -> 0 |
+
+All four pass the assembly checker and the strict extended audit; trial
+mesh minimum angles unchanged.
