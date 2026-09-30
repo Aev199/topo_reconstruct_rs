@@ -19,9 +19,12 @@ Exact reproduction of the source FE tessellation is not the objective.
 
 ## Private fixtures
 
-Three private LIRA text models are used as the Tier C gate (never committed):
-`скала1` (right section, 388 surfaces / 581 axes), `типовая секция`
-(23 / 291) and `тест 5` (108 / 8).
+Private LIRA text models used as the Tier C gate (never committed):
+`скала1` (right section, 59 surfaces / 525 axes since planar panel
+growing), `типовая секция` (23 / 291), `тест 5` (108 / 8), `тест 6`, and
+since 2026-09-30 eight more: a test slab, two АЖТ tests, скала with seismic
+loads, Багратион concrete bedding, "для testa", ЖК Остров (piles, curved
+walls) and Багратион v4 (160 MB).
 
 ## Current verified state
 
@@ -60,6 +63,19 @@ mesh-level connectivity and missing-property checks. Reconstruction targets
 PLAXIS (`docs/GEOTECHNICAL_GEOMETRY.md`, "PLAXIS profile"):
 `scripts/check_plaxis_profile.py` is the readiness gate at a target element
 size of 0.5 m. типовая секция and тест 5 pass it. Remaining:
+
+New fixtures (2026-09-30): test slab, АЖТ tests, скала seismic and "для
+testa" build fully (assembly checker, strict audit, trial mesh). Open:
+
+- Багратион bedding: main slab builds; open are duplicate collinear bars
+  with equal stiffness (the short one lies on the long one: user decision
+  on merging), 1 mm wide sliver regions overlapping the slab along a seam
+  (user decision: absorb as cracks), two 5 cm sliver fans;
+- ЖК Остров: frame does not converge (residual 0.9 mm) around curved walls
+  made of facets 2 degrees apart, some tilted 0.3-2 degrees from vertical;
+- Багратион v4: runtime (single-threaded stage taking hours; profiling).
+
+Previous fixtures:
 
 1. тест 6: PLAXIS profile passes (compound alignment corners closed);
 2. скала1: one contour corner of 8 degrees (a real wedge-shaped stiffness
