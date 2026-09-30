@@ -995,3 +995,16 @@ v4). Two frame failures, both general:
 
 Existing fixtures: outputs identical. New fixtures are triaged separately
 (DEV_STATE).
+
+Скала with seismic loads (new fixture): the trial mesh of one slab failed
+(missing constraint edge, unused vertex). A bar running along the slab edge
+leaves it at a contour vertex that is within precision of the bar but not
+exactly on it; the adjacent contour edges were only nearly collinear, so no
+cut was produced there, the midpoint of the merged piece fell exactly on
+that vertex, and the whole bar, including a segment over an opening, was
+recorded as a boundary contact of the slab. Bar-surface intervals now also
+cut at every contour vertex within precision of the axis. Regression:
+`axis_leaving_a_boundary_at_a_nearly_collinear_vertex_is_cut_there` (fails
+without the cut). The mesh coverage blocker now names the failed condition
+and the first offending edges and vertices. Existing fixtures: identical
+(one cut parameter differs by 1e-12).

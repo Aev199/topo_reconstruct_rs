@@ -121,6 +121,14 @@ fn intervals(
     for ring in contours {
         for i in 0..ring.len() {
             let p = ring[i];
+            // A contour vertex on the axis is a cut even when the adjacent
+            // edges are only nearly collinear with it (no exact collinear
+            // overlap is reported): the axis may leave the boundary there.
+            let v = DVec2::from_array(p);
+            let t = (v - a).dot(d) / d.length_squared();
+            if t > 0. && t < 1. && (a + d * t).distance(v) <= precision {
+                cuts.push(t);
+            }
             let q = ring[(i + 1) % ring.len()];
             match line_intersection(line, Line::new((p[0], p[1]), (q[0], q[1]))) {
                 Some(LineIntersection::SinglePoint { intersection, .. }) => {
@@ -748,6 +756,20 @@ mod tests {
         input::ElementData,
         reconstruction::{assembly, planes, recognize},
     };
+
+    #[test]
+    fn axis_leaving_a_boundary_at_a_nearly_collinear_vertex_is_cut_there() {
+        // The axis runs along the bottom edge and leaves the material at the
+        // vertex (1, 1e-9), within precision of it but not exactly on it.
+        let square = vec![vec![[0., 0.], [0.5, 0.], [1., 1e-9], [1., 1.], [0., 1.]]];
+        let r = intervals([0., 0.], [1.5, 0.], &square, 1e-8);
+        assert_eq!(r.len(), 1, "{r:?}");
+        assert_eq!(r[0].2, Location::Boundary);
+        assert!(
+            r[0].0.abs() < 1e-12 && (r[0].1 - 2. / 3.).abs() < 1e-8,
+            "{r:?}"
+        );
+    }
 
     fn frame(mesh: &MeshData, up: DVec3) -> frame::Report {
         let axes = recognize::recognize(

@@ -689,19 +689,45 @@ fn build_impl(
                 stiffness: source.surface_stiffness[s],
             });
         }
+        let expected = |edge: &[usize; 2]| if boundary.contains(edge) { 1 } else { 2 };
+        let mut failures = vec![];
         if (area - polygon.unsigned_area()).abs()
             > eps * polygon.unsigned_area().sqrt().max(eps) * 10.
-            || constraints.iter().any(|edge| {
-                counts.get(edge).copied().unwrap_or(0)
-                    != if boundary.contains(edge) { 1 } else { 2 }
-            })
-            || counts
-                .iter()
-                .any(|(edge, &count)| count != if boundary.contains(edge) { 1 } else { 2 })
-            || handles.keys().any(|n| !used.contains(n))
         {
+            failures.push(format!("area {area} != {}", polygon.unsigned_area()));
+        }
+        let missing: Vec<_> = constraints
+            .iter()
+            .filter(|&edge| counts.get(edge).copied().unwrap_or(0) != expected(edge))
+            .collect();
+        if !missing.is_empty() {
+            failures.push(format!(
+                "constraint_edges {} {:?}",
+                missing.len(),
+                &missing[..missing.len().min(3)]
+            ));
+        }
+        let uses = counts
+            .iter()
+            .filter(|&(edge, &count)| count != expected(edge))
+            .count();
+        if uses > 0 {
+            failures.push(format!("edge_uses {uses}"));
+        }
+        let unused: Vec<_> = handles.keys().filter(|n| !used.contains(n)).collect();
+        if !unused.is_empty() {
+            failures.push(format!(
+                "unused_vertices {} {:?}",
+                unused.len(),
+                &unused[..unused.len().min(3)]
+            ));
+        }
+        if !failures.is_empty() {
             topology_valid = false;
-            blockers.push(format!("coverage_or_constraint_failure: surface={s}"));
+            blockers.push(format!(
+                "coverage_or_constraint_failure: surface={s} ({})",
+                failures.join(", ")
+            ));
         }
     }
     let mut bars = Vec::new();
