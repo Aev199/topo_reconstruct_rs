@@ -968,3 +968,30 @@ mesh minimum angles unchanged.
    convex clip.
 
 Private fixtures: outputs identical to 365464e (no end overlaps there).
+
+## Frame robustness on new fixtures, 2026-09-30
+
+Eight new private fixtures (a test slab, two АЖТ tests, скала with seismic
+loads, Багратион concrete bedding, "для testa", ЖК Остров piles, Багратион
+v4). Two frame failures, both general:
+
+1. A bar shorter than the minimum length must not shrink; the check used
+   the residual tolerance even before convergence, so a 0.4 um change of a
+   20 mm bar during an unconverged solve counted as an axis failure and
+   blocked the retry with a larger iteration budget. The check (and the
+   validity test) now allow a change below the current residual;
+   acceptance still requires convergence, after which it is strict.
+2. Nearly parallel walls with fixed normals 1e-4 rad apart, joined by
+   vertical bars at different positions, are inconsistent (residual
+   1e-4 x bar spacing, 0.08 mm); the solve cannot converge. When the solve
+   with the recognised normals does not converge, it is repeated with wall
+   normals unified per direction group (within the recognition angle, the
+   direction of the family with most nodes, only if every node of the
+   family stays within the plane distance tolerance); reported as
+   `frame.regularized_directions`. Applied always it broke скала1 (a
+   slightly tilted wall moved nodes beyond short-bar budgets), so it is a
+   fallback. Regression: `nearly_parallel_walls_share_a_direction_only_when_needed`
+   (the tilted pair fails without it).
+
+Existing fixtures: outputs identical. New fixtures are triaged separately
+(DEV_STATE).

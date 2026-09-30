@@ -112,6 +112,9 @@ pub struct Report {
     pub axes: Vec<Axis>,
     pub surfaces: Vec<Surface>,
     pub plane_families: Vec<Vec<usize>>,
+    /// Nearly parallel wall normals were unified (the solve with the
+    /// recognised normals did not converge).
+    pub regularized_directions: bool,
     pub equation_count: usize,
     pub short_axis_indices: Vec<usize>,
     /// Gaps closed in the solve by virtual plane incidences.
@@ -334,7 +337,7 @@ pub fn solve(
     planes: &planes::Report,
     policy: &Policy,
 ) -> Result<Report, &'static str> {
-    solve_impl(mesh, axes, planes, policy, 0, &[])
+    solve_impl(mesh, axes, planes, policy, 0, &[], false)
 }
 
 /// Retry only a numerically incomplete continuous solve with a bounded LSQR
@@ -449,13 +452,33 @@ fn retry(
     maximum_attempts: usize,
     extra: &[gaps::Incidence],
 ) -> Result<Report, &'static str> {
+    // Nearly parallel wall normals are unified only when the solve with the
+    // recognised normals cannot converge: the regularisation moves nodes of
+    // slightly tilted walls, which other models' budgets may not allow.
+    let plain = retry_with(mesh, axes, planes, policy, maximum_attempts, extra, false)?;
+    if plain.accepted {
+        return Ok(plain);
+    }
+    let snapped = retry_with(mesh, axes, planes, policy, maximum_attempts, extra, true)?;
+    Ok(if snapped.accepted { snapped } else { plain })
+}
+
+fn retry_with(
+    mesh: &MeshData,
+    axes: &recognize::Report,
+    planes: &planes::Report,
+    policy: &Policy,
+    maximum_attempts: usize,
+    extra: &[gaps::Incidence],
+    snap: bool,
+) -> Result<Report, &'static str> {
     if maximum_attempts == 0 {
         return Err("frame retry limit must be positive");
     }
     let mut attempt_policy = policy.clone();
     let mut best = None;
     for attempt in 0..maximum_attempts {
-        let result = solve_impl(mesh, axes, planes, &attempt_policy, 0, extra)?;
+        let result = solve_impl(mesh, axes, planes, &attempt_policy, 0, extra, snap)?;
         let improved = best.as_ref().is_none_or(|previous: &Report| {
             result.candidate_max_residual < previous.candidate_max_residual
         });
@@ -495,7 +518,7 @@ pub fn solve_sliding(
     if maximum_steps == 0 {
         return Err("nonlinear step limit must be positive");
     }
-    solve_impl(mesh, axes, planes, policy, maximum_steps, &[])
+    solve_impl(mesh, axes, planes, policy, maximum_steps, &[], false)
 }
 
 fn solve_impl(
@@ -505,6 +528,7 @@ fn solve_impl(
     policy: &Policy,
     maximum_steps: usize,
     extra: &[gaps::Incidence],
+    snap: bool,
 ) -> Result<Report, &'static str> {
     let up = DVec3::from_array(policy.up);
     if !up.is_finite()
@@ -641,6 +665,7 @@ fn solve_impl(
     let plane_families = support_families(mesh, planes);
     let mut plane_to_family = vec![0; planes.patches.len()];
     let mut normals = vec![];
+    let mut pending: Vec<(DVec3, Vec<DVec3>)> = vec![];
     for (family, members) in plane_families.iter().enumerate() {
         let nodes: BTreeSet<_> = members
             .iter()
@@ -668,12 +693,51 @@ fn solve_impl(
         } else {
             old
         };
-        let origin = points.iter().map(|p| *p - center).sum::<DVec3>() / points.len() as f64;
-        x.push(normal.dot(origin));
-        normals.push(normal);
+        pending.push((normal, points));
         for &pi in members {
             plane_to_family[pi] = family;
         }
+    }
+    // Walls in one direction share one normal: nearly parallel wall normals
+    // (within the recognition angle) take the direction of the largest wall
+    // of their group, if every node of the family stays within the plane
+    // distance tolerance. Otherwise bars between them are inconsistent with
+    // their fixed directions (a 1e-4 rad difference over the spacing of two
+    // vertical bars leaves a residual the solve cannot remove).
+    let vertical = |n: DVec3| n.dot(up).abs() <= 1e-12;
+    let mut order: Vec<usize> = (0..pending.len())
+        .filter(|&f| snap && vertical(pending[f].0))
+        .collect();
+    order.sort_by(|&a, &b| {
+        pending[b].1.len().cmp(&pending[a].1.len()).then_with(|| {
+            let angle = |n: DVec3| n.y.atan2(n.x).rem_euclid(std::f64::consts::PI);
+            angle(pending[a].0).total_cmp(&angle(pending[b].0))
+        })
+    });
+    let mut directions: Vec<DVec3> = vec![];
+    for f in order {
+        let normal = pending[f].0;
+        let Some(&d) = directions
+            .iter()
+            .find(|d| d.dot(normal).abs() >= policy.angle.cos())
+        else {
+            directions.push(normal);
+            continue;
+        };
+        let snapped = d * d.dot(normal).signum();
+        let points = &pending[f].1;
+        let mean = points.iter().copied().sum::<DVec3>() / points.len() as f64;
+        if points
+            .iter()
+            .all(|p| snapped.dot(*p - mean).abs() <= planes.policy.distance)
+        {
+            pending[f].0 = snapped;
+        }
+    }
+    for (normal, points) in pending {
+        let origin = points.iter().map(|p| *p - center).sum::<DVec3>() / points.len() as f64;
+        x.push(normal.dot(origin));
+        normals.push(normal);
     }
     let mut surfaces = vec![];
     for (pi, p) in planes.patches.iter().enumerate() {
@@ -758,7 +822,9 @@ fn solve_impl(
         && new_axes.iter().all(|a| {
             let [i, j] = a.endpoints;
             let d = candidate[j] - candidate[i];
-            d.length() + policy.residual_tolerance
+            // Acceptance still requires convergence (residual within the
+            // tolerance); before it, a change below the residual is numerical.
+            d.length() + policy.residual_tolerance.max(residual)
                 >= policy
                     .minimum_length
                     .min(reference[j].distance(reference[i]))
@@ -827,7 +893,10 @@ fn solve_impl(
             let [i, j] = a.endpoints;
             let old = reference[j] - reference[i];
             let new = candidate[j] - candidate[i];
-            (new.length() + policy.residual_tolerance < policy.minimum_length.min(old.length())
+            // Before convergence a length change below the residual is
+            // numerical, not a collapse (it must not block the retry).
+            (new.length() + policy.residual_tolerance.max(residual)
+                < policy.minimum_length.min(old.length())
                 || new.dot(old) <= 0.0
                 || (sliding_parameters.is_some()
                     && new.normalize().dot(old.normalize()) < policy.angle.cos()))
@@ -898,6 +967,7 @@ fn solve_impl(
             })
             .collect(),
         plane_families,
+        regularized_directions: snap,
         equation_count: equations.len(),
         virtual_incidences: gaps::Report::default(),
     })
@@ -1725,5 +1795,60 @@ mod tests {
             0.001,
         );
         assert_eq!(c.into_iter().collect::<Vec<_>>(), vec![first + 1]);
+    }
+
+    /// Wall A in x = 0 (z 0..1) and wall B above it, rotated `tilt` rad about
+    /// the vertical, joined by two vertical bars 2 m apart.
+    fn tilted_walls(tilt: f64) -> MeshData {
+        let mut m = MeshData::default();
+        let next = strip(
+            &mut m,
+            1,
+            1,
+            DVec3::ZERO,
+            DVec3::new(0., 2., 0.),
+            DVec3::Z,
+            2,
+        );
+        let b0 = DVec3::new(0., 0., 1.2);
+        let b1 = b0 + DVec3::new(2. * tilt, 2., 0.);
+        let bars = strip(&mut m, next, 2, b0, b1, DVec3::Z, 2);
+        for (k, lower) in [2u32, 6].into_iter().enumerate() {
+            m.elements.push(ElementData {
+                id: bars + k as u32,
+                elem_type: 10,
+                stiff_id: 3,
+                nodes: vec![lower, next + 4 * k as u32],
+            });
+        }
+        m
+    }
+
+    #[test]
+    fn nearly_parallel_walls_share_a_direction_only_when_needed() {
+        for (tilt, regularized) in [(0., false), (1e-4, true)] {
+            let m = tilted_walls(tilt);
+            let axes = recognize::recognize(
+                &m,
+                &recognize::Policy {
+                    angle: 0.02,
+                    line_tolerance: 0.01,
+                    numerical_precision: 1e-8,
+                },
+            )
+            .unwrap();
+            let planes = planes_of(&m, 1.);
+            assert_eq!(planes.patches.len(), 2);
+            let r = solve_with_retry(&m, &axes, &planes, &policy(), 3).unwrap();
+            assert!(
+                r.accepted,
+                "tilt {tilt}: {} {}",
+                r.reason, r.candidate_max_residual
+            );
+            assert_eq!(r.regularized_directions, regularized, "tilt {tilt}");
+            // With the recognised normals the tilted pair cannot converge.
+            let plain = retry_with(&m, &axes, &planes, &policy(), 3, &[], false).unwrap();
+            assert_eq!(plain.accepted, !regularized, "tilt {tilt}");
+        }
     }
 }
