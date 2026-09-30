@@ -527,7 +527,14 @@ fn propose(
             } else {
                 ((ca + cb) * 0.5, 0.5)
             };
-            base + reference * (a.t - t)
+            // A short axis keeps its source vector, or the vector the frame
+            // flattened onto its plane.
+            let vector = if source.policy.flatten_short_axes {
+                cb - ca
+            } else {
+                reference
+            };
+            base + vector * (a.t - t)
         } else {
             origin + direction * (candidate - origin).dot(direction)
         };
@@ -645,6 +652,7 @@ pub(super) fn assemble(
     supports: &[PlaneFrame],
     representatives: &[usize],
     policy: &Policy,
+    removed_elements: &BTreeSet<u32>,
 ) -> Report {
     let mut report = Report::default();
     let mut vertices: BTreeMap<_, _> = vertex_source_nodes
@@ -688,7 +696,8 @@ pub(super) fn assemble(
         .collect();
     let mut owner_surfaces = BTreeMap::<u32, BTreeSet<usize>>::new();
     for e in &mesh.elements {
-        if !source_shells.contains(&e.id) {
+        // Elements removed as degenerate slivers are absent, not unbuilt.
+        if !source_shells.contains(&e.id) || removed_elements.contains(&e.id) {
             continue;
         }
         for &n in &e.nodes {
@@ -1164,6 +1173,7 @@ mod tests {
                 residual_tolerance: 1e-7,
                 iterations: 100,
                 panel_tolerance: 0.,
+                flatten_short_axes: false,
             },
         )
         .unwrap()
@@ -1547,6 +1557,7 @@ mod tests {
                 residual_tolerance: 1e-7,
                 iterations: 10,
                 panel_tolerance: 0.,
+                flatten_short_axes: false,
             },
             accepted: true,
             candidate_constraints_satisfied: true,
@@ -1570,6 +1581,7 @@ mod tests {
             plane_families: vec![],
             equation_count: 0,
             short_axis_indices: vec![],
+            short_axis_movement: 0.,
         };
         let locked = BTreeMap::from([(1, DVec3::ZERO), (2, DVec3::new(1e-7, 0., -4.))]);
         let proposal = propose(

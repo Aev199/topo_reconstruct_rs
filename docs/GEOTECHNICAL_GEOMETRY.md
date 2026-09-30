@@ -1120,3 +1120,56 @@ gradual-curvature test now checks planar panels, and
 split points), trial triangles 23066 -> 22217, maximum frame movement
 1.5 -> 6.8 mm (within the plane distance); strict audit, assembly checker,
 PLAXIS profile and mesh angles unchanged. Other fixtures unchanged.
+
+## Duplicate bars, sliver regions, kinked walls, runtime, 2026-09-30
+
+User decisions: overlapping duplicate bars are merged, regions narrower than
+a crack are removed, curved walls become larger planar panels. General
+rules (all with regression tests):
+
+1. Overlapping bars (axis recognition): a bar running from a node along a
+   shorter bar of the same stiffness (the shorter one's far node within the
+   line tolerance of it, strictly inside) starts at that far node; the
+   overlap is represented once, by the shorter bar
+   (`axis_recognition.merged_overlaps`). Different stiffnesses stay
+   separate. Regressions: `bar_overlapping_a_shorter_collinear_bar_is_represented_once`,
+   `overlapping_bars_of_different_stiffness_stay_separate`.
+2. Duplicate bar pieces (bar cleanup): a short piece between the same two
+   vertices on several bars collapses on all of them at once (it was
+   rejected as `bar_would_collapse`); bars through exactly the same
+   vertices with the same stiffness sequence are kept once
+   (`short_bars.duplicates`, the lowest source axis is kept). Regressions:
+   `duplicate_short_pieces_between_the_same_nodes_collapse_together`,
+   `bar_through_the_vertices_of_another_bar_is_kept_once`.
+3. Sliver regions (geotechnical assembly): a property region whose every
+   facet is no wider than the crack width (smallest extent of the convex
+   facet) and whose mean width (2 area / perimeter) is too, is a degenerate
+   sliver of the source mesh (needle triangles along a seam) and is removed
+   with provenance (`removed_slivers`); bars on its nodes are still built.
+   A 17 mm needle is kept. Regression:
+   `region_no_wider_than_a_crack_is_removed_with_provenance`.
+4. Crack mouths shared across the regions of a patch no longer fold a ring:
+   back-and-forth spikes `a, b, a` are removed after identification
+   (`identified_ring_loses_back_and_forth_spikes`).
+5. Kinked walls (frame): support families whose common nodes spread across
+   their intersection direction by more than the plane distance (an upper
+   wall kinked 2-5 degrees over a straight lower wall through the slab edge
+   nodes, facets of a curved wall) are merged into one panel when all their
+   nodes lie within the stack offset tolerance (50 mm) of one plane,
+   smallest deviation first (`frame::Policy::panel_tolerance`, geotechnical
+   mode). Common nodes along one line (a corner) never trigger it.
+   Regressions: `kinked_wall_sharing_nodes_off_the_kink_becomes_one_panel`,
+   `walls_meeting_at_a_corner_line_stay_separate_panels`.
+6. Short axes (frame): an axis shorter than the minimum length keeps its
+   vector and may only translate, so its nodes' budget is at least the
+   plane distance (not 5 % of a 29 mm bar); in geotechnical mode
+   (`flatten_short_axes`) its vector is kept only along the planes of the
+   families common to both ends (a 12 mm bar lying in a wall had a 2.2 mm
+   component across it, a contradiction). Assembly and the assembly
+   checker use the same budget. Regressions:
+   `short_bar_translates_with_a_node_moved_onto_its_wall_plane`,
+   `short_axis_lying_on_its_plane_follows_it_in_geotechnical_mode`.
+7. Runtime: node movement budgets are cached per frame report (they were
+   recomputed over all axes per node); element maps are built once for
+   region boundaries, crack closure and sliver checks; bar end merges find
+   candidates through a grid. Outputs identical (m5, m6 byte-equal).

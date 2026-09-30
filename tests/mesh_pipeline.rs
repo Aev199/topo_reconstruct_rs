@@ -81,6 +81,7 @@ fn run_with(
             residual_tolerance: 1e-8 * scale,
             iterations: 1000,
             panel_tolerance: 0.,
+            flatten_short_axes: false,
         },
     )
     .unwrap();
@@ -940,6 +941,14 @@ fn sliver_source() -> topo_reconstruct_rs::input::MeshData {
         stiff_id: 1,
         nodes: vec![20, 21, 22],
     });
+    // A column standing on the sliver apex.
+    mesh.nodes.insert(23, DVec3::new(0.45, 2.002, 1.));
+    mesh.elements.push(ElementData {
+        id: 6,
+        elem_type: 10,
+        stiff_id: 2,
+        nodes: vec![22, 23],
+    });
     mesh
 }
 
@@ -959,6 +968,9 @@ fn region_no_wider_than_a_crack_is_removed_with_provenance() {
             assert!(sliver.mean_width < sliver.width);
             assert_eq!(topology.surface_stiffness.len(), 1);
             assert!(topology.issues.is_empty());
+            // The column on a removed sliver node is still built.
+            assert!(topology.axis_assembly.issues.is_empty());
+            assert_eq!(topology.axis_assembly.axes.len(), 1);
             assert!(
                 mesh.topology_valid && mesh.source_coverage_complete,
                 "scale={scale} rotated={rotated}: {:?}",

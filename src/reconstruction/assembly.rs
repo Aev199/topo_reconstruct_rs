@@ -481,6 +481,31 @@ fn movement_budget(_mesh: &MeshData, source: &frame::Report, index: usize) -> f6
 
 /// Apply the crack mouths identified in any region of a patch to the rings
 /// of every region of that patch; consecutive repeated nodes collapse.
+/// Remove repeated consecutive nodes and back-and-forth spikes `a, b, a`
+/// (cyclically) from a ring whose nodes were identified: a mouth applied from
+/// another region of the patch can fold a straight boundary through a node
+/// that the crack removed there.
+fn collapse_backtracks(ring: &mut Vec<u32>) {
+    loop {
+        ring.dedup();
+        while ring.len() > 1 && ring.first() == ring.last() {
+            ring.pop();
+        }
+        let n = ring.len();
+        if n < 3 {
+            return;
+        }
+        let Some(i) = (0..n).find(|&i| ring[(i + n - 1) % n] == ring[(i + 1) % n]) else {
+            return;
+        };
+        // Drop the spike tip and the repeated node after it.
+        let next = (i + 1) % n;
+        let (first, second) = (i.max(next), i.min(next));
+        ring.remove(first);
+        ring.remove(second);
+    }
+}
+
 fn share_crack_mouths(
     rings: &mut BTreeMap<usize, Vec<Vec<u32>>>,
     patch: impl Fn(usize) -> usize,
@@ -509,10 +534,7 @@ fn share_crack_mouths(
         for ring in loops.iter_mut() {
             if ring.iter().any(|n| map.contains_key(n)) {
                 let mut mapped: Vec<u32> = ring.iter().map(|&n| resolve(n)).collect();
-                mapped.dedup();
-                while mapped.len() > 1 && mapped.first() == mapped.last() {
-                    mapped.pop();
-                }
+                collapse_backtracks(&mut mapped);
                 *ring = mapped;
             }
         }
@@ -1126,6 +1148,10 @@ fn assemble_impl(
         &closed_supports,
         &support_representatives,
         policy,
+        &removed_slivers
+            .iter()
+            .flat_map(|s| s.source_elements.iter().copied())
+            .collect(),
     );
     maximum_closure_movement =
         maximum_closure_movement.max(axis_assembly.maximum_additional_movement);
@@ -1445,6 +1471,7 @@ mod tests {
                 residual_tolerance: 1e-7,
                 iterations: 100,
                 panel_tolerance: 0.,
+                flatten_short_axes: false,
             },
         )
         .unwrap()
@@ -2346,6 +2373,7 @@ mod tests {
                 residual_tolerance: 1e-7,
                 iterations: 100,
                 panel_tolerance: 0.,
+                flatten_short_axes: false,
             },
         )
         .unwrap();
@@ -2436,5 +2464,18 @@ mod tests {
         let a = PlaneFrame::new([0., 0., 0.], [0., 0., 1.]).unwrap();
         let p = intersection(DVec3::new(1., 2., 0.0003), &[&a, &a], 1e-9).unwrap();
         assert_eq!(p, DVec3::new(1., 2., 0.));
+    }
+
+    #[test]
+    fn identified_ring_loses_back_and_forth_spikes() {
+        let mut ring = vec![234, 940, 2813, 7823, 3267, 2363, 7824, 940];
+        collapse_backtracks(&mut ring);
+        assert_eq!(ring, vec![2813, 7823, 3267, 2363, 7824, 940]);
+        let mut ring = vec![1, 2, 3, 2, 4, 5];
+        collapse_backtracks(&mut ring);
+        assert_eq!(ring, vec![1, 2, 4, 5]);
+        let mut ring = vec![1, 2, 2, 3, 1];
+        collapse_backtracks(&mut ring);
+        assert_eq!(ring, vec![1, 2, 3]);
     }
 }

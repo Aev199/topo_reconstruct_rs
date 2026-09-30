@@ -137,6 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             residual_tolerance: 1e-7,
             iterations: 1000,
             panel_tolerance: 0.,
+            flatten_short_axes: false,
         },
     )?;
     let topology = assembly::assemble(

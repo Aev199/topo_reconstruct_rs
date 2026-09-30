@@ -217,6 +217,8 @@ fn run_v2_preview(
             } else {
                 tolerances.stack_offset
             },
+            // A short bar lying in a wall or slab follows its plane.
+            flatten_short_axes: !preserve_details,
         },
         3,
         gap_tolerance,

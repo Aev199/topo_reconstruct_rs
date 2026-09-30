@@ -165,9 +165,13 @@ def check(data, baseline=None):
     for k, axis in enumerate(frame["axes"]):
         if k in removed_axes:
             continue
-        limit = frame["policy"]["relative_movement"] * math.dist(
-            *(frame["reference_points"][i] for i in axis["endpoints"])
-        )
+        length = math.dist(*(frame["reference_points"][i] for i in axis["endpoints"]))
+        limit = frame["policy"]["relative_movement"] * length
+        # A short axis keeps its vector in the solve and may only translate:
+        # its nodes may move as far as the plane distance tolerance.
+        if length < frame["policy"]["minimum_length"]:
+            limit = max(limit, frame.get("short_axis_movement", 0.))
+        limit = min(limit, frame["policy"]["maximum_movement"])
         for anchor in axis["anchors"]:
             n = frame["node_ids"][anchor["node"]]
             if n in budget:

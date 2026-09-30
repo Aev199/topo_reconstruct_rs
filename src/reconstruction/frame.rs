@@ -23,6 +23,10 @@ pub struct Policy {
     /// one panel if all their nodes lie within this of one plane. Zero
     /// disables.
     pub panel_tolerance: f64,
+    /// A short axis (kept as a vector) whose ends all lie on one support
+    /// family keeps its vector only along that family's plane: the normal
+    /// component (noise within the plane distance) is dropped.
+    pub flatten_short_axes: bool,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Anchor {
@@ -122,6 +126,9 @@ pub struct Report {
     pub regularized_directions: bool,
     pub equation_count: usize,
     pub short_axis_indices: Vec<usize>,
+    /// Movement allowed to the nodes of a short axis (translation only):
+    /// the plane distance tolerance.
+    pub short_axis_movement: f64,
     /// Gaps closed in the solve by virtual plane incidences.
     pub virtual_incidences: gaps::Report,
     #[serde(skip)]
@@ -138,7 +145,7 @@ impl Clone for BudgetCache {
 }
 impl Report {
     /// Movement budget of every node: the maximum movement, capped by the
-    /// relative movement of each axis through it. Computed once.
+    /// budget of each axis through it (`short_axis_cap`). Computed once.
     pub fn movement_budgets(&self) -> &[f64] {
         self.budget_cache.0.get_or_init(|| {
             let mut budgets = vec![self.policy.maximum_movement; self.node_ids.len()];
@@ -146,7 +153,7 @@ impl Report {
                 let [a, b] = axis
                     .endpoints
                     .map(|e| DVec3::from_array(self.reference_points[e]));
-                let cap = self.policy.relative_movement * a.distance(b);
+                let cap = short_axis_cap(&self.policy, a.distance(b), self.short_axis_movement);
                 for anchor in &axis.anchors {
                     budgets[anchor.node] = budgets[anchor.node].min(cap);
                 }
@@ -211,14 +218,30 @@ fn narrowest_extent(points: &[[f64; 2]]) -> f64 {
     hi - lo
 }
 
+/// Movement budget of the nodes of an axis: a fraction of its length, but
+/// an axis shorter than the minimum length keeps its vector in the solve
+/// (it may only translate, undistorted), so its nodes may move as far as a
+/// node may lie off its plane, like the surfaces carrying it.
+fn short_axis_cap(policy: &Policy, length: f64, plane_distance: f64) -> f64 {
+    let relative = policy.relative_movement * length;
+    policy
+        .maximum_movement
+        .min(if length < policy.minimum_length {
+            relative.max(plane_distance)
+        } else {
+            relative
+        })
+}
+
 /// Merge support families whose common nodes cannot lie on one line of
-/// their intersection direction: spread more than `tolerance` across it
-/// (nearly parallel walls, e.g. an upper wall kinked by a few degrees over a
-/// straight lower wall, both through the nodes of the slab edge; the solve
-/// would pull those nodes onto the far kink line). Plane offsets are free
-/// in the solve, so common nodes along one line (a corner) are consistent.
-/// They become one panel when every node of both lies within `tolerance`
-/// of one plane; pairs are taken by the smallest merged deviation first.
+/// their intersection direction: spread across it by more than the plane
+/// distance (nearly parallel walls, e.g. an upper wall kinked by a few
+/// degrees over a straight lower wall, both through the nodes of the slab
+/// edge; the solve would pull those nodes onto the kink line, ill
+/// conditioned). Plane offsets are free in the solve, so common nodes along
+/// one line (a corner) are consistent. They become one panel when all nodes
+/// of both lie within `tolerance` of one plane (a curved wall becomes larger
+/// planar panels); pairs are taken by the smallest merged deviation first.
 fn merge_kinked_families(
     mesh: &MeshData,
     report: &planes::Report,
@@ -272,20 +295,19 @@ fn merge_kinked_families(
         }
         let kinked: Vec<(usize, usize)> = common
             .into_iter()
-            .filter(|((f, g), nodes)| {
-                let (Some(a), Some(b)) = (fitted[*f], fitted[*g]) else {
-                    return false;
-                };
+            .filter_map(|((f, g), nodes)| {
+                let (a, b) = (fitted[f]?, fitted[g]?);
                 let u = a.0.cross(b.0);
-                if u.length() <= 1e-12 {
-                    return true;
-                }
-                let u = u.normalize();
-                let across: Vec<DVec3> = nodes.iter().map(|p| *p - u * u.dot(*p)).collect();
-                let c = across.iter().copied().sum::<DVec3>() / across.len() as f64;
-                across.iter().any(|q| q.distance(c) > tolerance)
+                let spread = if u.length() <= 1e-12 {
+                    f64::INFINITY
+                } else {
+                    let u = u.normalize();
+                    let across: Vec<DVec3> = nodes.iter().map(|p| *p - u * u.dot(*p)).collect();
+                    let c = across.iter().copied().sum::<DVec3>() / across.len() as f64;
+                    across.iter().map(|q| q.distance(c)).fold(0., f64::max)
+                };
+                (spread > report.policy.distance).then_some((f, g))
             })
-            .map(|(pair, _)| pair)
             .collect();
         let best = kinked
             .into_iter()
@@ -807,6 +829,7 @@ fn solve_impl(
     let mut equations = vec![];
     let mut budgets = vec![policy.maximum_movement; reference.len()];
     let mut new_axes = vec![];
+    let mut deferred_short = vec![];
     let segments = segments::split(mesh, axes, planes);
     for (axis_index, (a, constructive_segment)) in segments.iter().enumerate() {
         if a.endpoint_nodes.iter().any(|n| !map.contains_key(n))
@@ -822,9 +845,7 @@ fn solve_impl(
         if !length.is_finite() || length <= policy.residual_tolerance {
             return Err("source axis shorter than minimum length");
         }
-        let cap = policy
-            .maximum_movement
-            .min(policy.relative_movement * length);
+        let cap = short_axis_cap(policy, length, planes.policy.distance);
         let mut anchors = vec![];
         for c in &a.anchors {
             let node = map[&c.node];
@@ -849,16 +870,20 @@ fn solve_impl(
         // An unresolved short feature may translate, but must not be flattened,
         // contracted or assigned a new direction from noisy source coordinates.
         if length < policy.minimum_length {
-            for k in 0..3 {
-                let mut e = equation(
-                    vec![(ends[1] * 3 + k, 1.), (ends[0] * 3 + k, -1.)],
-                    ConstraintOrigin::ShortAxisVector {
-                        axis: axis_index,
-                        component: k,
-                    },
-                );
-                e.target = d[k];
-                equations.push(e);
+            if policy.flatten_short_axes {
+                deferred_short.push((axis_index, ends, d));
+            } else {
+                for k in 0..3 {
+                    let mut e = equation(
+                        vec![(ends[1] * 3 + k, 1.), (ends[0] * 3 + k, -1.)],
+                        ConstraintOrigin::ShortAxisVector {
+                            axis: axis_index,
+                            component: k,
+                        },
+                    );
+                    e.target = d[k];
+                    equations.push(e);
+                }
             }
         }
         let directions = if *constructive_segment || length < policy.minimum_length {
@@ -979,6 +1004,64 @@ fn solve_impl(
         let origin = points.iter().map(|p| *p - center).sum::<DVec3>() / points.len() as f64;
         x.push(normal.dot(origin));
         normals.push(normal);
+    }
+    // Short axes whose ends lie on common support families keep their
+    // vector only across those families' normals.
+    let mut node_families = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for (pi, p) in planes.patches.iter().enumerate() {
+        for id in &p.source_nodes {
+            node_families
+                .entry(map[id])
+                .or_default()
+                .insert(plane_to_family[pi]);
+        }
+    }
+    let mut flattened_lengths = BTreeMap::<usize, f64>::new();
+    for (axis_index, ends, d) in deferred_short {
+        let empty = BTreeSet::new();
+        let [a, b] = ends.map(|e| node_families.get(&e).unwrap_or(&empty));
+        let mut basis: Vec<DVec3> = vec![];
+        for f in a.intersection(b) {
+            let mut n = normals[*f];
+            for q in &basis {
+                n -= *q * q.dot(n);
+            }
+            if n.length() > 1e-6 {
+                basis.push(n.normalize());
+            }
+        }
+        let fixed = basis.len();
+        for axis in [DVec3::X, DVec3::Y, DVec3::Z] {
+            let mut n = axis;
+            for q in &basis {
+                n -= *q * q.dot(n);
+            }
+            if n.length() > 1e-6 {
+                basis.push(n.normalize());
+            }
+        }
+        let kept: DVec3 = basis.iter().skip(fixed).map(|n| *n * n.dot(d)).sum();
+        // A bar mostly across the plane is not noise in it: keep its vector.
+        let fixed = if kept.length() < 0.5 * d.length() {
+            basis = vec![DVec3::X, DVec3::Y, DVec3::Z];
+            0
+        } else {
+            flattened_lengths.insert(axis_index, kept.length());
+            fixed
+        };
+        for (k, n) in basis.iter().enumerate().skip(fixed) {
+            let mut e = equation(
+                (0..3)
+                    .flat_map(|c| [(ends[1] * 3 + c, n[c]), (ends[0] * 3 + c, -n[c])])
+                    .collect(),
+                ConstraintOrigin::ShortAxisVector {
+                    axis: axis_index,
+                    component: k - fixed,
+                },
+            );
+            e.target = n.dot(d);
+            equations.push(e);
+        }
     }
     let mut surfaces = vec![];
     for (pi, p) in planes.patches.iter().enumerate() {
@@ -1134,10 +1217,15 @@ fn solve_impl(
             let [i, j] = a.endpoints;
             let old = reference[j] - reference[i];
             let new = candidate[j] - candidate[i];
+            // A short axis flattened onto its plane keeps its in-plane length.
+            let expected = flattened_lengths
+                .get(&axis)
+                .copied()
+                .unwrap_or(old.length());
             // Before convergence a length change below the residual is
             // numerical, not a collapse (it must not block the retry).
             (new.length() + policy.residual_tolerance.max(residual)
-                < policy.minimum_length.min(old.length())
+                < policy.minimum_length.min(expected)
                 || new.dot(old) <= 0.0
                 || (sliding_parameters.is_some()
                     && new.normalize().dot(old.normalize()) < policy.angle.cos()))
@@ -1207,6 +1295,7 @@ fn solve_impl(
                     .then_some(i)
             })
             .collect(),
+        short_axis_movement: planes.policy.distance,
         plane_families,
         regularized_directions: snap,
         equation_count: equations.len(),
@@ -1483,6 +1572,7 @@ mod tests {
                         residual_tolerance: 1e-8 * scale,
                         iterations: 2000,
                         panel_tolerance: 0.,
+                        flatten_short_axes: false,
                     },
                 )
                 .unwrap();
@@ -1571,6 +1661,7 @@ mod tests {
             residual_tolerance: 1e-8,
             iterations: 2000,
             panel_tolerance: 0.,
+            flatten_short_axes: false,
         }
     }
     fn run(m: &MeshData, p: &Policy) -> Report {
@@ -2241,5 +2332,101 @@ mod tests {
             p.panel_tolerance = 0.002;
             assert!(run(&m, &p).plane_families.len() > 1);
         }
+    }
+
+    #[test]
+    fn walls_meeting_at_a_corner_line_stay_separate_panels() {
+        // Two 1 m facets 3 degrees apart sharing only their vertical edge:
+        // the common nodes lie on the intersection line, no merge.
+        let turn = 3f64.to_radians();
+        let mut m = MeshData::default();
+        strip(
+            &mut m,
+            1,
+            1,
+            DVec3::new(-1., 0., 0.),
+            DVec3::ZERO,
+            DVec3::Z * 3.,
+            2,
+        );
+        let far = DVec3::new(turn.cos(), turn.sin(), 0.);
+        for (id, p) in [(7, far * 0.5), (9, far)] {
+            m.nodes.insert(id, p);
+            m.nodes.insert(id + 1, p + DVec3::Z * 3.);
+        }
+        for (id, nodes) in [(3, vec![5, 7, 8, 6]), (4, vec![7, 9, 10, 8])] {
+            m.elements.push(ElementData {
+                id,
+                elem_type: 44,
+                stiff_id: 2,
+                nodes,
+            });
+        }
+        let mut p = policy();
+        p.panel_tolerance = 0.05;
+        let r = run(&m, &p);
+        assert!(r.accepted);
+        assert_eq!(r.plane_families.len(), 2);
+    }
+
+    #[test]
+    fn short_bar_translates_with_a_node_moved_onto_its_wall_plane() {
+        // A wall node 8 mm off the wall plane carries a 20 mm bar: the node
+        // moves about 5 mm onto the plane, the bar translates with it,
+        // beyond 5 % of its length but within the plane distance.
+        let mut m = MeshData::default();
+        for (id, p) in [
+            (1, [0., 0., 0.]),
+            (2, [0., 1., 0.]),
+            (3, [0., 2., 0.]),
+            (4, [0., 0., 1.]),
+            (5, [0.008, 1., 1.]),
+            (6, [0., 2., 1.]),
+            (7, [0.028, 1., 1.]),
+        ] {
+            m.nodes.insert(id, DVec3::from_array(p));
+        }
+        for (id, nodes) in [(1, vec![1, 2, 5, 4]), (2, vec![2, 3, 6, 5])] {
+            m.elements.push(ElementData {
+                id,
+                elem_type: 44,
+                stiff_id: 1,
+                nodes,
+            });
+        }
+        m.elements.push(ElementData {
+            id: 3,
+            elem_type: 10,
+            stiff_id: 2,
+            nodes: vec![5, 7],
+        });
+        let r = run(&m, &policy());
+        assert!(r.accepted, "{:?}", r.movement_failures);
+        assert_eq!(r.short_axis_indices.len(), 1);
+        let k = |id: u32| r.node_ids.iter().position(|&n| n == id).unwrap();
+        let moved = DVec3::from_array(r.points[k(5)]).distance(m.nodes[&5]);
+        assert!(moved > 0.001 && moved <= 0.01, "{moved}");
+        let vector = DVec3::from_array(r.points[k(7)]) - DVec3::from_array(r.points[k(5)]);
+        assert!((vector - (m.nodes[&7] - m.nodes[&5])).length() < 1e-6);
+        assert!((r.movement_budgets()[k(7)] - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn short_axis_lying_on_its_plane_follows_it_in_geotechnical_mode() {
+        // The conflicting short feature (both ends on one slightly tilted
+        // plane, the bar 0.01 mm off it) is accepted when short axes follow
+        // their plane; its in-plane vector is kept.
+        let m = short_feature(true);
+        let mut p = policy();
+        p.flatten_short_axes = true;
+        let r = run(&m, &p);
+        assert!(r.accepted, "{}: {}", r.reason, r.candidate_max_residual);
+        assert!(r.axis_failures.is_empty());
+        let [i, j] = r.axes[0].endpoints;
+        let old =
+            DVec3::from_array(r.reference_points[j]) - DVec3::from_array(r.reference_points[i]);
+        let new = DVec3::from_array(r.points[j]) - DVec3::from_array(r.points[i]);
+        assert!(old.distance(new) < 1e-4, "{}", old.distance(new));
+        assert!(new.length() > 0.9 * old.length());
     }
 }
