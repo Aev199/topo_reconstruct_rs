@@ -328,17 +328,21 @@ pub(super) fn synchronize(
                     return Err("degenerate interval contact");
                 }
                 interval_contact_count += 1;
+                // An axis node closer than the minimum edge to an interval
+                // end (a bar crossing at a slab edge) is that end.
+                let snap = tolerance.max(model.minimum_edge / length);
                 for (role, t) in [(EndpointRole::Start, start_t), (EndpointRole::End, end_t)] {
                     let existing = axis_nodes[*axis]
                         .iter()
-                        .find(|(u, _)| (*u - t).abs() <= tolerance)
-                        .map(|(_, vertex)| *vertex);
-                    let (vertex, generated) = if let Some(vertex) = existing {
-                        (vertex, false)
+                        .filter(|(u, _)| (*u - t).abs() <= snap)
+                        .min_by(|x, y| (x.0 - t).abs().total_cmp(&(y.0 - t).abs()))
+                        .copied();
+                    let (t, vertex, generated) = if let Some((u, vertex)) = existing {
+                        (u, vertex, false)
                     } else {
                         let vertex = vertices.len();
                         vertices.push(start.lerp(end, t).to_array());
-                        (vertex, true)
+                        (t, vertex, true)
                     };
                     insert_axis_node(
                         &mut axis_nodes[*axis],
@@ -688,6 +692,32 @@ mod tests {
         for chain in &synced.axis_nodes {
             assert!(chain.windows(2).all(|w| w[0].0 < w[1].0));
         }
+    }
+
+    #[test]
+    fn axis_node_next_to_an_interval_end_is_that_end() {
+        // A bar node 0.4 mm before the interval start (below the 10 mm
+        // minimum edge): the start binds to it, no vertex is generated.
+        let (model, mut vertices, mut axes, contacts) = shared_edge_case();
+        vertices.push([1.0004 - 0.0008, 0., 0.]);
+        let node = vertices.len() - 1;
+        axes[0].anchors.insert(
+            1,
+            Anchor {
+                source_node: 12,
+                vertex: node,
+                t: 0.9996 / 4.,
+            },
+        );
+        let synced = synchronize(&model, &axes, &contacts, &mut vertices, &policy(), 1e-8).unwrap();
+        let starts: Vec<_> = synced
+            .report
+            .endpoint_bindings
+            .iter()
+            .filter(|b| matches!(b.role, EndpointRole::Start))
+            .collect();
+        assert!(starts.iter().all(|b| b.vertex == node && !b.generated));
+        assert!(starts.iter().all(|b| b.parameter == 0.9996 / 4.));
     }
 
     #[test]
