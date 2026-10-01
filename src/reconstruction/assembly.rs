@@ -381,6 +381,35 @@ fn intersection(point: DVec3, planes: &[&PlaneFrame], precision: f64) -> Option<
     .then_some(result)
 }
 
+/// A support takes its concurrent offset only if all nodes of its surfaces
+/// (support, points) stay within `tolerance` of it; one support that does
+/// not fit no longer withdraws the projection from the whole model. Returns
+/// the supports and whether every one took its proposal.
+fn fitting_supports(
+    proposal: Vec<PlaneFrame>,
+    candidate: &[PlaneFrame],
+    surfaces: impl Iterator<Item = (usize, Vec<[f64; 3]>)>,
+    tolerance: f64,
+) -> (Vec<PlaneFrame>, bool) {
+    let mut fits = vec![true; candidate.len()];
+    for (r, points) in surfaces {
+        if !points
+            .iter()
+            .all(|p| proposal[r].distance(*p).abs() <= tolerance)
+        {
+            fits[r] = false;
+        }
+    }
+    let all = fits.iter().all(|&f| f);
+    let supports = proposal
+        .into_iter()
+        .zip(candidate)
+        .zip(&fits)
+        .map(|((p, c), &f)| if f { p } else { c.clone() })
+        .collect();
+    (supports, all)
+}
+
 /// Enforce concurrence by projecting support offsets onto the linear
 /// compatibility constraints. Normals remain fixed; no per-surface node copies.
 fn concurrent_supports(planes: &[PlaneFrame], junctions: &[Vec<usize>]) -> Vec<PlaneFrame> {
@@ -841,20 +870,25 @@ fn assemble_impl(
         .collect();
     timer.lap("stacked_walls");
     let proposal = concurrent_supports(&source.candidate_planes, &junctions);
-    let support_offsets_adjusted = source.surfaces.iter().enumerate().all(|(i, s)| {
-        aligned.contains(&i)
-            || s.nodes.iter().all(|&n| {
-                proposal[support_representatives[i]]
-                    .distance(source.candidate_points[n])
-                    .abs()
-                    <= policy.closure_tolerance
-            })
-    });
-    let closed_supports = if support_offsets_adjusted {
-        proposal
-    } else {
-        source.candidate_planes.clone()
-    };
+    let (closed_supports, support_offsets_adjusted) = fitting_supports(
+        proposal,
+        &source.candidate_planes,
+        source
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !aligned.contains(i))
+            .map(|(i, s)| {
+                (
+                    support_representatives[i],
+                    s.nodes
+                        .iter()
+                        .map(|&n| source.candidate_points[n])
+                        .collect::<Vec<_>>(),
+                )
+            }),
+        policy.closure_tolerance,
+    );
     timer.lap("concurrent_supports");
     let mut rejected_vertices = BTreeMap::new();
     let mut closed_points = BTreeMap::new();
@@ -2477,5 +2511,21 @@ mod tests {
         let mut ring = vec![1, 2, 2, 3, 1];
         collapse_backtracks(&mut ring);
         assert_eq!(ring, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn support_projection_is_kept_where_it_fits() {
+        let plane = |z: f64| PlaneFrame::new([0., 0., z], [0., 0., 1.]).unwrap();
+        let candidate = vec![plane(0.), plane(1.)];
+        // The first support moves 0.5 mm, the second 5 mm.
+        let proposal = vec![plane(0.0005), plane(1.005)];
+        let surfaces = vec![
+            (0, vec![[0., 0., 0.], [1., 0., 0.]]),
+            (1, vec![[0., 0., 1.]]),
+        ];
+        let (supports, all) = fitting_supports(proposal, &candidate, surfaces.into_iter(), 0.001);
+        assert!(!all);
+        assert!((supports[0].origin[2] - 0.0005).abs() < 1e-12);
+        assert_eq!(supports[1].origin, candidate[1].origin);
     }
 }
