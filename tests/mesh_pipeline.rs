@@ -82,6 +82,7 @@ fn run_with(
             iterations: 1000,
             panel_tolerance: 0.,
             geotechnical: false,
+            over_constrained_panels: false,
         },
     )
     .unwrap();

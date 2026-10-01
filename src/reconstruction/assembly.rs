@@ -1509,6 +1509,7 @@ mod tests {
                 iterations: 100,
                 panel_tolerance: 0.,
                 geotechnical: false,
+                over_constrained_panels: false,
             },
         )
         .unwrap()
@@ -2411,6 +2412,7 @@ mod tests {
                 iterations: 100,
                 panel_tolerance: 0.,
                 geotechnical: false,
+                over_constrained_panels: false,
             },
         )
         .unwrap();

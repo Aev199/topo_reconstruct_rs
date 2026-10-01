@@ -138,6 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             iterations: 1000,
             panel_tolerance: 0.,
             geotechnical: false,
+            over_constrained_panels: false,
         },
     )?;
     let topology = assembly::assemble(

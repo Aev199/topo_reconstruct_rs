@@ -198,34 +198,50 @@ fn run_v2_preview(
     } else {
         tolerances.gap_closure
     };
-    let result = frame::solve_closing_gaps(
-        &mesh,
-        &axes,
-        &plane_report,
-        &frame::Policy {
-            up: [0., 0., 1.],
-            angle: 0.02,
-            maximum_movement: 0.15,
-            relative_movement: 0.05,
-            minimum_length: 0.03,
-            residual_tolerance: 1e-7,
-            iterations,
-            // Nearly parallel walls through common nodes may be joined into
-            // one panel within the tolerance for aligning walls in one line.
-            panel_tolerance: if preserve_details {
-                0.
-            } else {
-                tolerances.stack_offset
-            },
-            // A short bar lying in a wall or slab follows its plane.
-            geotechnical: !preserve_details,
+    let frame_policy = |over_constrained_panels: bool| frame::Policy {
+        up: [0., 0., 1.],
+        angle: 0.02,
+        maximum_movement: 0.15,
+        relative_movement: 0.05,
+        minimum_length: 0.03,
+        residual_tolerance: 1e-7,
+        iterations,
+        // Nearly parallel walls through common nodes may be joined into
+        // one panel within the tolerance for aligning walls in one line.
+        panel_tolerance: if preserve_details {
+            0.
+        } else {
+            tolerances.stack_offset
         },
-        // Doubling iteration budgets: 1, 2, 4 and 8 times the base (a
-        // curved-wall model needed about 4800 iterations).
-        4,
-        gap_tolerance,
-        0.001,
-    )?;
+        // A short bar lying in a wall or slab follows its plane.
+        geotechnical: !preserve_details,
+        over_constrained_panels,
+    };
+    let solve = |policy: &frame::Policy| {
+        frame::solve_closing_gaps(
+            &mesh,
+            &axes,
+            &plane_report,
+            policy,
+            // Doubling iteration budgets: 1, 2, 4 and 8 times the base (a
+            // curved-wall model needed about 4800 iterations).
+            4,
+            gap_tolerance,
+            0.001,
+        )
+    };
+    // Relaxation ladder: a frame the default rules cannot satisfy is solved
+    // again with panels merged at over-constrained nodes (geotechnical
+    // only). The step used is reported.
+    let mut relaxation = 0;
+    let mut result = solve(&frame_policy(false))?;
+    if !result.accepted && !preserve_details {
+        let relaxed = solve(&frame_policy(true))?;
+        if relaxed.accepted {
+            result = relaxed;
+            relaxation = 1;
+        }
+    }
     lap("frame");
     let assembly_policy = assembly::Policy {
         closure_tolerance: 0.001,
@@ -285,6 +301,7 @@ fn run_v2_preview(
         "reconciliation": reconciliation,
         "axis_recognition": axes,
         "plane_recognition": plane_report,
+        "relaxation": { "frame": relaxation },
     });
     if include_mesh {
         report["mesh"] = serde_json::to_value(mesh_report)?;

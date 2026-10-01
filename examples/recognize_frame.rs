@@ -44,6 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         iterations,
         panel_tolerance: 0.,
         geotechnical: false,
+        over_constrained_panels: false,
     };
     if sliding_steps > 0 {
         let result = frame::solve_sliding(&mesh, &axes, &planes, &policy, sliding_steps)?;

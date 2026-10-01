@@ -28,6 +28,12 @@ pub struct Policy {
     /// support family keeps its vector only along that family's plane, and
     /// every axis node may move at least the plane distance.
     pub geotechnical: bool,
+    /// Also merge support families at an over-constrained node (on three or
+    /// more families whose planes do not meet near it, or on four or more
+    /// non-parallel ones: a slab bump of tilted triangles). A relaxation
+    /// step: facets of a polygonal curved wall meet that way too, and merged
+    /// they move their corners far.
+    pub over_constrained_panels: bool,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Anchor {
@@ -250,6 +256,7 @@ fn merge_kinked_families(
     report: &planes::Report,
     mut families: Vec<Vec<usize>>,
     tolerance: f64,
+    over_constrained: bool,
 ) -> Vec<Vec<usize>> {
     if tolerance <= 0. {
         return families;
@@ -318,7 +325,7 @@ fn merge_kinked_families(
         // non-parallel pair of them is a candidate.
         let mut kinked = kinked;
         for (n, fs) in &node_families {
-            if fs.len() < 3 {
+            if !over_constrained || fs.len() < 3 {
                 continue;
             }
             let planes: Vec<(DVec3, DVec3)> = fs
@@ -973,7 +980,13 @@ fn solve_impl(
     }
     let support = support_families(mesh, planes);
     let unmerged: BTreeSet<Vec<usize>> = support.iter().cloned().collect();
-    let plane_families = merge_kinked_families(mesh, planes, support, policy.panel_tolerance);
+    let plane_families = merge_kinked_families(
+        mesh,
+        planes,
+        support,
+        policy.panel_tolerance,
+        policy.over_constrained_panels,
+    );
     let mut plane_to_family = vec![0; planes.patches.len()];
     let mut normals = vec![];
     let mut pending: Vec<(DVec3, Vec<DVec3>)> = vec![];
@@ -1655,6 +1668,7 @@ mod tests {
                         iterations: 2000,
                         panel_tolerance: 0.,
                         geotechnical: false,
+                        over_constrained_panels: false,
                     },
                 )
                 .unwrap();
@@ -1744,6 +1758,7 @@ mod tests {
             iterations: 2000,
             panel_tolerance: 0.,
             geotechnical: false,
+            over_constrained_panels: false,
         }
     }
     fn run(m: &MeshData, p: &Policy) -> Report {
@@ -2724,6 +2739,9 @@ mod tests {
         let mut p = policy();
         p.panel_tolerance = 0.05;
         p.geotechnical = true;
+        // A relaxation step: by default the bump faces stay separate.
+        assert!(run(&m, &p).plane_families.len() > 1);
+        p.over_constrained_panels = true;
         let r = run(&m, &p);
         assert_eq!(r.plane_families.len(), 1, "{:?}", r.plane_families);
         assert!(r.accepted, "{}: {}", r.reason, r.candidate_max_residual);
@@ -2739,6 +2757,7 @@ mod tests {
         let mut p = policy();
         p.panel_tolerance = 0.05;
         p.geotechnical = true;
+        p.over_constrained_panels = true;
         let r = run(&m, &p);
         assert_eq!(r.plane_families.len(), 1, "{:?}", r.plane_families);
         assert!(r.accepted);
@@ -2756,6 +2775,7 @@ mod tests {
         let mut p = policy();
         p.panel_tolerance = 0.05;
         p.geotechnical = true;
+        p.over_constrained_panels = true;
         let r = run(&m, &p);
         assert_eq!(r.plane_families.len(), 1);
         for plane in &r.candidate_planes {
