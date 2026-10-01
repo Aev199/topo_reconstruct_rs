@@ -328,11 +328,21 @@ def check(data, baseline=None):
     # Generated crossings of a bar with a surface carry no source node; each
     # is reported with its axis and lies on the plane of its surface.
     no_source = 4294967295
+    # A crossing of two bars is a generated vertex reported for each bar, on
+    # both of them.
     crossings = {(c["axis"], c["vertex"]): c for c in bars.get("imprinted", [])
-                 if c["kind"] == "crossing"}
+                 if c["kind"] in ("crossing", "bar_crossing")}
     for (k, v), c in crossings.items():
         assert c["source_node"] == no_source
-        assert abs(distance(model["surfaces"][c["surface"]], vertices[v])) <= epsilon
+        if c["kind"] == "crossing":
+            assert abs(distance(model["surfaces"][c["surface"]], vertices[v])) <= epsilon
+        else:
+            a, b = (vertices[w] for w in bars["axes"][k]["endpoints"])
+            p = [x + (y - x) * c["t"] for x, y in zip(a, b)]
+            assert math.dist(p, vertices[v]) <= epsilon
+    bar_crossings = collections.Counter(c["vertex"] for c in bars.get("imprinted", [])
+                                        if c["kind"] == "bar_crossing")
+    assert all(n == 2 for n in bar_crossings.values())
     for k, axis in enumerate(bars["axes"]):
         original = frame["axes"][axis["source_axis"]]
         assert len(axis["endpoints"]) == 2

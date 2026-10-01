@@ -1427,13 +1427,18 @@ fn assemble_impl(
     axis_assembly.imprinted =
         bars::imprint_surface_vertices(&mut model, &mut axis_assembly.axes, &vertex_source_nodes);
     if features.is_some() {
-        let crossings = bars::imprint_crossings(&mut model, &mut axis_assembly.axes);
-        junctions.generated_vertices.extend(
-            crossings
-                .iter()
-                .filter(|c| c.kind == "crossing")
-                .map(|c| c.vertex),
-        );
+        let mut crossings = bars::imprint_crossings(&mut model, &mut axis_assembly.axes);
+        crossings.extend(bars::imprint_bar_crossings(
+            &mut model,
+            &mut axis_assembly.axes,
+        ));
+        // Generated vertices (a bar crossing is reported once per bar).
+        let generated: BTreeSet<usize> = crossings
+            .iter()
+            .filter(|c| c.kind == "crossing" || c.kind == "bar_crossing")
+            .map(|c| c.vertex)
+            .collect();
+        junctions.generated_vertices.extend(generated);
         axis_assembly.imprinted.extend(crossings);
     }
     bars::refresh_contacts(&model, &axis_assembly.axes, &mut axis_assembly.contacts);

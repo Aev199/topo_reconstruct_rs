@@ -84,8 +84,9 @@ pub struct Imprint {
     pub source_node: u32,
     pub t: f64,
     /// `surface_vertex` (a surface vertex on the axis), `crossing` (the
-    /// bar passes through the surface) or `slid_anchor` (a bar node slid
-    /// along its bar onto the crossing next to it).
+    /// bar passes through the surface), `slid_anchor` (a bar node slid
+    /// along its bar onto the crossing next to it) or `bar_crossing` (a
+    /// vertex shared with a crossing bar).
     pub kind: String,
     pub surface: Option<usize>,
     /// Movement of the vertex (onto the axis, or along it).
@@ -222,6 +223,104 @@ pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
                 kind: kind.into(),
                 surface: Some(s),
                 movement,
+            });
+        }
+    }
+    out
+}
+
+/// Two bars crossing at a point away from their nodes (beams lying in one
+/// slab, one passing through the span of another) share a generated vertex
+/// there: it becomes an anchor of both. Crossings within the minimum edge
+/// of a node of either bar are left alone, as are bars already sharing a
+/// node and parallel bars.
+pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
+    let precision = model.precision;
+    let minimum = model.minimum_edge;
+    // Endpoints never move here.
+    let points: Vec<[DVec3; 2]> = axes
+        .iter()
+        .map(|a| a.endpoints.map(|v| DVec3::from_array(model.vertices[v])))
+        .collect();
+    let ends = |_: &[Axis], i: usize| points[i];
+    let lengths: Vec<f64> = points.iter().map(|[a, b]| a.distance(*b)).collect();
+    let cell = lengths.iter().sum::<f64>() / lengths.len().max(1) as f64;
+    if !(cell > precision) {
+        return vec![];
+    }
+    let key = |p: DVec3| ((p / cell).floor()).as_ivec3().to_array();
+    let mut grid = BTreeMap::<[i32; 3], Vec<usize>>::new();
+    for i in 0..axes.len() {
+        let [a, b] = ends(axes, i);
+        let (lo, hi) = (key(a.min(b) - precision), key(a.max(b) + precision));
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    grid.entry([x, y, z]).or_default().push(i);
+                }
+            }
+        }
+    }
+    let mut pairs = BTreeSet::new();
+    for members in grid.values() {
+        for (k, &i) in members.iter().enumerate() {
+            for &j in &members[k + 1..] {
+                pairs.insert((i.min(j), i.max(j)));
+            }
+        }
+    }
+    let mut out = vec![];
+    for (i, j) in pairs {
+        let shared = axes[i]
+            .anchors
+            .iter()
+            .any(|x| axes[j].anchors.iter().any(|y| y.vertex == x.vertex));
+        if shared {
+            continue;
+        }
+        let ([a0, a1], [b0, b1]) = (ends(axes, i), ends(axes, j));
+        let (d1, d2, r) = (a1 - a0, b1 - b0, a0 - b0);
+        let (a, b, e) = (d1.length_squared(), d1.dot(d2), d2.length_squared());
+        let denominator = a * e - b * b;
+        if denominator <= 1e-12 * a * e {
+            continue;
+        }
+        let (c, f) = (d1.dot(r), d2.dot(r));
+        let (s, t) = ((b * f - c * e) / denominator, (a * f - b * c) / denominator);
+        if !(s > 0. && s < 1. && t > 0. && t < 1.) {
+            continue;
+        }
+        let (pa, pb) = (a0 + d1 * s, b0 + d2 * t);
+        if pa.distance(pb) > precision {
+            continue;
+        }
+        let near = |k: usize, u: f64| {
+            axes[k]
+                .anchors
+                .iter()
+                .any(|x| (x.t - u).abs() * lengths[k] < minimum)
+        };
+        if near(i, s) || near(j, t) {
+            continue;
+        }
+        let Ok(v) = model.add_vertex(((pa + pb) * 0.5).to_array()) else {
+            continue;
+        };
+        for (k, u) in [(i, s), (j, t)] {
+            axes[k].anchors.push(Anchor {
+                source_node: NO_SOURCE_NODE,
+                vertex: v,
+                t: u,
+            });
+            axes[k].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+            out.push(Imprint {
+                axis: k,
+                vertex: v,
+                source_node: NO_SOURCE_NODE,
+                t: u,
+                kind: "bar_crossing".into(),
+                surface: None,
+                movement: 0.,
             });
         }
     }
@@ -1191,6 +1290,53 @@ mod tests {
                 } else {
                     assert_eq!(r[0].kind, "crossing");
                     assert_eq!(axes[0].anchors.len(), 4);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn crossing_bars_share_a_generated_vertex() {
+        use super::super::junctions::tests::Placement;
+        for place in Placement::all() {
+            // Bar A along y = 1; bar B along x = 1 crosses it at (1, 1, 0).
+            // 2 mm above A, B misses it; crossing 0.5 mm from A's end, the
+            // near touch is left alone.
+            for (b0, b1, crossing) in [
+                ([1., 0., 0.], [1., 2., 0.], true),
+                ([1., 0., 0.002], [1., 2., 0.002], false),
+                ([1.9995, 0., 0.], [1.9995, 2., 0.], false),
+            ] {
+                let mut m = Model::new(1e-7 * place.scale, 0.001 * place.scale).unwrap();
+                let mut bar = |p: [f64; 3], q: [f64; 3], source_axis: usize| {
+                    let [a, b] = [p, q].map(|x| m.add_vertex(place.point(x)).unwrap());
+                    Axis {
+                        source_axis,
+                        endpoints: [a, b],
+                        anchors: [(a, 0.), (b, 1.)]
+                            .map(|(vertex, t)| Anchor {
+                                source_node: vertex as u32,
+                                vertex,
+                                t,
+                            })
+                            .to_vec(),
+                        spans: vec![],
+                    }
+                };
+                let mut axes = vec![bar([0., 1., 0.], [2., 1., 0.], 0), bar(b0, b1, 1)];
+                let r = imprint_bar_crossings(&mut m, &mut axes);
+                assert_eq!(r.len(), if crossing { 2 } else { 0 }, "{r:?}");
+                if crossing {
+                    let v = r[0].vertex;
+                    assert_eq!(r[1].vertex, v);
+                    let p = DVec3::from_array(m.vertices[v]);
+                    let expected = DVec3::from_array(place.point([1., 1., 0.]));
+                    assert!(p.distance(expected) < 1e-9 * place.scale);
+                    for axis in &axes {
+                        assert_eq!(axis.anchors.len(), 3);
+                        assert_eq!(axis.anchors[1].vertex, v);
+                        assert!((axis.anchors[1].t - 0.5).abs() < 1e-9);
+                    }
                 }
             }
         }
