@@ -75,14 +75,25 @@ bars, sliver regions and kinked walls are handled by general rules
   contact (micrometre to 0.5 m), one bar anchor outside its surface, trial
   mesh angles (external mesher gate still false);
 - ЖК Остров: kinked walls merged into panels, the 175 mm frame movement and
-  all 24 contour issues are gone, the frame converges with an 8x iteration
-  budget (about 4800 iterations, maximum movement 68 mm). Open: trial mesh
-  "constraint crossing requires explicit shared vertex";
-- Багратион v4: runtime hours -> about 9 minutes (quadratic stages
-  removed). Open: frame not accepted (one node of a 32.8 mm bar moves
-  2.1 mm, budget 1.64 mm = 5 % of its length, just above the 30 mm short
-  axis threshold), 24 surface issues, many bars on unbuilt regions. The
-  global geometry audit takes over 30 minutes on it.
+  all 24 contour issues are gone, the frame converges (about 4800
+  iterations, fourth retry; frame stage about 34 minutes, maximum movement
+  68 mm). Open: trial mesh "constraint crossing requires explicit shared
+  vertex"; frame runtime (retries restart from the source);
+- Багратион v4: runtime hours -> about 30 minutes (quadratic stages
+  removed; the frame needs the 8x retry). Frame now accepted after the
+  geotechnical rules below; 0 rejected vertices (was 11), surface issues
+  20 -> 1 (one contour_InvalidRing), unbuilt-region bars ~1400 -> 20.
+  Open: that ring, 17 axis length/orientation and 1 direction conflict,
+  trial mesh "distinct constraint vertices coincide". The global geometry
+  audit takes over 30 minutes on it.
+
+Geotechnical rules added for these (PLAXIS geometry; deviation from the
+source scheme is allowed, user decision 2026-10-01): bar nodes may move at
+least the plane distance; short axes keep length and direction class, not
+transverse noise; support families with nodes on four non-parallel planes
+or whose planes do not meet near a node merge into panels within 50 mm;
+merged panels snap horizontal/vertical within 50 mm; concurrent support
+offsets apply per support.
 
 Previous fixtures:
 
