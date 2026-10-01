@@ -338,10 +338,17 @@ fn merge_kinked_families(
                 .map(|(n, c)| n.dot(p + delta - *c).abs())
                 .fold(0., f64::max);
             if delta.length() > report.policy.distance || off > report.policy.distance {
+                // Nearly parallel families (within the recognition angle)
+                // are consistent through their free offsets in the solve.
                 let fs: Vec<usize> = fs.iter().copied().collect();
                 for (k, &f) in fs.iter().enumerate() {
                     for &g in &fs[k + 1..] {
-                        kinked.push((f, g));
+                        let (Some(a), Some(b)) = (fitted[f], fitted[g]) else {
+                            continue;
+                        };
+                        if a.0.dot(b.0).abs() < report.policy.angle.cos() {
+                            kinked.push((f, g));
+                        }
                     }
                 }
             }
