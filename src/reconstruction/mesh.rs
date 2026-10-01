@@ -198,6 +198,11 @@ fn subdivide(
     }
     Ok(out)
 }
+/// Bar interval ends and bar nodes within this many precisions are one point
+/// (separately computed intersections of one bar with a surface edge and
+/// with another bar differ by floating error).
+pub(super) const ENDPOINT_SLACK: f64 = 10.;
+
 /// Details of a mesh failure on stderr when TOPO_DIAG is set (the error
 /// itself is a static reason).
 pub(super) fn diagnostic(message: impl FnOnce() -> String) {
@@ -475,15 +480,18 @@ fn build_impl(
                         .distance(point(&vertices[axes[axis].endpoints[1]]));
                     let tolerance = eps / length;
                     let chain = &axis_nodes[axis];
-                    if ![start_t, end_t]
-                        .iter()
-                        .all(|t| chain.iter().any(|(u, _)| (t - u).abs() <= tolerance))
-                    {
+                    if ![start_t, end_t].iter().all(|t| {
+                        chain
+                            .iter()
+                            .any(|(u, _)| (t - u).abs() <= ENDPOINT_SLACK * tolerance)
+                    }) {
                         return Err("contact endpoint requires explicit intersection vertex");
                     }
                     let mut interval_edges = Vec::new();
                     for pair in chain.windows(2) {
-                        if pair[0].0 >= start_t - tolerance && pair[1].0 <= end_t + tolerance {
+                        if pair[0].0 >= start_t - ENDPOINT_SLACK * tolerance
+                            && pair[1].0 <= end_t + ENDPOINT_SLACK * tolerance
+                        {
                             let edge = key(pair[0].1, pair[1].1);
                             constraints.insert(edge);
                             interval_edges.push(edge);
@@ -637,7 +645,9 @@ fn build_impl(
                 ) else {
                     continue;
                 };
-                if t < start_t - tolerance || t > end_t + tolerance {
+                if t < start_t - ENDPOINT_SLACK * tolerance
+                    || t > end_t + ENDPOINT_SLACK * tolerance
+                {
                     continue;
                 }
                 let canonical = axis_nodes[axis]

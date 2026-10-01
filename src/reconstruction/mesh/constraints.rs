@@ -5,7 +5,7 @@
 //! surface owning the edge.  This keeps surface constraints and bar chains
 //! conforming without welding vertices by proximity.
 
-use super::{diagnostic, parameter, point, sorted, subdivide, Policy};
+use super::{diagnostic, parameter, point, sorted, subdivide, Policy, ENDPOINT_SLACK};
 use crate::reconstruction::{
     assembly::bars::{Axis, Contact},
     Model,
@@ -328,9 +328,10 @@ pub(super) fn synchronize(
                     return Err("degenerate interval contact");
                 }
                 interval_contact_count += 1;
-                // An axis node closer than the minimum edge to an interval
-                // end (a bar crossing at a slab edge) is that end.
-                let snap = tolerance.max(model.minimum_edge / length);
+                // An axis node within the endpoint slack of an interval end
+                // (a bar crossing computed separately at a slab edge) is
+                // that end.
+                let snap = ENDPOINT_SLACK * tolerance;
                 for (role, t) in [(EndpointRole::Start, start_t), (EndpointRole::End, end_t)] {
                     let existing = axis_nodes[*axis]
                         .iter()
@@ -446,7 +447,10 @@ pub(super) fn synchronize(
                     surface,
                     axis_nodes[axis]
                         .iter()
-                        .filter(|(t, _)| *t >= start_t && *t <= end_t)
+                        .filter(|(t, _)| {
+                            let slack = ENDPOINT_SLACK * precision / geometries[axis].2;
+                            *t >= start_t - slack && *t <= end_t + slack
+                        })
                         .map(|(_, vertex)| *vertex)
                         .collect(),
                 ),
@@ -504,7 +508,9 @@ pub(super) fn synchronize(
                 ) {
                     let length = point(&vertices[a]).distance(point(&vertices[b]));
                     let tolerance = precision / length;
-                    if t >= start_t - tolerance && t <= end_t + tolerance {
+                    if t >= start_t - ENDPOINT_SLACK * tolerance
+                        && t <= end_t + ENDPOINT_SLACK * tolerance
+                    {
                         insert_axis_node(
                             &mut axis_nodes[axis],
                             t,
@@ -696,17 +702,18 @@ mod tests {
 
     #[test]
     fn axis_node_next_to_an_interval_end_is_that_end() {
-        // A bar node 0.4 mm before the interval start (below the 10 mm
-        // minimum edge): the start binds to it, no vertex is generated.
+        // A bar node 50 nm before the interval start (within the endpoint
+        // slack of 10 precisions): the start binds to it, no vertex is
+        // generated.
         let (model, mut vertices, mut axes, contacts) = shared_edge_case();
-        vertices.push([1.0004 - 0.0008, 0., 0.]);
+        vertices.push([1. - 5e-8, 0., 0.]);
         let node = vertices.len() - 1;
         axes[0].anchors.insert(
             1,
             Anchor {
                 source_node: 12,
                 vertex: node,
-                t: 0.9996 / 4.,
+                t: (1. - 5e-8) / 4.,
             },
         );
         let synced = synchronize(&model, &axes, &contacts, &mut vertices, &policy(), 1e-8).unwrap();
@@ -717,7 +724,7 @@ mod tests {
             .filter(|b| matches!(b.role, EndpointRole::Start))
             .collect();
         assert!(starts.iter().all(|b| b.vertex == node && !b.generated));
-        assert!(starts.iter().all(|b| b.parameter == 0.9996 / 4.));
+        assert!(starts.iter().all(|b| b.parameter == (1. - 5e-8) / 4.));
     }
 
     #[test]

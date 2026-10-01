@@ -87,6 +87,8 @@ pub struct Report {
     pub bar_ends: cleanup::MergeReport,
     /// Surface vertices identified with nearly coincident bar nodes.
     pub bar_anchors: cleanup::MergeReport,
+    /// Bar ends joined to the span of a nearby bar (geotechnical).
+    pub bar_tees: cleanup::TeeReport,
     /// Short edges between needed corners collapsed into one vertex.
     pub short_edge_merges: cleanup::MergeReport,
     /// Bar pieces shorter than the edge collapse tolerance, collapsed.
@@ -1296,6 +1298,21 @@ fn assemble_impl(
         contacts: &mut axis_assembly.contacts,
     });
     let (_, _, fixed) = protected(&model, &axis_assembly);
+    // Bar ends a few millimetres off the span of another bar join it.
+    let bar_tees = match features {
+        Some(features) if features.maximum_wall_end_snap > 0. => cleanup::join_bar_tees(
+            &mut model,
+            &mut cleanup::Bars {
+                axes: &mut axis_assembly.axes,
+                contacts: &mut axis_assembly.contacts,
+            },
+            features.maximum_wall_end_snap,
+            &fixed,
+            &vertex_source_nodes,
+        ),
+        _ => cleanup::TeeReport::default(),
+    };
+    let (_, _, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
     let gaps = match features {
         Some(features) if features.maximum_gap > 0. => gaps::close(
@@ -1464,6 +1481,7 @@ fn assemble_impl(
         wall_ends,
         bar_ends,
         bar_anchors,
+        bar_tees,
         short_edge_merges,
         short_bars,
         removed_slivers,

@@ -11,7 +11,7 @@
 //! stopping next to a contour corner are merged into one vertex: the
 //! geotechnical model is deliberately simplified, and every merge is
 //! recorded with its source nodes.
-use super::bars::{Axis, Contact};
+use super::bars::{Anchor, Axis, Contact};
 use crate::reconstruction::{Model, PlaneFrame};
 use glam::DVec3;
 use serde::Serialize;
@@ -1072,6 +1072,193 @@ pub fn merge_bar_ends(
     }
 }
 
+/// A bar end joined to the span of another bar (a T junction).
+#[derive(Debug, Serialize)]
+pub struct BarTee {
+    pub vertex: usize,
+    pub source_node: u32,
+    /// The bar whose span takes the end as a node.
+    pub source_axis: usize,
+    pub t: f64,
+    pub distance: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RejectedTee {
+    pub vertex: usize,
+    pub source_axis: usize,
+    pub distance: f64,
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct TeeReport {
+    pub tolerance: f64,
+    pub joined: Vec<BarTee>,
+    pub rejected: Vec<RejectedTee>,
+}
+
+/// Join a bar end lying within `tolerance` of the span of another bar (beams
+/// meeting a beam a few millimetres off it; a node where several beams meet
+/// next to a beam): the end moves onto that bar, its own bars staying
+/// straight, and becomes a node of it. Closest first; an end next to a node
+/// of the other bar (within the minimum edge) is left to the end and node
+/// merges, an end that is an interior node of a bar never moves, and the end
+/// must stay on the planes of the surfaces it belongs to.
+pub fn join_bar_tees(
+    model: &mut Model,
+    bars: &mut Bars<'_>,
+    tolerance: f64,
+    fixed: &BTreeSet<usize>,
+    source_nodes: &[u32],
+) -> TeeReport {
+    let mut report = TeeReport {
+        tolerance,
+        ..Default::default()
+    };
+    let (precision, minimum) = (model.precision, model.minimum_edge);
+    let point = |model: &Model, v: usize| DVec3::from_array(model.vertices[v]);
+    let ends: BTreeSet<usize> = bars.axes.iter().flat_map(|a| a.endpoints).collect();
+    let cell = tolerance.max(precision);
+    let key = |p: DVec3| (p / cell).floor().as_ivec3().to_array();
+    let mut grid = std::collections::BTreeMap::<[i32; 3], Vec<usize>>::new();
+    for (k, a) in bars.axes.iter().enumerate() {
+        let [p, q] = a.endpoints.map(|v| point(model, v));
+        let (lo, hi) = (key(p.min(q) - tolerance), key(p.max(q) + tolerance));
+        // Bars far longer than the tolerance span many cells; bounded by
+        // their length over the tolerance.
+        for x in lo[0]..=hi[0] {
+            for y in lo[1]..=hi[1] {
+                for z in lo[2]..=hi[2] {
+                    let c = DVec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5) * cell;
+                    let d = q - p;
+                    let u = ((c - p).dot(d) / d.length_squared()).clamp(0., 1.);
+                    if (p + d * u).distance(c) <= cell + tolerance {
+                        grid.entry([x, y, z]).or_default().push(k);
+                    }
+                }
+            }
+        }
+    }
+    // Distance, end, bar and parameter of the span point closest to the end.
+    let candidate = |model: &Model, axes: &[Axis], v: usize, k: usize| {
+        let a = &axes[k];
+        if a.anchors.iter().any(|x| x.vertex == v) || a.endpoints.contains(&v) {
+            return None;
+        }
+        let [p, q] = a.endpoints.map(|w| point(model, w));
+        let d = q - p;
+        let length = d.length();
+        let u = (point(model, v) - p).dot(d) / (length * length);
+        let distance = (p + d * u).distance(point(model, v));
+        (u * length > minimum
+            && (1. - u) * length > minimum
+            && distance <= tolerance
+            && distance > precision)
+            .then_some((distance, u))
+    };
+    let mut candidates = vec![];
+    for &v in &ends {
+        let mut best: Option<(f64, usize, f64)> = None;
+        let cells = grid.get(&key(point(model, v))).cloned().unwrap_or_default();
+        for k in cells {
+            if let Some((distance, u)) = candidate(model, bars.axes, v, k) {
+                if best.is_none_or(|b| (distance, k) < (b.0, b.1)) {
+                    best = Some((distance, k, u));
+                }
+            }
+        }
+        if let Some((distance, k, _)) = best {
+            candidates.push((distance, v, k));
+        }
+    }
+    candidates.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
+    for (_, v, k) in candidates {
+        let source_axis = bars.axes[k].source_axis;
+        let reject = |report: &mut TeeReport, distance: f64, reason: &str| {
+            report.rejected.push(RejectedTee {
+                vertex: v,
+                source_axis,
+                distance,
+                reason: reason.into(),
+            })
+        };
+        // Geometry may have changed by earlier joins.
+        let Some((distance, u)) = candidate(model, bars.axes, v, k) else {
+            continue;
+        };
+        let length = {
+            let [p, q] = bars.axes[k].endpoints.map(|w| point(model, w));
+            p.distance(q)
+        };
+        if bars.axes[k]
+            .anchors
+            .iter()
+            .any(|x| (x.t - u).abs() * length < minimum)
+        {
+            reject(&mut report, distance, "near_bar_node");
+            continue;
+        }
+        if fixed.contains(&v) || v >= source_nodes.len() {
+            reject(&mut report, distance, "retained_node");
+            continue;
+        }
+        let [p, q] = bars.axes[k].endpoints.map(|w| point(model, w));
+        let target = p + (q - p) * u;
+        let mut planes: Vec<usize> = users(model, v);
+        for c in bars.contacts.iter() {
+            if let Contact::Point {
+                vertex, surface, ..
+            } = c
+            {
+                if *vertex == v {
+                    planes.push(*surface);
+                }
+            }
+        }
+        if planes.iter().any(|&s| {
+            model.planes[model.surfaces[s].plane]
+                .distance(target.to_array())
+                .abs()
+                > precision
+        }) {
+            reject(&mut report, distance, "off_surface_plane");
+            continue;
+        }
+        // Restore every vertex the move may touch if it fails midway.
+        let touched: Vec<(usize, [f64; 3])> = bars
+            .axes
+            .iter()
+            .filter(|a| a.endpoints.contains(&v))
+            .flat_map(|a| a.anchors.iter().map(|x| x.vertex))
+            .chain([v])
+            .map(|w| (w, model.vertices[w]))
+            .collect();
+        if let Err(reason) = move_with_axes(model, bars.axes, v, target, tolerance) {
+            for &(w, p) in touched.iter().rev() {
+                let _ = model.move_vertex(w, p);
+            }
+            reject(&mut report, distance, &reason);
+            continue;
+        }
+        let axis = &mut bars.axes[k];
+        axis.anchors.push(Anchor {
+            source_node: source_nodes[v],
+            vertex: v,
+            t: u,
+        });
+        axis.anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+        report.joined.push(BarTee {
+            vertex: v,
+            source_node: source_nodes[v],
+            source_axis,
+            t: u,
+            distance,
+        });
+    }
+    report
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
     pub tolerance: f64,
@@ -1342,6 +1529,70 @@ mod tests {
                     end_t: w[1].1,
                 })
                 .collect(),
+        }
+    }
+
+    #[test]
+    fn bar_end_next_to_a_span_joins_it() {
+        for place in Placement::all() {
+            // Beam A along y = 1 above a slab; beams B and C meet at a node
+            // `off` beside A's span at x = 2. 3 mm off, the node moves onto
+            // A (B and C stay straight) and becomes a node of A; 60 mm off,
+            // nothing changes; next to a node of A, it is left alone.
+            for (off, node_on_a, joined) in [
+                (0.003, false, true),
+                (0.06, false, false),
+                (0.003, true, false),
+            ] {
+                let mut m = build(&place, &[slab(0., 4.)]);
+                let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+                let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [4., 1., 1.]));
+                let a = v(&mut m, [2.0005, 1., 1.]);
+                let end = v(&mut m, [2., 1. + off, 1.]);
+                let (b1, c1) = (v(&mut m, [2., 3., 1.]), v(&mut m, [3., 3., 1.]));
+                let mut nodes = vec![(a0, 0.)];
+                if node_on_a {
+                    nodes.push((a, 2.0005 / 4.));
+                }
+                nodes.push((a1, 1.));
+                let mut axes = vec![
+                    spanned([a0, a1], &nodes, 10),
+                    spanned([end, b1], &[(end, 0.), (b1, 1.)], 20),
+                    spanned([end, c1], &[(end, 0.), (c1, 1.)], 30),
+                ];
+                let source_nodes = vec![0; m.vertices.len()];
+                let r = join_bar_tees(
+                    &mut m,
+                    &mut Bars {
+                        axes: &mut axes,
+                        contacts: &mut vec![],
+                    },
+                    0.05 * place.scale,
+                    &BTreeSet::new(),
+                    &source_nodes,
+                );
+                assert_eq!(r.joined.len(), usize::from(joined), "{:?}", r.rejected);
+                if joined {
+                    let p = DVec3::from_array(m.vertices[end]);
+                    assert!(
+                        p.distance(DVec3::from_array(place.point([2., 1., 1.])))
+                            < 1e-9 * place.scale
+                    );
+                    assert!((r.joined[0].distance - off * place.scale).abs() < 1e-9 * place.scale);
+                    assert!(axes[0]
+                        .anchors
+                        .iter()
+                        .any(|x| x.vertex == end && (x.t - 0.5).abs() < 1e-9));
+                    assert_eq!(axes[1].endpoints[0], end);
+                } else {
+                    let p = DVec3::from_array(m.vertices[end]);
+                    assert!(
+                        p.distance(DVec3::from_array(place.point([2., 1. + off, 1.])))
+                            < 1e-12 * place.scale
+                    );
+                    assert_eq!(r.rejected.len(), usize::from(node_on_a));
+                }
+            }
         }
     }
 

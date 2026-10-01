@@ -228,6 +228,13 @@ def check(data, baseline=None):
     for vertex, tolerance in merges:
         for axis in ends.get(vertex, []):
             closures += [(a["source_node"], tolerance) for a in axis["anchors"]]
+    # A bar end joined to the span of another bar moves onto it; its bars
+    # are re-placed straight.
+    tees = topology.get("bar_tees") or {}
+    for j in tees.get("joined", []):
+        assert 0. < j["distance"] <= tees["tolerance"] + epsilon
+        for axis in ends.get(j["vertex"], []):
+            closures += [(a["source_node"], j["distance"]) for a in axis["anchors"]]
     for n, tolerance in closures:
         if n in budget:
             budget[n] = budget[n] + tolerance

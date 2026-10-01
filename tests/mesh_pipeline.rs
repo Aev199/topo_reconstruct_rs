@@ -326,6 +326,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         wall_ends: assembly::cleanup::MergeReport::default(),
         bar_ends: assembly::cleanup::MergeReport::default(),
         bar_anchors: assembly::cleanup::MergeReport::default(),
+        bar_tees: Default::default(),
         cracks: vec![],
         removed_slivers: vec![],
         short_edge_merges: assembly::cleanup::MergeReport::default(),
