@@ -1096,6 +1096,8 @@ pub struct TeeReport {
     pub tolerance: f64,
     pub joined: Vec<BarTee>,
     pub rejected: Vec<RejectedTee>,
+    /// Nodes exchanged between bars lying on each other afterwards.
+    pub shared_nodes: usize,
 }
 
 /// Join a bar end lying within `tolerance` of the span of another bar (beams
@@ -1103,9 +1105,10 @@ pub struct TeeReport {
 /// next to a beam): the end moves onto that bar, its own bars staying
 /// straight, and becomes a node of it. Closest first; an end next to a node
 /// of the other bar (within the minimum edge) is left to the end and node
-/// merges, an end that is an interior node of a bar never moves, a bar is
-/// never joined by both ends (a parallel duplicate would lie on the other
-/// bar), and the end must stay on the planes of the surfaces it belongs to.
+/// merges, an end that is an interior node of a bar never moves, and the
+/// end must stay on the planes of the surfaces it belongs to. A bar joined
+/// by both ends lies on the other one (a beam modelled twice a few
+/// millimetres apart): `share_overlapping_bars` gives both the same nodes.
 pub fn join_bar_tees(
     model: &mut Model,
     bars: &mut Bars<'_>,
@@ -1205,25 +1208,6 @@ pub fn join_bar_tees(
             continue;
         }
         let [p, q] = bars.axes[k].endpoints.map(|w| point(model, w));
-        // A bar whose other end is already a node of the other bar would lie
-        // on it (a parallel duplicate a few millimetres off, both ends
-        // joined): not a T junction.
-        let along = bars
-            .axes
-            .iter()
-            .filter(|a| a.endpoints.contains(&v))
-            .any(|a| {
-                let other = if a.endpoints[0] == v {
-                    a.endpoints[1]
-                } else {
-                    a.endpoints[0]
-                };
-                bars.axes[k].anchors.iter().any(|x| x.vertex == other)
-            });
-        if along {
-            reject(&mut report, distance, "bar_along_bar");
-            continue;
-        }
         let target = p + (q - p) * u;
         let mut planes: Vec<usize> = users(model, v);
         for c in bars.contacts.iter() {
@@ -1277,6 +1261,69 @@ pub fn join_bar_tees(
         });
     }
     report
+}
+
+/// A bar lying on another one (both its ends are nodes of it: a beam
+/// modelled twice, one element over two) takes the other bar's nodes inside
+/// its span and gives it its own, so both run through the same vertices
+/// (the mesh shares their subdivision). Only nodes within precision of the
+/// other axis are exchanged. Returns the number of nodes added.
+pub fn share_overlapping_bars(model: &Model, axes: &mut [Axis]) -> usize {
+    let point = |v: usize| DVec3::from_array(model.vertices[v]);
+    let mut by_vertex = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for (k, a) in axes.iter().enumerate() {
+        for x in &a.anchors {
+            by_vertex.entry(x.vertex).or_default().push(k);
+        }
+    }
+    let mut added = 0;
+    for i in 0..axes.len() {
+        let [e0, e1] = axes[i].endpoints;
+        let on_both: Vec<usize> = by_vertex
+            .get(&e0)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&k| k != i && by_vertex.get(&e1).is_some_and(|ks| ks.contains(&k)))
+            .collect();
+        for k in on_both {
+            for (from, to) in [(i, k), (k, i)] {
+                let [p, q] = axes[to].endpoints.map(point);
+                let d = q - p;
+                let [lo, hi] = {
+                    let t = |v: usize| {
+                        axes[to]
+                            .anchors
+                            .iter()
+                            .find(|x| x.vertex == v)
+                            .map_or_else(|| (point(v) - p).dot(d) / d.length_squared(), |x| x.t)
+                    };
+                    let (a, b) = (t(e0), t(e1));
+                    [a.min(b), a.max(b)]
+                };
+                let new: Vec<Anchor> = axes[from]
+                    .anchors
+                    .iter()
+                    .filter(|x| axes[to].anchors.iter().all(|y| y.vertex != x.vertex))
+                    .filter_map(|x| {
+                        let u = (point(x.vertex) - p).dot(d) / d.length_squared();
+                        (u > lo
+                            && u < hi
+                            && (p + d * u).distance(point(x.vertex)) <= model.precision)
+                            .then_some(Anchor {
+                                source_node: x.source_node,
+                                vertex: x.vertex,
+                                t: u,
+                            })
+                    })
+                    .collect();
+                added += new.len();
+                axes[to].anchors.extend(new);
+                axes[to].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+            }
+        }
+    }
+    added
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -1617,16 +1664,18 @@ mod tests {
     }
 
     #[test]
-    fn bar_parallel_to_a_span_is_joined_by_one_end_only() {
+    fn bar_lying_beside_a_span_shares_its_nodes() {
         for place in Placement::all() {
-            // A 1 m bar 3 mm beside beam A along its span: one end joins A,
-            // the other stays (both joined, the bar would lie on A).
+            // A 1 m bar 3 mm beside beam A along its span (a beam modelled
+            // twice): both ends join A, and the bar takes A's node at
+            // x = 1.5, so both run through the same vertices.
             let mut m = build(&place, &[slab(0., 4.)]);
             let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
             let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [4., 1., 1.]));
+            let mid = v(&mut m, [1.5, 1., 1.]);
             let (b0, b1) = (v(&mut m, [1., 1.003, 1.]), v(&mut m, [2., 1.003, 1.]));
             let mut axes = vec![
-                spanned([a0, a1], &[(a0, 0.), (a1, 1.)], 10),
+                spanned([a0, a1], &[(a0, 0.), (mid, 0.375), (a1, 1.)], 10),
                 spanned([b0, b1], &[(b0, 0.), (b1, 1.)], 20),
             ];
             let source_nodes = vec![0; m.vertices.len()];
@@ -1640,10 +1689,12 @@ mod tests {
                 &BTreeSet::new(),
                 &source_nodes,
             );
-            assert_eq!(r.joined.len(), 1);
-            assert_eq!(r.rejected.len(), 1);
-            assert_eq!(r.rejected[0].reason, "bar_along_bar");
-            assert_eq!(axes[0].anchors.len(), 3);
+            assert_eq!(r.joined.len(), 2, "{:?}", r.rejected);
+            assert_eq!(share_overlapping_bars(&m, &mut axes), 1);
+            let nodes = |a: &Axis| a.anchors.iter().map(|x| x.vertex).collect::<Vec<_>>();
+            assert_eq!(nodes(&axes[1]), vec![b0, mid, b1]);
+            assert!((axes[1].anchors[1].t - 0.5).abs() < 1e-9);
+            assert_eq!(nodes(&axes[0]), vec![a0, b0, mid, b1, a1]);
         }
     }
 

@@ -1312,6 +1312,16 @@ fn assemble_impl(
         ),
         _ => cleanup::TeeReport::default(),
     };
+    let mut bar_tees = bar_tees;
+    if !bar_tees.joined.is_empty() {
+        bar_tees.shared_nodes = cleanup::share_overlapping_bars(&model, &mut axis_assembly.axes);
+        short_bars
+            .duplicates
+            .extend(cleanup::remove_duplicate_bars(&mut cleanup::Bars {
+                axes: &mut axis_assembly.axes,
+                contacts: &mut axis_assembly.contacts,
+            }));
+    }
     let (_, _, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
     let gaps = match features {
