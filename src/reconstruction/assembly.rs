@@ -1428,9 +1428,12 @@ fn assemble_impl(
         bars::imprint_surface_vertices(&mut model, &mut axis_assembly.axes, &vertex_source_nodes);
     if features.is_some() {
         let crossings = bars::imprint_crossings(&mut model, &mut axis_assembly.axes);
-        junctions
-            .generated_vertices
-            .extend(crossings.iter().map(|c| c.vertex));
+        junctions.generated_vertices.extend(
+            crossings
+                .iter()
+                .filter(|c| c.kind == "crossing")
+                .map(|c| c.vertex),
+        );
         axis_assembly.imprinted.extend(crossings);
     }
     bars::refresh_contacts(&model, &axis_assembly.axes, &mut axis_assembly.contacts);

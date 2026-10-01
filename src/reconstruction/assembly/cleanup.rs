@@ -491,6 +491,9 @@ pub struct CollapsedBar {
     pub dropped_source_node: Option<u32>,
     pub kept_source_node: Option<u32>,
     pub length: f64,
+    /// Movement of the kept vertex onto the planes of both (at most the
+    /// collapse tolerance).
+    pub kept_movement: f64,
     /// Source bar elements of the collapsed piece.
     pub elements: Vec<u32>,
 }
@@ -748,7 +751,7 @@ pub fn collapse_short_bars(
             fixed,
         );
         match result {
-            Ok(_) => {
+            Ok(movement) => {
                 *model = trial;
                 *bars.axes = axes;
                 *bars.contacts = contacts;
@@ -762,6 +765,7 @@ pub fn collapse_short_bars(
                         dropped_source_node: source_nodes.get(drop).copied(),
                         kept_source_node: source_nodes.get(keep).copied(),
                         length: d,
+                        kept_movement: movement,
                         elements,
                     });
                 }

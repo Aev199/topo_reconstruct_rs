@@ -83,18 +83,24 @@ pub struct Imprint {
     /// `NO_SOURCE_NODE` for a crossing.
     pub source_node: u32,
     pub t: f64,
-    /// `surface_vertex` (a surface vertex on the axis) or `crossing` (the
-    /// bar passes through the surface).
+    /// `surface_vertex` (a surface vertex on the axis), `crossing` (the
+    /// bar passes through the surface) or `slid_anchor` (a bar node slid
+    /// along its bar onto the crossing next to it).
     pub kind: String,
     pub surface: Option<usize>,
+    /// Movement of the vertex (onto the axis, or along it).
+    pub movement: f64,
 }
 
 /// A bar passing through a surface (its axis crosses the surface plane
 /// inside the material, away from its anchors) shares a generated vertex
 /// with it: the vertex becomes an anchor of the bar and, when it falls on a
 /// contour or junction edge of the surface, splits that edge. Crossings
-/// within the minimum edge length of a bar anchor or of a surface vertex are
-/// left alone (they are gaps or near touches, handled elsewhere).
+/// within the minimum edge length of a surface vertex are left alone (near
+/// touches, handled elsewhere). A crossing within it of an interior bar node
+/// (a beam node a few micrometres off a wall foot line) moves that node
+/// along its bar onto the crossing: the bar stays straight and shares the
+/// node with the surface.
 pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
     let precision = model.precision;
     let minimum = model.minimum_edge;
@@ -134,13 +140,6 @@ pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
             let t = da / (da - db);
             let p = a + d * t;
             let p = p - DVec3::from_array(plane.normal) * plane.distance(p.to_array());
-            if axes[i]
-                .anchors
-                .iter()
-                .any(|x| (x.t - t).abs() * length < minimum)
-            {
-                continue;
-            }
             let uv = plane.project(p.to_array());
             let Some(_) = location(uv, &model.surfaces[s].contours, precision) else {
                 continue;
@@ -152,9 +151,26 @@ pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
             if near_vertex {
                 continue;
             }
+            let near: Vec<usize> = (0..axes[i].anchors.len())
+                .filter(|&k| (axes[i].anchors[k].t - t).abs() * length < minimum)
+                .collect();
             let mut trial = model.clone();
-            let Ok(v) = trial.add_vertex(p.to_array()) else {
-                continue;
+            let (v, slid, movement) = match near[..] {
+                [] => {
+                    let Ok(v) = trial.add_vertex(p.to_array()) else {
+                        continue;
+                    };
+                    (v, None, 0.)
+                }
+                [k] => {
+                    let v = axes[i].anchors[k].vertex;
+                    let movement = DVec3::from_array(model.vertices[v]).distance(p);
+                    if !slides_onto(&mut trial, axes, i, v, p) {
+                        continue;
+                    }
+                    (v, Some(k), movement)
+                }
+                _ => continue,
             };
             // On a contour or junction edge of the surface: split it.
             let on_edge: Vec<usize> = trial
@@ -177,23 +193,54 @@ pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
                 continue;
             }
             *model = trial;
-            axes[i].anchors.push(Anchor {
-                source_node: NO_SOURCE_NODE,
-                vertex: v,
-                t,
-            });
+            let (source_node, kind) = if let Some(k) = slid {
+                axes[i].anchors[k].t = t;
+                (axes[i].anchors[k].source_node, "slid_anchor")
+            } else {
+                axes[i].anchors.push(Anchor {
+                    source_node: NO_SOURCE_NODE,
+                    vertex: v,
+                    t,
+                });
+                (NO_SOURCE_NODE, "crossing")
+            };
             axes[i].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
             out.push(Imprint {
                 axis: i,
                 vertex: v,
-                source_node: NO_SOURCE_NODE,
+                source_node,
                 t,
-                kind: "crossing".into(),
+                kind: kind.into(),
                 surface: Some(s),
+                movement,
             });
         }
     }
     out
+}
+
+/// Move the interior bar node `v` of axis `i` along the axis to `p`: only a
+/// node of no other axis and no surface contour, and only when every plane
+/// whose material holds it (the slab a beam lies in) holds `p` too.
+fn slides_onto(model: &mut Model, axes: &[Axis], i: usize, v: usize, p: DVec3) -> bool {
+    let precision = model.precision;
+    let q = DVec3::from_array(model.vertices[v]);
+    if axes[i].endpoints.contains(&v)
+        || axes.iter().enumerate().any(|(j, a)| {
+            j != i && (a.endpoints.contains(&v) || a.anchors.iter().any(|x| x.vertex == v))
+        })
+        || (0..model.surfaces.len())
+            .any(|s| model.surface_edges(s).any(|e| model.edges[e].contains(&v)))
+    {
+        return false;
+    }
+    let keeps_planes = model.surfaces.iter().all(|surface| {
+        let plane = &model.planes[surface.plane];
+        plane.distance(q.to_array()).abs() > precision
+            || location(plane.project(q.to_array()), &surface.contours, precision).is_none()
+            || plane.distance(p.to_array()).abs() <= precision
+    });
+    keeps_planes && model.move_vertex(v, p.to_array()).is_ok()
 }
 
 /// A surface vertex lying on a bar axis inside its span (a bar running
@@ -277,9 +324,8 @@ pub fn imprint_surface_vertices(
                 continue;
             }
             let q = a + d * t;
-            if DVec3::from_array(model.vertices[v]).distance(q) > precision
-                && model.move_vertex(v, q.to_array()).is_err()
-            {
+            let movement = DVec3::from_array(model.vertices[v]).distance(q);
+            if movement > precision && model.move_vertex(v, q.to_array()).is_err() {
                 continue;
             }
             axes[i].anchors.push(Anchor {
@@ -294,6 +340,7 @@ pub fn imprint_surface_vertices(
                 t,
                 kind: "surface_vertex".into(),
                 surface: None,
+                movement,
             });
         }
         axes[i].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
@@ -600,7 +647,15 @@ fn propose(
     let (a, b) = (points[&ends[0]], points[&ends[1]]);
     let d = b - a;
     let length = d.length();
-    if length + policy.precision < source.policy.minimum_length.min(reference_length)
+    // Each end may move by its budget, so a short axis may shorten by both
+    // (a 10 mm bar whose ends lie on surface planes a few micrometres
+    // closer); it must keep a length and its orientation.
+    let slack = [i, j]
+        .map(|e| movement_budget(mesh, source, e))
+        .iter()
+        .sum::<f64>();
+    if length <= policy.precision
+        || length + policy.precision + slack < source.policy.minimum_length.min(reference_length)
         || d.dot(reference) <= 0.
     {
         return fail("axis_length_or_orientation", ends.to_vec());
@@ -1065,6 +1120,57 @@ mod tests {
                     );
                     // On the edge, the contour edge is split at the crossing.
                     assert_eq!(m.surface_edges(0).count(), before + usize::from(on_edge));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn beam_node_next_to_a_wall_foot_slides_onto_it() {
+        use super::super::junctions::tests::{build, run, slab, wall, Placement};
+        for place in Placement::all() {
+            // A beam lying in the slab crosses the foot of a wall standing on
+            // it; its node 5 um before the foot line slides onto it and
+            // splits the foot line. 2 mm before it, a crossing is generated.
+            for (offset, slid) in [(5e-6, true), (0.002, false)] {
+                let mut m = build(&place, &[slab(0., 4.), wall(1., 3., 0., 2.)]);
+                run(&mut m);
+                let mut node = |y: f64| m.add_vertex(place.point([2., y, 0.])).unwrap();
+                let (a, b, c) = (node(0.5), node(2. - offset), node(3.5));
+                let t = (1.5 - offset) / 3.;
+                let mut axes = vec![Axis {
+                    source_axis: 0,
+                    endpoints: [a, c],
+                    anchors: [(1, a, 0.), (2, b, t), (3, c, 1.)]
+                        .map(|(source_node, vertex, t)| Anchor {
+                            source_node,
+                            vertex,
+                            t,
+                        })
+                        .to_vec(),
+                    spans: vec![],
+                }];
+                let r = imprint_crossings(&mut m, &mut axes);
+                assert_eq!(r.len(), 1, "{r:?}");
+                let foot = DVec3::from_array(place.point([2., 2., 0.]));
+                let v = r[0].vertex;
+                assert!(DVec3::from_array(m.vertices[v]).distance(foot) < 1e-9 * place.scale);
+                assert!((r[0].t - 0.5).abs() < 1e-9);
+                // The foot line (wall contour, slab junction) is split at the
+                // shared vertex.
+                for surface in [0, 1] {
+                    assert!(m.surface_edges(surface).any(|e| m.edges[e].contains(&v)));
+                }
+                if slid {
+                    assert_eq!(
+                        (r[0].kind.as_str(), r[0].source_node, v),
+                        ("slid_anchor", 2, b)
+                    );
+                    assert!((r[0].movement - offset * place.scale).abs() < 1e-9 * place.scale);
+                    assert_eq!(axes[0].anchors.len(), 3);
+                } else {
+                    assert_eq!(r[0].kind, "crossing");
+                    assert_eq!(axes[0].anchors.len(), 4);
                 }
             }
         }
@@ -1597,6 +1703,65 @@ mod tests {
         .expect("the exact fixed endpoint chord is a valid branch");
         assert_eq!(proposal.points[&1], DVec3::ZERO);
         assert_eq!(proposal.points[&2], DVec3::new(1e-7, 0., -4.));
+    }
+
+    #[test]
+    fn short_bar_may_shorten_within_its_end_budgets() {
+        // A 10 mm bar whose ends are fixed by surface planes 10 um closer
+        // (geotechnical frame): each end may move by the plane distance, so
+        // the bar is built; ends that coincide or swap are still refused.
+        let ends = [DVec3::new(2., -1., 3.), DVec3::new(2.01, -1., 3.)];
+        let mesh = MeshData {
+            nodes: BTreeMap::from([(1, ends[0]), (2, ends[1])])
+                .into_iter()
+                .collect(),
+            elements: vec![ElementData {
+                id: 1,
+                elem_type: 10,
+                stiff_id: 5,
+                nodes: vec![1, 2],
+            }],
+        };
+        let axis = frame::Axis {
+            constructive_segment: false,
+            endpoints: [0, 1],
+            anchors: vec![
+                frame::Anchor { node: 0, t: 0. },
+                frame::Anchor { node: 1, t: 1. },
+            ],
+            spans: vec![SourceSpan {
+                element: 1,
+                stiffness: 5,
+                start_t: 0.,
+                end_t: 1.,
+            }],
+        };
+        let mut f = frame(&mesh, DVec3::Z);
+        f.axes = vec![axis.clone()];
+        f.short_axis_movement = 0.01;
+        f.policy.geotechnical = true;
+        let run = |b: DVec3| {
+            // The geotechnical frame keeps the length class of a short axis,
+            // not its exact length.
+            let mut f = f.clone();
+            f.candidate_points = vec![ends[0].to_array(), b.to_array()];
+            let locked = BTreeMap::from([(1, ends[0]), (2, b)]);
+            propose(
+                &mesh,
+                &f,
+                &axis,
+                &locked,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+                &policy(1.),
+            )
+            .map(|_| ())
+            .map_err(|(reason, _)| reason)
+        };
+        assert_eq!(run(DVec3::new(2.00999, -1., 3.)), Ok(()));
+        assert!(run(ends[0]).is_err());
+        assert!(run(DVec3::new(1.99, -1., 3.)).is_err());
     }
 
     #[test]

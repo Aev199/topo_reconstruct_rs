@@ -179,9 +179,18 @@ def check(data, baseline=None):
                 budget[n] = min(budget[n], limit)
     # A node dropped by a bar collapse takes the kept node's place: bounded
     # by the global movement limit (the collapse tolerance is far below it).
-    for c in topology.get("short_bars", {}).get("collapsed", []):
+    # The kept node moves onto the planes of both, by the reported movement
+    # (within the collapse tolerance: a beam node onto a wall 50 mm away
+    # when the 50 mm bar joining them collapses).
+    short_bars = topology.get("short_bars", {})
+    for c in short_bars.get("collapsed", []):
         if c["dropped_source_node"] in budget:
             budget[c["dropped_source_node"]] = frame["policy"]["maximum_movement"]
+    for c in short_bars.get("collapsed", []):
+        movement = c.get("kept_movement", 0.)
+        assert 0. <= movement <= short_bars["tolerance"] + epsilon
+        if c["kept_source_node"] in budget:
+            budget[c["kept_source_node"]] += movement
     # A node moved by a recorded geotechnical closure (a gap closed onto a
     # surface, a bar or wall end merged onto another structure) may move by
     # that closure's tolerance beyond its frame budget (5 % of a short bar
@@ -192,6 +201,19 @@ def check(data, baseline=None):
     for key in ("bar_ends", "wall_ends"):
         closures += [(m["dropped_source_node"], features.get("maximum_wall_end_snap", 0.))
                      for m in topology.get(key, {}).get("merged", [])]
+    # The kept vertex of a merge moves onto the planes of both by its
+    # reported movement, within that merge's tolerance.
+    for key in ("bar_ends", "wall_ends", "short_edge_merges", "coincident_vertices"):
+        report = topology.get(key) or {}
+        for m in report.get("merged", []):
+            assert 0. <= m["kept_movement"] <= report["tolerance"] + epsilon
+            closures.append((m["kept_source_node"], m["kept_movement"]))
+    # A bar node slid along its bar onto a crossing next to it (within the
+    # minimum edge) by its reported movement.
+    for c in bars.get("imprinted", []):
+        if c["kind"] == "slid_anchor":
+            assert 0. <= c["movement"] <= topology["policy"]["minimum_edge"] + epsilon
+            closures.append((c["source_node"], c["movement"]))
     for n, tolerance in closures:
         if n in budget:
             budget[n] = budget[n] + tolerance
