@@ -404,12 +404,24 @@ pub(super) fn synchronize(
     }
     let shared_edge_count = owners.iter().filter(|owner| owner.len() > 1).count();
     let sizing = Sizing::new(model, vertices, policy.boundary_spacing);
+    // Contacts of each surface, in contact order (an edge only collects
+    // those of its owners; scanning all contacts per edge was quadratic).
+    let mut by_surface = vec![vec![]; model.surfaces.len()];
+    for (k, item) in contacts.iter().enumerate() {
+        let (Contact::Point { surface, .. } | Contact::Interval { surface, .. }) = item;
+        by_surface[*surface].push(k);
+    }
     let mut edge_nodes = Vec::with_capacity(model.edges.len());
     for (edge_id, &[a, b]) in model.edges.iter().enumerate() {
         let pa = point(vertices.get(a).ok_or("invalid model edge vertex")?);
         let pb = point(vertices.get(b).ok_or("invalid model edge vertex")?);
         let mut chain = vec![(0., a), (1., b)];
-        for item in contacts {
+        let mut owned: Vec<usize> = owners[edge_id]
+            .iter()
+            .flat_map(|&s| by_surface[s].iter().copied())
+            .collect();
+        owned.sort_unstable();
+        for item in owned.iter().map(|&k| &contacts[k]) {
             let (surface, candidates) = match *item {
                 Contact::Point {
                     vertex, surface, ..

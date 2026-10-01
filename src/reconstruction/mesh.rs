@@ -287,6 +287,12 @@ fn build_impl(
     let mut axis_nodes = synchronized.axis_nodes;
     let edge_nodes = synchronized.edge_nodes;
     let constraint_synchronization = synchronized.report;
+    // Contacts of each surface in contact order (validated above).
+    let mut by_surface = vec![vec![]; model.surfaces.len()];
+    for (k, item) in contacts.iter().enumerate() {
+        let (Contact::Point { surface, .. } | Contact::Interval { surface, .. }) = item;
+        by_surface[*surface].push(k);
+    }
     let mut triangles = Vec::new();
     let mut blockers = Vec::new();
     if !source.all_surface_patches_built || !source.issues.is_empty() {
@@ -451,7 +457,7 @@ fn build_impl(
         barriers.extend(&boundary);
         let boundary_nodes: BTreeSet<_> = boundary.iter().flatten().copied().collect();
         constraints.extend(&boundary);
-        for c in contacts {
+        for c in by_surface[s].iter().map(|&k| &contacts[k]) {
             match *c {
                 Contact::Point {
                     surface, vertex, ..
@@ -605,7 +611,7 @@ fn build_impl(
         // would describe different subdivisions of the same construction.
         let face_nodes: BTreeSet<_> = faces.iter().flatten().copied().collect();
         let mut remap = BTreeMap::new();
-        for c in contacts {
+        for c in by_surface[s].iter().map(|&k| &contacts[k]) {
             let Contact::Interval {
                 axis,
                 surface,
