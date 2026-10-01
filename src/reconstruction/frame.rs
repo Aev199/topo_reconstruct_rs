@@ -23,10 +23,11 @@ pub struct Policy {
     /// one panel if all their nodes lie within this of one plane. Zero
     /// disables.
     pub panel_tolerance: f64,
-    /// A short axis (kept as a vector) whose ends all lie on one support
-    /// family keeps its vector only along that family's plane: the normal
-    /// component (noise within the plane distance) is dropped.
-    pub flatten_short_axes: bool,
+    /// Geotechnical repairs (PLAXIS geometry; deviation from the source is
+    /// allowed): a short axis (kept as a vector) whose ends lie on one
+    /// support family keeps its vector only along that family's plane, and
+    /// every axis node may move at least the plane distance.
+    pub geotechnical: bool,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Anchor {
@@ -221,12 +222,14 @@ fn narrowest_extent(points: &[[f64; 2]]) -> f64 {
 /// Movement budget of the nodes of an axis: a fraction of its length, but
 /// an axis shorter than the minimum length keeps its vector in the solve
 /// (it may only translate, undistorted), so its nodes may move as far as a
-/// node may lie off its plane, like the surfaces carrying it.
+/// node may lie off its plane, like the surfaces carrying it. In
+/// geotechnical mode every axis node may move that far (a 33 mm bar end on
+/// a wall corner 2 mm off the wall plane).
 fn short_axis_cap(policy: &Policy, length: f64, plane_distance: f64) -> f64 {
     let relative = policy.relative_movement * length;
     policy
         .maximum_movement
-        .min(if length < policy.minimum_length {
+        .min(if length < policy.minimum_length || policy.geotechnical {
             relative.max(plane_distance)
         } else {
             relative
@@ -870,7 +873,7 @@ fn solve_impl(
         // An unresolved short feature may translate, but must not be flattened,
         // contracted or assigned a new direction from noisy source coordinates.
         if length < policy.minimum_length {
-            if policy.flatten_short_axes {
+            if policy.geotechnical {
                 deferred_short.push((axis_index, ends, d));
             } else {
                 for k in 0..3 {
@@ -1572,7 +1575,7 @@ mod tests {
                         residual_tolerance: 1e-8 * scale,
                         iterations: 2000,
                         panel_tolerance: 0.,
-                        flatten_short_axes: false,
+                        geotechnical: false,
                     },
                 )
                 .unwrap();
@@ -1661,7 +1664,7 @@ mod tests {
             residual_tolerance: 1e-8,
             iterations: 2000,
             panel_tolerance: 0.,
-            flatten_short_axes: false,
+            geotechnical: false,
         }
     }
     fn run(m: &MeshData, p: &Policy) -> Report {
@@ -2418,7 +2421,7 @@ mod tests {
         // their plane; its in-plane vector is kept.
         let m = short_feature(true);
         let mut p = policy();
-        p.flatten_short_axes = true;
+        p.geotechnical = true;
         let r = run(&m, &p);
         assert!(r.accepted, "{}: {}", r.reason, r.candidate_max_residual);
         assert!(r.axis_failures.is_empty());
@@ -2428,5 +2431,47 @@ mod tests {
         let new = DVec3::from_array(r.points[j]) - DVec3::from_array(r.points[i]);
         assert!(old.distance(new) < 1e-4, "{}", old.distance(new));
         assert!(new.length() > 0.9 * old.length());
+    }
+
+    #[test]
+    fn bar_end_on_a_wall_moves_with_the_wall_in_geotechnical_mode() {
+        // A 33 mm bar (above the short-axis length) on a wall node 8 mm off
+        // the wall plane: its end moves about 5 mm, beyond 5 % of its length;
+        // accepted only in geotechnical mode.
+        let mut m = MeshData::default();
+        for (id, p) in [
+            (1, [0., 0., 0.]),
+            (2, [0., 1., 0.]),
+            (3, [0., 2., 0.]),
+            (4, [0., 0., 1.]),
+            (5, [0.008, 1., 1.]),
+            (6, [0., 2., 1.]),
+            (7, [0.041, 1., 1.]),
+        ] {
+            m.nodes.insert(id, DVec3::from_array(p));
+        }
+        for (id, nodes) in [(1, vec![1, 2, 5, 4]), (2, vec![2, 3, 6, 5])] {
+            m.elements.push(ElementData {
+                id,
+                elem_type: 44,
+                stiff_id: 1,
+                nodes,
+            });
+        }
+        m.elements.push(ElementData {
+            id: 3,
+            elem_type: 10,
+            stiff_id: 2,
+            nodes: vec![5, 7],
+        });
+        let mut p = policy();
+        let strict = run(&m, &p);
+        assert!(!strict.accepted);
+        assert!(!strict.movement_failures.is_empty());
+        p.geotechnical = true;
+        let r = run(&m, &p);
+        assert!(r.accepted, "{:?}", r.movement_failures);
+        let k = |id: u32| r.node_ids.iter().position(|&n| n == id).unwrap();
+        assert!(DVec3::from_array(r.points[k(5)]).distance(m.nodes[&5]) <= 0.01);
     }
 }

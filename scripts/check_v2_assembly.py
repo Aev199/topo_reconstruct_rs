@@ -168,8 +168,9 @@ def check(data, baseline=None):
         length = math.dist(*(frame["reference_points"][i] for i in axis["endpoints"]))
         limit = frame["policy"]["relative_movement"] * length
         # A short axis keeps its vector in the solve and may only translate:
-        # its nodes may move as far as the plane distance tolerance.
-        if length < frame["policy"]["minimum_length"]:
+        # its nodes may move as far as the plane distance tolerance; in
+        # geotechnical mode every axis node may.
+        if length < frame["policy"]["minimum_length"] or frame["policy"].get("geotechnical"):
             limit = max(limit, frame.get("short_axis_movement", 0.))
         limit = min(limit, frame["policy"]["maximum_movement"])
         for anchor in axis["anchors"]:

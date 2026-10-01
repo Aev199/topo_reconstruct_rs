@@ -529,7 +529,7 @@ fn propose(
             };
             // A short axis keeps its source vector, or the vector the frame
             // flattened onto its plane.
-            let vector = if source.policy.flatten_short_axes {
+            let vector = if source.policy.geotechnical {
                 cb - ca
             } else {
                 reference
@@ -1173,7 +1173,7 @@ mod tests {
                 residual_tolerance: 1e-7,
                 iterations: 100,
                 panel_tolerance: 0.,
-                flatten_short_axes: false,
+                geotechnical: false,
             },
         )
         .unwrap()
@@ -1557,7 +1557,7 @@ mod tests {
                 residual_tolerance: 1e-7,
                 iterations: 10,
                 panel_tolerance: 0.,
-                flatten_short_axes: false,
+                geotechnical: false,
             },
             accepted: true,
             candidate_constraints_satisfied: true,

@@ -81,7 +81,7 @@ fn run_with(
             residual_tolerance: 1e-8 * scale,
             iterations: 1000,
             panel_tolerance: 0.,
-            flatten_short_axes: false,
+            geotechnical: false,
         },
     )
     .unwrap();
