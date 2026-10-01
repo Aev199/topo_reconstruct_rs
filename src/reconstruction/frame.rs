@@ -1006,11 +1006,12 @@ fn solve_impl(
         };
         // Horizontal slabs and vertical walls, if every node of the family
         // stays within the plane distance (a large slightly tilted family,
-        // 1 degree over 9 m, would move nodes by 16 cm); a merged panel
+        // 1 degree over 9 m, would move nodes by 16 cm); a merged slab panel
         // (already allowed the panel tolerance: a slab with an 18 mm bump)
-        // within the panel tolerance.
+        // within the panel tolerance. Not a merged wall panel: its corner
+        // with a wall 10 degrees off would move six times as far.
         let mean = points.iter().copied().sum::<DVec3>() / points.len() as f64;
-        let allowed = if unmerged.contains(members) {
+        let allowed = if unmerged.contains(members) || snapped.dot(up).abs() < 0.5 {
             planes.policy.distance
         } else {
             planes.policy.distance.max(policy.panel_tolerance)
@@ -2412,6 +2413,34 @@ mod tests {
             // A tolerance below the kink deviation keeps the families apart.
             p.panel_tolerance = 0.002;
             assert!(run(&m, &p).plane_families.len() > 1);
+        }
+    }
+
+    #[test]
+    fn merged_wall_panel_leaning_beyond_the_plane_distance_keeps_its_lean() {
+        // The kinked wall leans 30 mm over its 6 m height: vertical, its
+        // nodes would move up to 15 mm (beyond the plane distance, within
+        // the panel tolerance). A merged wall is not snapped then: its
+        // corner with a wall a few degrees off would move several times
+        // as far.
+        let rotation = glam::DQuat::from_axis_angle(DVec3::Z, 0.7);
+        for rotated in [false, true] {
+            let m = kinked_upper_wall(|p| {
+                let p = p + DVec3::Y * 0.005 * (p.z + 3.);
+                if rotated {
+                    rotation * p
+                } else {
+                    p
+                }
+            });
+            let mut p = policy();
+            p.panel_tolerance = 0.05;
+            p.geotechnical = true;
+            let r = run(&m, &p);
+            assert_eq!(r.plane_families.len(), 1, "{:?}", r.plane_families);
+            for plane in &r.candidate_planes {
+                assert!(plane.normal[2].abs() > 1e-4, "{:?}", plane.normal);
+            }
         }
     }
 
