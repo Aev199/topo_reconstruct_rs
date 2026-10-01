@@ -12,7 +12,7 @@ use crate::reconstruction::{
 };
 use glam::DVec3;
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize)]
 pub struct Report {
@@ -358,17 +358,38 @@ pub(super) fn synchronize(
         }
     }
 
+    // Overlapping bars (a source bar along part of a longer one) run through
+    // the same two vertices: that piece is subdivided once and its vertices
+    // are shared, keyed by the piece's ends.
+    let mut pieces = BTreeMap::<[usize; 2], Vec<(f64, usize)>>::new();
     for chain in &mut axis_nodes {
         sorted(chain, vertices, precision)?;
         // A synchronized interval endpoint is part of the global chain before
         // spacing is applied, so every owner receives the same split vertex.
-        let expanded = subdivide(
-            chain,
-            vertices,
-            policy.boundary_spacing,
-            policy.maximum_added_vertices_per_surface,
-            precision,
-        )?;
+        let mut expanded = vec![chain[0]];
+        for w in chain.windows(2) {
+            let [(ta, a), (tb, b)] = [w[0], w[1]];
+            let key = [a.min(b), a.max(b)];
+            if !pieces.contains_key(&key) {
+                let piece = subdivide(
+                    &[(0., key[0]), (1., key[1])],
+                    vertices,
+                    policy.boundary_spacing,
+                    policy.maximum_added_vertices_per_surface,
+                    precision,
+                )?;
+                pieces.insert(key, piece[1..piece.len() - 1].to_vec());
+            }
+            let inner = &pieces[&key];
+            let along = |u: f64| if a == key[0] { u } else { 1. - u };
+            let mut inner: Vec<_> = inner
+                .iter()
+                .map(|&(u, v)| (ta + (tb - ta) * along(u), v))
+                .collect();
+            inner.sort_by(|x, y| x.0.total_cmp(&y.0));
+            expanded.extend(inner);
+            expanded.push((tb, b));
+        }
         *chain = expanded;
     }
 
@@ -609,6 +630,46 @@ mod tests {
         // The nominal spacing exceeds the panels. The 4 m outer edges are 2 m
         // from the opposite shared edge, so graded sizing splits each once.
         assert_eq!(synced.report.edge_node_count, 18);
+    }
+
+    #[test]
+    fn overlapping_bars_share_the_subdivision_of_their_common_piece() {
+        // A bar from x = 0 to 4 and a longer one from x = 4 back to -2 through
+        // x = 0 (overlapping source bars): their common piece gets one set of
+        // subdivision vertices, whichever direction each bar runs.
+        let (model, mut vertices, mut axes, _) = shared_edge_case();
+        vertices.push([-2., 0., 0.]);
+        let far = vertices.len() - 1;
+        let anchor = |source_node, vertex, t| Anchor {
+            source_node,
+            vertex,
+            t,
+        };
+        axes.push(Axis {
+            source_axis: 1,
+            endpoints: [1, far],
+            anchors: vec![
+                anchor(11, 1, 0.),
+                anchor(10, 0, 2. / 3.),
+                anchor(12, far, 1.),
+            ],
+            spans: vec![],
+        });
+        let mut p = policy();
+        p.boundary_spacing = 1.;
+        let synced = synchronize(&model, &axes, &[], &mut vertices, &p, 1e-8).unwrap();
+        let on_piece = |k: usize| -> BTreeSet<usize> {
+            synced.axis_nodes[k]
+                .iter()
+                .map(|&(_, v)| v)
+                .filter(|&v| (0. ..=4.).contains(&vertices[v][0]))
+                .collect()
+        };
+        assert_eq!(on_piece(0).len(), 5);
+        assert_eq!(on_piece(0), on_piece(1));
+        for chain in &synced.axis_nodes {
+            assert!(chain.windows(2).all(|w| w[0].0 < w[1].0));
+        }
     }
 
     #[test]

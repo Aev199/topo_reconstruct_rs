@@ -2680,7 +2680,7 @@ mod tests {
         for (i, row) in grid.iter_mut().enumerate() {
             for (j, n) in row.iter_mut().enumerate() {
                 let z = if (1..=2).contains(&i) && (1..=2).contains(&j) {
-                    0.004
+                    noise
                 } else {
                     0.
                 };
