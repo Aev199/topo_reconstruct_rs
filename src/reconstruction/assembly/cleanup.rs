@@ -611,8 +611,13 @@ pub fn remove_contained_bars(bars: &mut Bars<'_>) -> Vec<DuplicateBar> {
     let mut order: Vec<usize> = (0..bars.axes.len()).collect();
     order.sort_by_key(|&k| bars.axes[k].source_axis);
     let mut removed = vec![false; bars.axes.len()];
+    // A bar kept for a duplicate stays (its duplicates name it).
+    let mut kept = vec![false; bars.axes.len()];
     let mut duplicates = vec![];
     for i in order {
+        if kept[i] {
+            continue;
+        }
         let stiffness: BTreeSet<u32> = bars.axes[i].spans.iter().map(|s| s.stiffness).collect();
         let (Some(&stiffness), 1) = (stiffness.first(), stiffness.len()) else {
             continue;
@@ -624,6 +629,9 @@ pub fn remove_contained_bars(bars: &mut Bars<'_>) -> Vec<DuplicateBar> {
             .copied()
             .filter(|&k| k != i && !removed[k] && by_vertex[&last].contains(&k))
             .collect();
+        // The longest bar containing it is kept (a chain of contained bars
+        // reduces to one).
+        let mut best: Option<(usize, usize)> = None;
         for k in candidates {
             let ck = chain(&bars.axes[k]);
             if ck.len() <= ci.len() {
@@ -652,14 +660,19 @@ pub fn remove_contained_bars(bars: &mut Bars<'_>) -> Vec<DuplicateBar> {
             if covering.is_empty() || covering.iter().any(|&s| s != stiffness) {
                 continue;
             }
+            if best.is_none_or(|(n, _)| ck.len() > n) {
+                best = Some((ck.len(), k));
+            }
+        }
+        if let Some((_, k)) = best {
             removed[i] = true;
+            kept[k] = true;
             duplicates.push(DuplicateBar {
                 source_axis: bars.axes[i].source_axis,
                 kept_source_axis: bars.axes[k].source_axis,
                 elements: bars.axes[i].spans.iter().map(|s| s.element).collect(),
                 contained: true,
             });
-            break;
         }
     }
     drop_axes(bars, &removed);
@@ -1197,7 +1210,7 @@ pub fn join_bar_tees(
     model: &mut Model,
     bars: &mut Bars<'_>,
     tolerance: f64,
-    fixed: &BTreeSet<usize>,
+    _fixed: &BTreeSet<usize>,
     source_nodes: &[u32],
 ) -> TeeReport {
     let mut report = TeeReport {
@@ -1286,8 +1299,10 @@ pub fn join_bar_tees(
             reject(&mut report, distance, "near_bar_node");
             continue;
         }
-        if fixed.contains(&v) || v >= source_nodes.len() {
-            reject(&mut report, distance, "retained_node");
+        // A retained node (a simplified hole corner) may move: it stays a
+        // vertex; merges are what must not drop it.
+        if v >= source_nodes.len() {
+            reject(&mut report, distance, "generated_node");
             continue;
         }
         let [p, q] = bars.axes[k].endpoints.map(|w| point(model, w));
@@ -1838,6 +1853,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn chain_of_contained_bars_reduces_to_the_longest() {
+        // C lies on B, B on A (one stiffness): only A stays, kept for both.
+        let mut m = Model::new(1e-7, 0.001).unwrap();
+        let v: Vec<usize> = [0., 1., 1.5, 2., 4.]
+            .iter()
+            .map(|&x| m.add_vertex([x, 1., 1.]).unwrap())
+            .collect();
+        let single = |ends: [usize; 2], nodes: &[(usize, f64)], element: u32, source_axis| {
+            let mut a = spanned(ends, nodes, element);
+            a.spans.truncate(1);
+            a.spans[0].end_t = 1.;
+            a.source_axis = source_axis;
+            a
+        };
+        let mut axes = vec![
+            single([v[1], v[2]], &[(v[1], 0.), (v[2], 1.)], 30, 0),
+            single([v[1], v[3]], &[(v[1], 0.), (v[2], 0.5), (v[3], 1.)], 20, 1),
+            spanned(
+                [v[0], v[4]],
+                &[
+                    (v[0], 0.),
+                    (v[1], 0.25),
+                    (v[2], 0.375),
+                    (v[3], 0.5),
+                    (v[4], 1.),
+                ],
+                10,
+            ),
+        ];
+        axes[2].source_axis = 2;
+        let r = remove_contained_bars(&mut Bars {
+            axes: &mut axes,
+            contacts: &mut vec![],
+        });
+        assert_eq!(axes.len(), 1);
+        assert_eq!(axes[0].source_axis, 2);
+        assert!(r.iter().all(|d| d.kept_source_axis == 2));
     }
 
     #[test]
