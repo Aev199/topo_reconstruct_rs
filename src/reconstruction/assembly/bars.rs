@@ -231,9 +231,10 @@ pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
 
 /// Two bars crossing at a point away from their nodes (beams lying in one
 /// slab, one passing through the span of another) share a generated vertex
-/// there: it becomes an anchor of both. Crossings within the minimum edge
-/// of a node of either bar are left alone, as are bars already sharing a
-/// node and parallel bars.
+/// there: it becomes an anchor of both (and of a third bar through the
+/// same point). Crossings within the minimum edge of another node of either
+/// bar are left alone, as are bars already sharing a node and parallel
+/// bars.
 pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
     let precision = model.precision;
     let minimum = model.minimum_edge;
@@ -294,19 +295,33 @@ pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprin
         if pa.distance(pb) > precision {
             continue;
         }
+        let p = (pa + pb) * 0.5;
+        // A node of a bar next to the crossing: a vertex generated for a
+        // crossing with a third bar at the same point is shared; any other
+        // node there is a near touch.
         let near = |k: usize, u: f64| {
             axes[k]
                 .anchors
                 .iter()
-                .any(|x| (x.t - u).abs() * lengths[k] < minimum)
+                .find(|x| (x.t - u).abs() * lengths[k] < minimum)
+                .map(|x| {
+                    (x.source_node == NO_SOURCE_NODE
+                        && DVec3::from_array(model.vertices[x.vertex]).distance(p) <= precision)
+                        .then_some(x.vertex)
+                })
         };
-        if near(i, s) || near(j, t) {
-            continue;
-        }
-        let Ok(v) = model.add_vertex(((pa + pb) * 0.5).to_array()) else {
-            continue;
+        let (v, bars) = match (near(i, s), near(j, t)) {
+            (None, None) => {
+                let Ok(v) = model.add_vertex(p.to_array()) else {
+                    continue;
+                };
+                (v, vec![(i, s), (j, t)])
+            }
+            (Some(Some(v)), None) => (v, vec![(j, t)]),
+            (None, Some(Some(v))) => (v, vec![(i, s)]),
+            _ => continue,
         };
-        for (k, u) in [(i, s), (j, t)] {
+        for (k, u) in bars {
             axes[k].anchors.push(Anchor {
                 source_node: NO_SOURCE_NODE,
                 vertex: v,
@@ -1324,11 +1339,15 @@ mod tests {
                     }
                 };
                 let mut axes = vec![bar([0., 1., 0.], [2., 1., 0.], 0), bar(b0, b1, 1)];
+                if crossing {
+                    // A third bar through the same point shares the vertex.
+                    axes.push(bar([0., 0., 0.], [2., 2., 0.], 2));
+                }
                 let r = imprint_bar_crossings(&mut m, &mut axes);
-                assert_eq!(r.len(), if crossing { 2 } else { 0 }, "{r:?}");
+                assert_eq!(r.len(), if crossing { 3 } else { 0 }, "{r:?}");
                 if crossing {
                     let v = r[0].vertex;
-                    assert_eq!(r[1].vertex, v);
+                    assert!(r.iter().all(|c| c.vertex == v));
                     let p = DVec3::from_array(m.vertices[v]);
                     let expected = DVec3::from_array(place.point([1., 1., 0.]));
                     assert!(p.distance(expected) < 1e-9 * place.scale);
