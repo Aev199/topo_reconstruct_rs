@@ -313,8 +313,9 @@ fn merge_kinked_families(
             })
             .collect();
         // A node on three or more families whose planes do not meet within
-        // the plane distance of it (a slab bump of a few single tilted
-        // triangles at a wall): every pair of them is a candidate.
+        // the plane distance of it, or on four or more non-parallel ones (a
+        // slab bump of single tilted triangles at a wall or a ramp): every
+        // non-parallel pair of them is a candidate.
         let mut kinked = kinked;
         for (n, fs) in &node_families {
             if fs.len() < 3 {
@@ -337,7 +338,21 @@ fn merge_kinked_families(
                 .iter()
                 .map(|(n, c)| n.dot(p + delta - *c).abs())
                 .fold(0., f64::max);
-            if delta.length() > report.policy.distance || off > report.policy.distance {
+            // Four or more mutually non-parallel planes through one node
+            // are over-determined: exact only by coincidence of the source.
+            let mut directions: Vec<DVec3> = vec![];
+            for (n, _) in &planes {
+                if directions
+                    .iter()
+                    .all(|d| d.dot(*n).abs() < report.policy.angle.cos())
+                {
+                    directions.push(*n);
+                }
+            }
+            if delta.length() > report.policy.distance
+                || off > report.policy.distance
+                || directions.len() >= 4
+            {
                 // Nearly parallel families (within the recognition angle)
                 // are consistent through their free offsets in the solve.
                 let fs: Vec<usize> = fs.iter().copied().collect();
@@ -2613,6 +2628,10 @@ mod tests {
     /// A 3 x 3 m slab (1 m quads) whose middle panel is a pyramid: apex
     /// 18 mm up, base corners 4 mm up (noise within the plane distance).
     fn slab_with_a_bump() -> MeshData {
+        slab_with_a_bump_noise(0.004)
+    }
+
+    fn slab_with_a_bump_noise(noise: f64) -> MeshData {
         let mut m = MeshData::default();
         let mut id = 0;
         let mut node = |m: &mut MeshData, p: [f64; 3]| {
@@ -2672,5 +2691,22 @@ mod tests {
         assert_eq!(r.plane_families.len(), 1, "{:?}", r.plane_families);
         assert!(r.accepted, "{}: {}", r.reason, r.candidate_max_residual);
         assert!(r.maximum_movement <= 0.02, "{}", r.maximum_movement);
+    }
+
+    #[test]
+    fn exact_low_pyramid_on_a_slab_is_flattened_into_it() {
+        // Without noise the four faces meet exactly at the apex, but four
+        // non-parallel planes through one node are over-determined: the
+        // 18 mm pyramid joins the slab panel.
+        let m = slab_with_a_bump_noise(0.);
+        let mut p = policy();
+        p.panel_tolerance = 0.05;
+        p.geotechnical = true;
+        let r = run(&m, &p);
+        assert_eq!(r.plane_families.len(), 1, "{:?}", r.plane_families);
+        assert!(r.accepted);
+        // Without the panel tolerance the faces stay separate.
+        p.panel_tolerance = 0.;
+        assert!(run(&m, &p).plane_families.len() > 1);
     }
 }
