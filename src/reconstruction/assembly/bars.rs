@@ -194,6 +194,15 @@ pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
             }
             *model = trial;
             let (source_node, kind) = if let Some(k) = slid {
+                // Element spans bounded by the node follow it.
+                let old = axes[i].anchors[k].t;
+                for span in &mut axes[i].spans {
+                    for u in [&mut span.start_t, &mut span.end_t] {
+                        if *u == old {
+                            *u = t;
+                        }
+                    }
+                }
                 axes[i].anchors[k].t = t;
                 (axes[i].anchors[k].source_node, "slid_anchor")
             } else {
@@ -1148,7 +1157,14 @@ mod tests {
                             t,
                         })
                         .to_vec(),
-                    spans: vec![],
+                    spans: [(1, 0., t), (2, t, 1.)]
+                        .map(|(element, start_t, end_t)| SourceSpan {
+                            element,
+                            stiffness: 1,
+                            start_t,
+                            end_t,
+                        })
+                        .to_vec(),
                 }];
                 let r = imprint_crossings(&mut m, &mut axes);
                 assert_eq!(r.len(), 1, "{r:?}");
@@ -1168,6 +1184,10 @@ mod tests {
                     );
                     assert!((r[0].movement - offset * place.scale).abs() < 1e-9 * place.scale);
                     assert_eq!(axes[0].anchors.len(), 3);
+                    // The element spans bounded by the node follow it.
+                    let spans: Vec<_> =
+                        axes[0].spans.iter().map(|s| (s.start_t, s.end_t)).collect();
+                    assert_eq!(spans, vec![(0., r[0].t), (r[0].t, 1.)]);
                 } else {
                     assert_eq!(r[0].kind, "crossing");
                     assert_eq!(axes[0].anchors.len(), 4);

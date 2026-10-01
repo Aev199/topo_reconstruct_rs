@@ -214,6 +214,20 @@ def check(data, baseline=None):
         if c["kind"] == "slid_anchor":
             assert 0. <= c["movement"] <= topology["policy"]["minimum_edge"] + epsilon
             closures.append((c["source_node"], c["movement"]))
+    # A merge moving the end of a bar re-places its other anchors on the
+    # straight bar, within the merge tolerance (a 36 mm bar collapsed at a
+    # beam end moves the beam's next node by about 30 mm).
+    ends = {}
+    for axis in bars["axes"]:
+        for v in axis["endpoints"]:
+            ends.setdefault(v, []).append(axis)
+    merges = [(c["kept"], short_bars["tolerance"]) for c in short_bars.get("collapsed", [])]
+    for key in ("bar_ends", "wall_ends", "short_edge_merges", "coincident_vertices", "bar_anchors"):
+        report = topology.get(key) or {}
+        merges += [(m["kept"], report["tolerance"]) for m in report.get("merged", [])]
+    for vertex, tolerance in merges:
+        for axis in ends.get(vertex, []):
+            closures += [(a["source_node"], tolerance) for a in axis["anchors"]]
     for n, tolerance in closures:
         if n in budget:
             budget[n] = budget[n] + tolerance
