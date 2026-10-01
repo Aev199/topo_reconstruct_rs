@@ -312,6 +312,42 @@ fn merge_kinked_families(
                 (spread > report.policy.distance).then_some((f, g))
             })
             .collect();
+        // A node on three or more families whose planes do not meet within
+        // the plane distance of it (a slab bump of a few single tilted
+        // triangles at a wall): every pair of them is a candidate.
+        let mut kinked = kinked;
+        for (n, fs) in &node_families {
+            if fs.len() < 3 {
+                continue;
+            }
+            let planes: Vec<(DVec3, DVec3)> = fs
+                .iter()
+                .filter_map(|&f| fitted[f].map(|(n, c, _)| (n, c)))
+                .collect();
+            let p = mesh.nodes[n];
+            let mut normal = glam::DMat3::ZERO;
+            let mut rhs = DVec3::ZERO;
+            for (n, c) in &planes {
+                normal += glam::DMat3::from_cols(*n * n.x, *n * n.y, *n * n.z);
+                rhs += *n * n.dot(*c - p);
+            }
+            let ridge = 1e-9 * (normal.x_axis.x + normal.y_axis.y + normal.z_axis.z);
+            let delta = (normal + glam::DMat3::from_diagonal(DVec3::splat(ridge))).inverse() * rhs;
+            let off = planes
+                .iter()
+                .map(|(n, c)| n.dot(p + delta - *c).abs())
+                .fold(0., f64::max);
+            if delta.length() > report.policy.distance || off > report.policy.distance {
+                let fs: Vec<usize> = fs.iter().copied().collect();
+                for (k, &f) in fs.iter().enumerate() {
+                    for &g in &fs[k + 1..] {
+                        kinked.push((f, g));
+                    }
+                }
+            }
+        }
+        kinked.sort_unstable();
+        kinked.dedup();
         let best = kinked
             .into_iter()
             .filter_map(|(f, g)| {
@@ -2565,5 +2601,69 @@ mod tests {
             assert!((old.length() - new.length()).abs() < 1e-3);
             assert!(new.z.abs() < 1e-6);
         }
+    }
+
+    /// A 3 x 3 m slab (1 m quads) whose middle panel is a pyramid: apex
+    /// 18 mm up, base corners 4 mm up (noise within the plane distance).
+    fn slab_with_a_bump() -> MeshData {
+        let mut m = MeshData::default();
+        let mut id = 0;
+        let mut node = |m: &mut MeshData, p: [f64; 3]| {
+            id += 1;
+            m.nodes.insert(id, DVec3::from_array(p));
+            id
+        };
+        let mut grid = [[0u32; 4]; 4];
+        for (i, row) in grid.iter_mut().enumerate() {
+            for (j, n) in row.iter_mut().enumerate() {
+                let z = if (1..=2).contains(&i) && (1..=2).contains(&j) {
+                    0.004
+                } else {
+                    0.
+                };
+                *n = node(&mut m, [i as f64, j as f64, z]);
+            }
+        }
+        let apex = node(&mut m, [1.5, 1.5, 0.018]);
+        let mut element = 0;
+        let mut push = |m: &mut MeshData, nodes: Vec<u32>| {
+            element += 1;
+            m.elements.push(ElementData {
+                id: element,
+                elem_type: if nodes.len() == 4 { 44 } else { 42 },
+                stiff_id: 1,
+                nodes,
+            });
+        };
+        for i in 0..3 {
+            for j in 0..3 {
+                let (a, b, c, d) = (
+                    grid[i][j],
+                    grid[i + 1][j],
+                    grid[i + 1][j + 1],
+                    grid[i][j + 1],
+                );
+                if (i, j) == (1, 1) {
+                    for (x, y) in [(a, b), (b, c), (c, d), (d, a)] {
+                        push(&mut m, vec![x, y, apex]);
+                    }
+                } else {
+                    push(&mut m, vec![a, b, c, d]);
+                }
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn slab_bump_of_tilted_triangles_joins_the_slab_panel() {
+        let m = slab_with_a_bump();
+        let mut p = policy();
+        p.panel_tolerance = 0.05;
+        p.geotechnical = true;
+        let r = run(&m, &p);
+        assert_eq!(r.plane_families.len(), 1, "{:?}", r.plane_families);
+        assert!(r.accepted, "{}: {}", r.reason, r.candidate_max_residual);
+        assert!(r.maximum_movement <= 0.02, "{}", r.maximum_movement);
     }
 }
