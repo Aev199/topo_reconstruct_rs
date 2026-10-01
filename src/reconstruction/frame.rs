@@ -1034,7 +1034,20 @@ fn solve_impl(
             }
         }
         let fixed = basis.len();
-        for axis in [DVec3::X, DVec3::Y, DVec3::Z] {
+        // Like a long axis, a vertical or horizontal short axis is snapped
+        // to its direction class; a horizontal one keeps only its plan
+        // length and level, its transverse plan offset (source noise, e.g.
+        // a chain wall - slab - wall of 25 mm links) is free.
+        let cosine = d.normalize().dot(up).abs();
+        let plan = d - up * d.dot(up);
+        let (target, candidates) = if cosine >= policy.angle.cos() {
+            (up * d.dot(up), vec![DVec3::X, DVec3::Y, DVec3::Z])
+        } else if cosine <= policy.angle.sin() {
+            (plan, vec![plan.normalize(), up])
+        } else {
+            (d, vec![DVec3::X, DVec3::Y, DVec3::Z])
+        };
+        for axis in candidates {
             let mut n = axis;
             for q in &basis {
                 n -= *q * q.dot(n);
@@ -1043,14 +1056,14 @@ fn solve_impl(
                 basis.push(n.normalize());
             }
         }
-        let kept: DVec3 = basis.iter().skip(fixed).map(|n| *n * n.dot(d)).sum();
+        let kept: DVec3 = basis.iter().skip(fixed).map(|n| *n * n.dot(target)).sum();
         // A bar mostly across the plane is not noise in it: keep its vector.
-        let fixed = if kept.length() < 0.5 * d.length() {
+        let (fixed, target) = if kept.length() < 0.5 * d.length() {
             basis = vec![DVec3::X, DVec3::Y, DVec3::Z];
-            0
+            (0, d)
         } else {
             flattened_lengths.insert(axis_index, kept.length());
-            fixed
+            (fixed, target)
         };
         for (k, n) in basis.iter().enumerate().skip(fixed) {
             let mut e = equation(
@@ -1062,7 +1075,7 @@ fn solve_impl(
                     component: k - fixed,
                 },
             );
-            e.target = n.dot(d);
+            e.target = n.dot(target);
             equations.push(e);
         }
     }
@@ -2495,5 +2508,62 @@ mod tests {
             "{}",
             new.length()
         );
+    }
+
+    /// Wall nodes A and C (C 0.2 mm off the wall plane) joined through a
+    /// slab node B by two 25 mm horizontal bars along the wall.
+    fn wall_slab_wall_links() -> MeshData {
+        let mut m = MeshData::default();
+        for (id, p) in [
+            (1, [0., 0., 0.]),
+            (2, [1., 0., 0.]),
+            (3, [1., 0., 1.]),
+            (4, [0.35, 0.0002, 1.]),
+            (5, [0.3, 0., 1.]),
+            (6, [0., 0., 1.]),
+            (7, [0.325, 0.0001, 1.]),
+            (8, [0.325, 1., 1.]),
+            (9, [1., 1., 1.]),
+        ] {
+            m.nodes.insert(id, DVec3::from_array(p));
+        }
+        for (id, ty, stiff, nodes) in [
+            (1, 42, 1, vec![1, 2, 4]),
+            (2, 42, 1, vec![2, 3, 4]),
+            (3, 42, 1, vec![1, 4, 5]),
+            (4, 42, 1, vec![1, 5, 6]),
+            (5, 42, 2, vec![7, 8, 9]),
+            (6, 10, 3, vec![5, 7]),
+            (7, 10, 3, vec![7, 4]),
+        ] {
+            m.elements.push(ElementData {
+                id,
+                elem_type: ty,
+                stiff_id: stiff,
+                nodes,
+            });
+        }
+        m
+    }
+
+    #[test]
+    fn short_links_keep_length_and_level_not_transverse_noise() {
+        let m = wall_slab_wall_links();
+        let mut p = policy();
+        p.geotechnical = true;
+        let r = run(&m, &p);
+        assert!(
+            r.accepted,
+            "{}: {} {:?}",
+            r.reason, r.candidate_max_residual, r.short_axis_indices
+        );
+        for axis in &r.axes {
+            let [i, j] = axis.endpoints;
+            let old =
+                DVec3::from_array(r.reference_points[j]) - DVec3::from_array(r.reference_points[i]);
+            let new = DVec3::from_array(r.points[j]) - DVec3::from_array(r.points[i]);
+            assert!((old.length() - new.length()).abs() < 1e-3);
+            assert!(new.z.abs() < 1e-6);
+        }
     }
 }
