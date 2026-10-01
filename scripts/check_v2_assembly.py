@@ -162,6 +162,8 @@ def check(data, baseline=None):
     # A bar collapsed as too short no longer bounds the movement of its nodes.
     removed_axes = {c["source_axis"] for c in topology.get("short_bars", {}).get("collapsed", [])
                     if c["removed"]}
+    # So does a bar represented by another one (a duplicate).
+    removed_axes |= {d["source_axis"] for d in topology.get("short_bars", {}).get("duplicates", [])}
     for k, axis in enumerate(frame["axes"]):
         if k in removed_axes:
             continue
@@ -233,6 +235,7 @@ def check(data, baseline=None):
     tees = topology.get("bar_tees") or {}
     for j in tees.get("joined", []):
         assert 0. <= j["distance"] <= tees["tolerance"] + epsilon
+        closures.append((j["source_node"], j["distance"]))
         for axis in ends.get(j["vertex"], []):
             closures += [(a["source_node"], j["distance"]) for a in axis["anchors"]]
     for n, tolerance in closures:
