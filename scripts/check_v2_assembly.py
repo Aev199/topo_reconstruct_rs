@@ -329,8 +329,12 @@ def check(data, baseline=None):
     for d in duplicates:
         kept = kept_axes[d["kept_source_axis"]]
         removed = frame["axes"][d["source_axis"]]
-        assert sorted(s["stiffness"] for s in kept["spans"]) == sorted(
-            s["stiffness"] for s in removed["spans"] if s["element"] in d["elements"])
+        removed_stiffness = [s["stiffness"] for s in removed["spans"] if s["element"] in d["elements"]]
+        if d.get("contained"):
+            # Lying on a part of the kept bar, of its stiffness there.
+            assert set(removed_stiffness) <= {s["stiffness"] for s in kept["spans"]}
+        else:
+            assert sorted(s["stiffness"] for s in kept["spans"]) == sorted(removed_stiffness)
     assert sorted(represented) == list(range(len(frame["axes"])))
     # Generated crossings of a bar with a surface carry no source node; each
     # is reported with its axis and lies on the plane of its surface.

@@ -505,6 +505,8 @@ pub struct DuplicateBar {
     pub source_axis: usize,
     pub kept_source_axis: usize,
     pub elements: Vec<u32>,
+    /// Lying on a part of the kept bar (not the whole of it).
+    pub contained: bool,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -549,12 +551,20 @@ pub fn remove_duplicate_bars(bars: &mut Bars<'_>) -> Vec<DuplicateBar> {
                     source_axis: axis.source_axis,
                     kept_source_axis: *e.get(),
                     elements: axis.spans.iter().map(|s| s.element).collect(),
+                    contained: false,
                 });
             }
         }
     }
-    if duplicates.is_empty() {
-        return duplicates;
+    drop_axes(bars, &removed);
+    duplicates
+}
+
+/// Remove the axes marked in `removed` with their contacts; contacts of the
+/// others are renumbered.
+fn drop_axes(bars: &mut Bars<'_>, removed: &[bool]) {
+    if !removed.contains(&true) {
+        return;
     }
     let mut index = vec![None; bars.axes.len()];
     let mut next = 0;
@@ -579,6 +589,80 @@ pub fn remove_duplicate_bars(bars: &mut Bars<'_>) -> Vec<DuplicateBar> {
             None => false,
         }
     });
+}
+
+/// Remove every bar lying on a part of another bar of the same stiffness
+/// (its nodes, in order, are consecutive nodes of the other one: a beam
+/// modelled twice, one element over two): represented once, its elements
+/// reported. Bars sharing a span only partly, or of another stiffness,
+/// stay.
+pub fn remove_contained_bars(bars: &mut Bars<'_>) -> Vec<DuplicateBar> {
+    let chain = |a: &Axis| {
+        let mut anchors = a.anchors.clone();
+        anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+        anchors.iter().map(|x| x.vertex).collect::<Vec<_>>()
+    };
+    let mut by_vertex = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for (k, a) in bars.axes.iter().enumerate() {
+        for x in &a.anchors {
+            by_vertex.entry(x.vertex).or_default().push(k);
+        }
+    }
+    let mut order: Vec<usize> = (0..bars.axes.len()).collect();
+    order.sort_by_key(|&k| bars.axes[k].source_axis);
+    let mut removed = vec![false; bars.axes.len()];
+    let mut duplicates = vec![];
+    for i in order {
+        let stiffness: BTreeSet<u32> = bars.axes[i].spans.iter().map(|s| s.stiffness).collect();
+        let (Some(&stiffness), 1) = (stiffness.first(), stiffness.len()) else {
+            continue;
+        };
+        let ci = chain(&bars.axes[i]);
+        let (first, last) = (ci[0], ci[ci.len() - 1]);
+        let candidates: Vec<usize> = by_vertex[&first]
+            .iter()
+            .copied()
+            .filter(|&k| k != i && !removed[k] && by_vertex[&last].contains(&k))
+            .collect();
+        for k in candidates {
+            let ck = chain(&bars.axes[k]);
+            if ck.len() <= ci.len() {
+                continue;
+            }
+            let reversed: Vec<usize> = ci.iter().rev().copied().collect();
+            let inside = |c: &[usize]| ck.windows(c.len()).any(|w| w == c);
+            if !inside(&ci) && !inside(&reversed) {
+                continue;
+            }
+            let t = |v: usize| {
+                bars.axes[k]
+                    .anchors
+                    .iter()
+                    .find(|x| x.vertex == v)
+                    .map(|x| x.t)
+                    .unwrap()
+            };
+            let (lo, hi) = (t(first).min(t(last)), t(first).max(t(last)));
+            let covering: Vec<u32> = bars.axes[k]
+                .spans
+                .iter()
+                .filter(|s| s.start_t < hi && s.end_t > lo)
+                .map(|s| s.stiffness)
+                .collect();
+            if covering.is_empty() || covering.iter().any(|&s| s != stiffness) {
+                continue;
+            }
+            removed[i] = true;
+            duplicates.push(DuplicateBar {
+                source_axis: bars.axes[i].source_axis,
+                kept_source_axis: bars.axes[k].source_axis,
+                elements: bars.axes[i].spans.iter().map(|s| s.element).collect(),
+                contained: true,
+            });
+            break;
+        }
+    }
+    drop_axes(bars, &removed);
     duplicates
 }
 
@@ -1703,6 +1787,56 @@ mod tests {
             assert_eq!(nodes(&axes[1]), vec![b0, mid, b1]);
             assert!((axes[1].anchors[1].t - 0.5).abs() < 1e-9);
             assert_eq!(nodes(&axes[0]), vec![a0, b0, mid, b1, a1]);
+        }
+    }
+
+    #[test]
+    fn bar_on_a_part_of_a_bar_of_its_stiffness_is_represented_once() {
+        // B runs through nodes b0, mid, b1 of A: of A's stiffness it is a
+        // duplicate (elements reported); of another stiffness it stays.
+        for (stiffness, removed) in [(1, true), (2, false)] {
+            let mut m = Model::new(1e-7, 0.001).unwrap();
+            let v: Vec<usize> = [0., 1., 1.5, 2., 4.]
+                .iter()
+                .map(|&x| m.add_vertex([x, 1., 1.]).unwrap())
+                .collect();
+            let mut b = spanned([v[1], v[3]], &[(v[1], 0.), (v[2], 0.5), (v[3], 1.)], 20);
+            b.spans.truncate(1);
+            b.spans[0].end_t = 1.;
+            b.spans[0].stiffness = stiffness;
+            b.source_axis = 1;
+            let mut axes = vec![
+                spanned(
+                    [v[0], v[4]],
+                    &[
+                        (v[0], 0.),
+                        (v[1], 0.25),
+                        (v[2], 0.375),
+                        (v[3], 0.5),
+                        (v[4], 1.),
+                    ],
+                    10,
+                ),
+                b,
+            ];
+            let mut contacts = vec![];
+            let r = remove_contained_bars(&mut Bars {
+                axes: &mut axes,
+                contacts: &mut contacts,
+            });
+            assert_eq!(r.len(), usize::from(removed));
+            assert_eq!(axes.len(), if removed { 1 } else { 2 });
+            if removed {
+                assert!(r[0].contained);
+                assert_eq!(
+                    (
+                        r[0].source_axis,
+                        r[0].kept_source_axis,
+                        r[0].elements.clone()
+                    ),
+                    (1, 0, vec![20])
+                );
+            }
         }
     }
 

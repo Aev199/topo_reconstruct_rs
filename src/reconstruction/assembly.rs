@@ -1315,12 +1315,16 @@ fn assemble_impl(
     let mut bar_tees = bar_tees;
     if !bar_tees.joined.is_empty() {
         bar_tees.shared_nodes = cleanup::share_overlapping_bars(&model, &mut axis_assembly.axes);
+        let mut bars = cleanup::Bars {
+            axes: &mut axis_assembly.axes,
+            contacts: &mut axis_assembly.contacts,
+        };
         short_bars
             .duplicates
-            .extend(cleanup::remove_duplicate_bars(&mut cleanup::Bars {
-                axes: &mut axis_assembly.axes,
-                contacts: &mut axis_assembly.contacts,
-            }));
+            .extend(cleanup::remove_duplicate_bars(&mut bars));
+        short_bars
+            .duplicates
+            .extend(cleanup::remove_contained_bars(&mut bars));
     }
     let (_, _, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
