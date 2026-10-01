@@ -284,6 +284,7 @@ pub(super) fn synchronize(
     }
 
     let mut endpoint_bindings = Vec::new();
+    let mut generated_ends = BTreeMap::<[i64; 3], Vec<usize>>::new();
     let mut interval_contact_count = 0;
     for (contact, item) in contacts.iter().enumerate() {
         match item {
@@ -341,9 +342,39 @@ pub(super) fn synchronize(
                     let (t, vertex, generated) = if let Some((u, vertex)) = existing {
                         (u, vertex, false)
                     } else {
-                        let vertex = vertices.len();
-                        vertices.push(start.lerp(end, t).to_array());
-                        (t, vertex, true)
+                        // The end of another bar's interval at the same point
+                        // (two bars leaving a slab at one point) is shared.
+                        let p = start.lerp(end, t);
+                        let radius = ENDPOINT_SLACK * precision;
+                        let cell = |p: DVec3| (p / radius).floor().as_i64vec3().to_array();
+                        let c = cell(p);
+                        let mut shared = None;
+                        'search: for dx in -1..=1 {
+                            for dy in -1..=1 {
+                                for dz in -1..=1 {
+                                    for &w in generated_ends
+                                        .get(&[c[0] + dx, c[1] + dy, c[2] + dz])
+                                        .into_iter()
+                                        .flatten()
+                                    {
+                                        // On this bar too, within precision.
+                                        if point(&vertices[w]).distance(p) <= precision {
+                                            shared = Some(w);
+                                            break 'search;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        match shared {
+                            Some(w) => (t, w, false),
+                            None => {
+                                let vertex = vertices.len();
+                                vertices.push(p.to_array());
+                                generated_ends.entry(c).or_default().push(vertex);
+                                (t, vertex, true)
+                            }
+                        }
                     };
                     insert_axis_node(
                         &mut axis_nodes[*axis],
@@ -725,6 +756,59 @@ mod tests {
             .collect();
         assert!(starts.iter().all(|b| b.vertex == node && !b.generated));
         assert!(starts.iter().all(|b| b.parameter == (1. - 5e-8) / 4.));
+    }
+
+    #[test]
+    fn bars_leaving_a_surface_at_one_point_share_the_interval_end() {
+        // Two bars crossing the common edge y = 0 of both panels at (2, 0):
+        // one interval end vertex there, used by both bars and the edge.
+        let (model, mut vertices, _, _) = shared_edge_case();
+        let mut axes = vec![];
+        let mut contacts = vec![];
+        for (k, (a, b)) in [([2., -1., 0.], [2., 1., 0.]), ([1., -1., 0.], [3., 1., 0.])]
+            .into_iter()
+            .enumerate()
+        {
+            vertices.push(a);
+            vertices.push(b);
+            let (va, vb) = (vertices.len() - 2, vertices.len() - 1);
+            axes.push(Axis {
+                source_axis: k,
+                endpoints: [va, vb],
+                anchors: vec![
+                    Anchor {
+                        source_node: 20 + k as u32,
+                        vertex: va,
+                        t: 0.,
+                    },
+                    Anchor {
+                        source_node: 30 + k as u32,
+                        vertex: vb,
+                        t: 1.,
+                    },
+                ],
+                spans: vec![],
+            });
+            for (surface, start_t, end_t) in [(1, 0., 0.5), (0, 0.5, 1.)] {
+                contacts.push(Contact::Interval {
+                    axis: k,
+                    surface,
+                    start_t,
+                    end_t,
+                    location: Location::Interior,
+                });
+            }
+        }
+        let synced = synchronize(&model, &axes, &contacts, &mut vertices, &policy(), 1e-8).unwrap();
+        let at = |k: usize| {
+            synced.axis_nodes[k]
+                .iter()
+                .find(|(t, _)| (t - 0.5).abs() < 1e-12)
+                .unwrap()
+                .1
+        };
+        assert_eq!(at(0), at(1));
+        assert!(synced.edge_nodes[0].iter().any(|&(_, v)| v == at(0)));
     }
 
     #[test]

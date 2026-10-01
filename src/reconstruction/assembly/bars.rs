@@ -271,6 +271,10 @@ pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprin
         }
     }
     let mut out = vec![];
+    // Generated vertices by cell (a point near a cell border is found from
+    // the neighbouring pair's own cell only if both round alike; the
+    // precision is far below the cell size).
+    let mut created = BTreeMap::<[i32; 3], Vec<usize>>::new();
     for (i, j) in pairs {
         let shared = axes[i]
             .anchors
@@ -312,8 +316,22 @@ pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprin
         };
         let (v, bars) = match (near(i, s), near(j, t)) {
             (None, None) => {
-                let Ok(v) = model.add_vertex(p.to_array()) else {
-                    continue;
+                // Another pair through the same point already generated it.
+                let existing = created
+                    .get(&key(p))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .find(|&w| DVec3::from_array(model.vertices[w]).distance(p) <= precision);
+                let v = match existing {
+                    Some(w) => w,
+                    None => {
+                        let Ok(v) = model.add_vertex(p.to_array()) else {
+                            continue;
+                        };
+                        created.entry(key(p)).or_default().push(v);
+                        v
+                    }
                 };
                 (v, vec![(i, s), (j, t)])
             }
