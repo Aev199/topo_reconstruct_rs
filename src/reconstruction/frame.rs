@@ -537,6 +537,32 @@ fn support_families(mesh: &MeshData, report: &planes::Report) -> Vec<Vec<usize>>
 }
 
 fn project(equations: &[Equation], x: &mut Vec<f64>, limit: usize, tolerance: f64) -> (f64, usize) {
+    let mut result = (0., 0);
+    project_checkpoints(
+        equations,
+        x.clone().as_slice(),
+        &[limit],
+        tolerance,
+        &mut |s, r, i| {
+            *x = s;
+            result = (r, i);
+            false
+        },
+    );
+    result
+}
+
+/// LSQR from `x` with the state recorded after each iteration limit in
+/// `limits` (ascending): exactly what separate solves with those limits
+/// return, computed once (a retry with a doubled limit repeated the first
+/// iterations).
+fn project_checkpoints(
+    equations: &[Equation],
+    x: &[f64],
+    limits: &[usize],
+    tolerance: f64,
+    checkpoint: &mut dyn FnMut(Vec<f64>, f64, usize) -> bool,
+) {
     // LSQR operates on A and A^T directly; avoid normal equations A A^T
     // whose conditioning is squared for nearly dependent plane constraints.
     let norm = |v: &[f64]| v.iter().fold(0.0_f64, |a, b| a.hypot(*b));
@@ -582,12 +608,22 @@ fn project(equations: &[Equation], x: &mut Vec<f64>, limit: usize, tolerance: f6
     let mut rho_bar = alpha;
     let mut phi_bar = beta;
     let mut correction = vec![0.0; x.len()];
-    let original = x.clone();
+    let original = x.to_vec();
     let mut residual = equations
         .iter()
-        .map(|e| e.residual(&x).abs())
+        .map(|e| e.residual(x).abs())
         .fold(0.0_f64, f64::max);
     let mut iterations = 0;
+    let state = |correction: &[f64]| -> Vec<f64> {
+        original
+            .iter()
+            .zip(correction)
+            .map(|(o, d)| o + d)
+            .collect()
+    };
+    // Checkpoints passed; the callback may stop the solve at any of them.
+    let mut passed = 0;
+    let limit = limits.last().copied().unwrap_or(0);
     for step in 0..limit {
         if residual <= tolerance {
             break;
@@ -637,11 +673,20 @@ fn project(equations: &[Equation], x: &mut Vec<f64>, limit: usize, tolerance: f6
             .map(|e| e.residual(&candidate).abs())
             .fold(0.0_f64, f64::max);
         iterations = step + 1;
+        while passed < limits.len() && limits[passed] == iterations {
+            passed += 1;
+            if !checkpoint(state(&correction), residual, iterations) {
+                return;
+            }
+        }
     }
-    for ((x, o), d) in x.iter_mut().zip(original).zip(correction) {
-        *x = o + d;
+    // Converged or stopped before the remaining limits: the same state.
+    while passed < limits.len() {
+        passed += 1;
+        if !checkpoint(state(&correction), residual, iterations) {
+            return;
+        }
     }
-    (residual, iterations)
 }
 
 pub fn solve(
@@ -650,7 +695,21 @@ pub fn solve(
     planes: &planes::Report,
     policy: &Policy,
 ) -> Result<Report, &'static str> {
-    solve_impl(mesh, axes, planes, policy, 0, &[], false)
+    single(solve_impl(
+        mesh,
+        axes,
+        planes,
+        policy,
+        0,
+        &[],
+        false,
+        &[policy.iterations],
+        &mut |_| true,
+    )?)
+}
+
+fn single(mut reports: Vec<Report>) -> Result<Report, &'static str> {
+    reports.pop().ok_or("frame solve produced no result")
 }
 
 /// Retry only a numerically incomplete continuous solve with a bounded LSQR
@@ -788,34 +847,44 @@ fn retry_with(
     if maximum_attempts == 0 {
         return Err("frame retry limit must be positive");
     }
-    let mut attempt_policy = policy.clone();
-    let mut best = None;
-    for attempt in 0..maximum_attempts {
-        let result = solve_impl(mesh, axes, planes, &attempt_policy, 0, extra, snap)?;
-        let improved = best.as_ref().is_none_or(|previous: &Report| {
-            result.candidate_max_residual < previous.candidate_max_residual
-        });
-        if improved {
-            best = Some(result.clone());
+    // Attempts double the iteration limit; one solve records them all.
+    let mut limits = vec![policy.iterations];
+    while limits.len() < maximum_attempts {
+        let last = *limits.last().unwrap();
+        match last.checked_mul(2) {
+            Some(next) if next > last => limits.push(next),
+            _ => break,
         }
-        let retryable = !result.accepted
-            && result.candidate_parameters_valid
-            && result.movement_failures.is_empty()
-            && result.axis_failures.is_empty()
-            && result.violating_equations > 0
-            && result.candidate_max_residual.is_finite()
-            && result.candidate_max_residual > attempt_policy.residual_tolerance;
-        if !retryable || !improved || attempt + 1 == maximum_attempts {
-            break;
-        }
-        let Some(iterations) = attempt_policy.iterations.checked_mul(2) else {
-            break;
-        };
-        if iterations <= attempt_policy.iterations {
-            break;
-        }
-        attempt_policy.iterations = iterations;
     }
+    let mut best: Option<Report> = None;
+    let mut attempt = 0;
+    solve_impl(
+        mesh,
+        axes,
+        planes,
+        policy,
+        0,
+        extra,
+        snap,
+        &limits,
+        &mut |result| {
+            attempt += 1;
+            let improved = best.as_ref().is_none_or(|previous| {
+                result.candidate_max_residual < previous.candidate_max_residual
+            });
+            let retryable = !result.accepted
+                && result.candidate_parameters_valid
+                && result.movement_failures.is_empty()
+                && result.axis_failures.is_empty()
+                && result.violating_equations > 0
+                && result.candidate_max_residual.is_finite()
+                && result.candidate_max_residual > result.policy.residual_tolerance;
+            if improved {
+                best = Some(result.clone());
+            }
+            retryable && improved && attempt < limits.len()
+        },
+    )?;
     best.ok_or("frame solve produced no result")
 }
 
@@ -831,7 +900,17 @@ pub fn solve_sliding(
     if maximum_steps == 0 {
         return Err("nonlinear step limit must be positive");
     }
-    solve_impl(mesh, axes, planes, policy, maximum_steps, &[], false)
+    single(solve_impl(
+        mesh,
+        axes,
+        planes,
+        policy,
+        maximum_steps,
+        &[],
+        false,
+        &[policy.iterations],
+        &mut |_| true,
+    )?)
 }
 
 fn solve_impl(
@@ -842,7 +921,9 @@ fn solve_impl(
     maximum_steps: usize,
     extra: &[gaps::Incidence],
     snap: bool,
-) -> Result<Report, &'static str> {
+    checkpoints: &[usize],
+    keep_going: &mut dyn FnMut(&Report) -> bool,
+) -> Result<Vec<Report>, &'static str> {
     let up = DVec3::from_array(policy.up);
     if !up.is_finite()
         || !up.length().is_finite()
@@ -1203,15 +1284,9 @@ fn solve_impl(
         ));
     }
     equations.retain(|e| !e.terms.is_empty());
-    let (residual, iterations, nonlinear_steps, sliding_parameters) = if maximum_steps == 0 {
-        let (residual, iterations) = project(
-            &equations,
-            &mut x,
-            policy.iterations,
-            policy.residual_tolerance,
-        );
-        (residual, iterations, 0, None)
-    } else {
+    // The nonlinear solve updates the equations; it runs before the report
+    // closure borrows them.
+    let nonlinear = (maximum_steps > 0).then(|| {
         sliding::solve(
             &mut equations,
             &mut x,
@@ -1221,182 +1296,241 @@ fn solve_impl(
             policy,
             maximum_steps,
         )
-    };
-    let candidate: Vec<_> = (0..reference.len())
-        .map(|i| center + DVec3::new(x[i * 3], x[i * 3 + 1], x[i * 3 + 2]))
-        .collect();
-    let valid_parameters = sliding_parameters.as_ref().is_none_or(|parameters| {
-        parameters.iter().zip(&new_axes).all(|(ts, axis)| {
-            let mut ordered: Vec<_> = axis.anchors.iter().zip(ts).collect();
-            ordered.sort_by(|(a, _), (b, _)| a.t.total_cmp(&b.t));
-            ts.iter().all(|t| t.is_finite() && *t >= 0.0 && *t <= 1.0)
-                && ordered.windows(2).all(|w| w[0].1 < w[1].1)
-        })
     });
-    let valid = valid_parameters
-        && candidate.iter().all(|p| p.is_finite())
-        && new_axes.iter().enumerate().all(|(k, a)| {
-            let [i, j] = a.endpoints;
-            let d = candidate[j] - candidate[i];
-            // A short axis flattened onto its plane keeps its in-plane length.
-            let expected = flattened_lengths
-                .get(&k)
-                .copied()
-                .unwrap_or(reference[j].distance(reference[i]));
-            // Acceptance still requires convergence (residual within the
-            // tolerance); before it, a change below the residual is numerical.
-            d.length() + policy.residual_tolerance.max(residual)
-                >= policy.minimum_length.min(expected)
-                && d.dot(reference[j] - reference[i]) > 0.0
-                && (sliding_parameters.is_none()
-                    || d.normalize().dot((reference[j] - reference[i]).normalize())
-                        >= policy.angle.cos())
+    let finish = |(x, residual, iterations, nonlinear_steps, sliding_parameters, limit): (
+        Vec<f64>,
+        f64,
+        usize,
+        usize,
+        Option<Vec<Vec<f64>>>,
+        usize,
+    )|
+     -> Result<Report, &'static str> {
+        let candidate: Vec<_> = (0..reference.len())
+            .map(|i| center + DVec3::new(x[i * 3], x[i * 3 + 1], x[i * 3 + 2]))
+            .collect();
+        let valid_parameters = sliding_parameters.as_ref().is_none_or(|parameters| {
+            parameters.iter().zip(&new_axes).all(|(ts, axis)| {
+                let mut ordered: Vec<_> = axis.anchors.iter().zip(ts).collect();
+                ordered.sort_by(|(a, _), (b, _)| a.t.total_cmp(&b.t));
+                ts.iter().all(|t| t.is_finite() && *t >= 0.0 && *t <= 1.0)
+                    && ordered.windows(2).all(|w| w[0].1 < w[1].1)
+            })
         });
-    let within_budget = candidate
-        .iter()
-        .zip(&reference)
-        .zip(&budgets)
-        .all(|((p, o), cap)| p.distance(*o) <= *cap + 1e-10);
-    let accepted = residual <= policy.residual_tolerance && valid && within_budget;
-    let mut maximum_movement = 0.0_f64;
-    let mut candidate_surfaces = surfaces.clone();
-    {
-        for (i, p) in candidate_surfaces.iter_mut().enumerate() {
-            let origin = DVec3::from_array(p.plane.origin);
-            let family = plane_to_family[i];
-            let n = normals[family];
-            let projected = origin + n * (x[base + family] - n.dot(origin - center));
-            p.plane = PlaneFrame::new(projected.to_array(), n.to_array())
-                .map_err(|_| "invalid solved plane")?;
-        }
-    }
-    if accepted {
-        surfaces = candidate_surfaces.clone();
-        maximum_movement = candidate
+        let valid = valid_parameters
+            && candidate.iter().all(|p| p.is_finite())
+            && new_axes.iter().enumerate().all(|(k, a)| {
+                let [i, j] = a.endpoints;
+                let d = candidate[j] - candidate[i];
+                // A short axis flattened onto its plane keeps its in-plane length.
+                let expected = flattened_lengths
+                    .get(&k)
+                    .copied()
+                    .unwrap_or(reference[j].distance(reference[i]));
+                // Acceptance still requires convergence (residual within the
+                // tolerance); before it, a change below the residual is numerical.
+                d.length() + policy.residual_tolerance.max(residual)
+                    >= policy.minimum_length.min(expected)
+                    && d.dot(reference[j] - reference[i]) > 0.0
+                    && (sliding_parameters.is_none()
+                        || d.normalize().dot((reference[j] - reference[i]).normalize())
+                            >= policy.angle.cos())
+            });
+        let within_budget = candidate
             .iter()
             .zip(&reference)
-            .map(|(a, b)| a.distance(*b))
-            .fold(0.0_f64, f64::max);
-    }
-    let mut failures: Vec<_> = equations
-        .iter()
-        .filter_map(|e| {
-            let residual = e.residual(&x).abs();
-            (residual > policy.residual_tolerance).then(|| ConstraintFailure {
-                origin: e.origin.clone(),
-                residual,
-            })
-        })
-        .collect();
-    let violating_equations = failures.len();
-    failures.sort_by(|a, b| b.residual.total_cmp(&a.residual));
-    failures.truncate(100);
-    let movement_failures = candidate
-        .iter()
-        .zip(&reference)
-        .zip(&budgets)
-        .enumerate()
-        .filter_map(|(i, ((p, o), cap))| {
-            let movement = p.distance(*o);
-            (movement > *cap + 1e-10).then_some(MovementFailure {
-                node_id: node_ids[i],
-                movement,
-                budget: *cap,
-            })
-        })
-        .collect();
-    let axis_failures = new_axes
-        .iter()
-        .enumerate()
-        .filter_map(|(axis, a)| {
-            let [i, j] = a.endpoints;
-            let old = reference[j] - reference[i];
-            let new = candidate[j] - candidate[i];
-            // A short axis flattened onto its plane keeps its in-plane length.
-            let expected = flattened_lengths
-                .get(&axis)
-                .copied()
-                .unwrap_or(old.length());
-            // Before convergence a length change below the residual is
-            // numerical, not a collapse (it must not block the retry).
-            (new.length() + policy.residual_tolerance.max(residual)
-                < policy.minimum_length.min(expected)
-                || new.dot(old) <= 0.0
-                || (sliding_parameters.is_some()
-                    && new.normalize().dot(old.normalize()) < policy.angle.cos()))
-            .then_some(AxisFailure {
-                axis,
-                original_length: old.length(),
-                candidate_length: new.length(),
-                source_elements: a.spans.iter().map(|s| s.element).collect(),
-            })
-        })
-        .collect();
-    Ok(Report {
-        sliding_parameters,
-        nonlinear_steps,
-        candidate_parameters_valid: valid_parameters,
-        policy: policy.clone(),
-        accepted,
-        candidate_constraints_satisfied: residual <= policy.residual_tolerance,
-        violating_equations,
-        largest_constraint_failures: failures,
-        movement_failures,
-        axis_failures,
-        reason: if accepted {
-            "converged"
-        } else if !valid_parameters {
-            "invalid_anchor_order"
-        } else if !within_budget {
-            "movement_budget_exceeded"
-        } else if !valid {
-            "invalid_axis"
-        } else {
-            "constraints_or_budget_not_satisfied"
+            .zip(&budgets)
+            .all(|((p, o), cap)| p.distance(*o) <= *cap + 1e-10);
+        let accepted = residual <= policy.residual_tolerance && valid && within_budget;
+        let mut maximum_movement = 0.0_f64;
+        let mut surfaces = surfaces.clone();
+        let mut candidate_surfaces = surfaces.clone();
+        {
+            for (i, p) in candidate_surfaces.iter_mut().enumerate() {
+                let origin = DVec3::from_array(p.plane.origin);
+                let family = plane_to_family[i];
+                let n = normals[family];
+                let projected = origin + n * (x[base + family] - n.dot(origin - center));
+                p.plane = PlaneFrame::new(projected.to_array(), n.to_array())
+                    .map_err(|_| "invalid solved plane")?;
+            }
         }
-        .into(),
-        iterations,
-        candidate_max_residual: residual,
-        candidate_maximum_movement: candidate
+        if accepted {
+            surfaces = candidate_surfaces.clone();
+            maximum_movement = candidate
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| a.distance(*b))
+                .fold(0.0_f64, f64::max);
+        }
+        let mut failures: Vec<_> = equations
             .iter()
-            .zip(&reference)
-            .map(|(a, b)| a.distance(*b))
-            .fold(0.0_f64, f64::max),
-        candidate_over_budget_node_ids: candidate
+            .filter_map(|e| {
+                let residual = e.residual(&x).abs();
+                (residual > policy.residual_tolerance).then(|| ConstraintFailure {
+                    origin: e.origin.clone(),
+                    residual,
+                })
+            })
+            .collect();
+        let violating_equations = failures.len();
+        failures.sort_by(|a, b| b.residual.total_cmp(&a.residual));
+        failures.truncate(100);
+        let movement_failures = candidate
             .iter()
             .zip(&reference)
             .zip(&budgets)
             .enumerate()
-            .filter_map(|(i, ((p, o), cap))| (p.distance(*o) > *cap + 1e-10).then_some(node_ids[i]))
-            .collect(),
-        maximum_movement,
-        node_ids: node_ids.clone(),
-        reference_points: reference.iter().map(|p| p.to_array()).collect(),
-        candidate_points: candidate.iter().map(|p| p.to_array()).collect(),
-        candidate_planes: candidate_surfaces.iter().map(|s| s.plane.clone()).collect(),
-        points: if accepted {
-            candidate.iter().map(|p| p.to_array()).collect()
-        } else {
-            reference.iter().map(|p| p.to_array()).collect()
-        },
-        axes: new_axes.clone(),
-        surfaces,
-        short_axis_indices: new_axes
+            .filter_map(|(i, ((p, o), cap))| {
+                let movement = p.distance(*o);
+                (movement > *cap + 1e-10).then_some(MovementFailure {
+                    node_id: node_ids[i],
+                    movement,
+                    budget: *cap,
+                })
+            })
+            .collect();
+        let axis_failures = new_axes
             .iter()
             .enumerate()
-            .filter_map(|(i, a)| {
-                (reference[a.endpoints[0]].distance(reference[a.endpoints[1]])
-                    < policy.minimum_length)
-                    .then_some(i)
+            .filter_map(|(axis, a)| {
+                let [i, j] = a.endpoints;
+                let old = reference[j] - reference[i];
+                let new = candidate[j] - candidate[i];
+                // A short axis flattened onto its plane keeps its in-plane length.
+                let expected = flattened_lengths
+                    .get(&axis)
+                    .copied()
+                    .unwrap_or(old.length());
+                // Before convergence a length change below the residual is
+                // numerical, not a collapse (it must not block the retry).
+                (new.length() + policy.residual_tolerance.max(residual)
+                    < policy.minimum_length.min(expected)
+                    || new.dot(old) <= 0.0
+                    || (sliding_parameters.is_some()
+                        && new.normalize().dot(old.normalize()) < policy.angle.cos()))
+                .then_some(AxisFailure {
+                    axis,
+                    original_length: old.length(),
+                    candidate_length: new.length(),
+                    source_elements: a.spans.iter().map(|s| s.element).collect(),
+                })
             })
-            .collect(),
-        short_axis_movement: planes.policy.distance,
-        plane_families,
-        regularized_directions: snap,
-        equation_count: equations.len(),
-        virtual_incidences: gaps::Report::default(),
-        budget_cache: Default::default(),
-    })
+            .collect();
+        Ok(Report {
+            sliding_parameters,
+            nonlinear_steps,
+            candidate_parameters_valid: valid_parameters,
+            policy: Policy {
+                iterations: limit,
+                ..policy.clone()
+            },
+            accepted,
+            candidate_constraints_satisfied: residual <= policy.residual_tolerance,
+            violating_equations,
+            largest_constraint_failures: failures,
+            movement_failures,
+            axis_failures,
+            reason: if accepted {
+                "converged"
+            } else if !valid_parameters {
+                "invalid_anchor_order"
+            } else if !within_budget {
+                "movement_budget_exceeded"
+            } else if !valid {
+                "invalid_axis"
+            } else {
+                "constraints_or_budget_not_satisfied"
+            }
+            .into(),
+            iterations,
+            candidate_max_residual: residual,
+            candidate_maximum_movement: candidate
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| a.distance(*b))
+                .fold(0.0_f64, f64::max),
+            candidate_over_budget_node_ids: candidate
+                .iter()
+                .zip(&reference)
+                .zip(&budgets)
+                .enumerate()
+                .filter_map(|(i, ((p, o), cap))| {
+                    (p.distance(*o) > *cap + 1e-10).then_some(node_ids[i])
+                })
+                .collect(),
+            maximum_movement,
+            node_ids: node_ids.clone(),
+            reference_points: reference.iter().map(|p| p.to_array()).collect(),
+            candidate_points: candidate.iter().map(|p| p.to_array()).collect(),
+            candidate_planes: candidate_surfaces.iter().map(|s| s.plane.clone()).collect(),
+            points: if accepted {
+                candidate.iter().map(|p| p.to_array()).collect()
+            } else {
+                reference.iter().map(|p| p.to_array()).collect()
+            },
+            axes: new_axes.clone(),
+            surfaces,
+            short_axis_indices: new_axes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, a)| {
+                    (reference[a.endpoints[0]].distance(reference[a.endpoints[1]])
+                        < policy.minimum_length)
+                        .then_some(i)
+                })
+                .collect(),
+            short_axis_movement: planes.policy.distance,
+            plane_families: plane_families.clone(),
+            regularized_directions: snap,
+            equation_count: equations.len(),
+            virtual_incidences: gaps::Report::default(),
+            budget_cache: Default::default(),
+        })
+    };
+    // One report per iteration limit (a linear solve records each until
+    // `keep_going` declines; the nonlinear solve has one).
+    let mut reports = vec![];
+    if maximum_steps == 0 {
+        let mut error = None;
+        let mut next = 0;
+        project_checkpoints(
+            &equations,
+            &x,
+            checkpoints,
+            policy.residual_tolerance,
+            &mut |x, residual, iterations| {
+                let limit = checkpoints[next];
+                next += 1;
+                match finish((x, residual, iterations, 0, None, limit)) {
+                    Ok(report) => {
+                        let more = keep_going(&report);
+                        reports.push(report);
+                        more
+                    }
+                    Err(e) => {
+                        error = Some(e);
+                        false
+                    }
+                }
+            },
+        );
+        if let Some(e) = error {
+            return Err(e);
+        }
+    } else {
+        let (residual, iterations, nonlinear_steps, sliding_parameters) =
+            nonlinear.expect("nonlinear solve");
+        reports.push(finish((
+            x.clone(),
+            residual,
+            iterations,
+            nonlinear_steps,
+            sliding_parameters,
+            policy.iterations,
+        ))?);
+    }
+    Ok(reports)
 }
 
 #[cfg(test)]
