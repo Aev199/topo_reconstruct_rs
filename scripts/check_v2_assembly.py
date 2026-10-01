@@ -362,7 +362,8 @@ def check(data, baseline=None):
         for anchor in axis["anchors"]:
             assert 0 <= anchor["t"] <= 1
             interpolated = [x + (y - x) * anchor["t"] for x, y in zip(a, b)]
-            assert math.dist(interpolated, vertices[anchor["vertex"]]) <= epsilon
+            # Points within ten precisions are one point (the mesh's slack).
+            assert math.dist(interpolated, vertices[anchor["vertex"]]) <= 10 * epsilon
             if anchor["source_node"] == no_source:
                 assert (k, anchor["vertex"]) in crossings
                 continue

@@ -1237,7 +1237,14 @@ pub fn join_bar_tees(
             .chain([v])
             .map(|w| (w, model.vertices[w]))
             .collect();
-        if let Err(reason) = move_with_axes(model, bars.axes, v, target, tolerance) {
+        // Within the point slack the end is already on the bar: no move.
+        let numerical = distance <= crate::reconstruction::mesh::ENDPOINT_SLACK * precision;
+        let moved = if numerical {
+            Ok(())
+        } else {
+            move_with_axes(model, bars.axes, v, target, tolerance)
+        };
+        if let Err(reason) = moved {
             for &(w, p) in touched.iter().rev() {
                 let _ = model.move_vertex(w, p);
             }
@@ -1696,6 +1703,38 @@ mod tests {
             assert_eq!(nodes(&axes[1]), vec![b0, mid, b1]);
             assert!((axes[1].anchors[1].t - 0.5).abs() < 1e-9);
             assert_eq!(nodes(&axes[0]), vec![a0, b0, mid, b1, a1]);
+        }
+    }
+
+    #[test]
+    fn bar_end_within_the_point_slack_joins_without_moving() {
+        for place in Placement::all() {
+            // A beam end 0.5 um beside beam A (within ten precisions): it
+            // becomes a node of A where it is.
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [4., 1., 1.]));
+            let end = v(&mut m, [2., 1. + 5e-7, 1.]);
+            let b1 = v(&mut m, [2., 3., 1.]);
+            let before = m.vertices[end];
+            let mut axes = vec![
+                spanned([a0, a1], &[(a0, 0.), (a1, 1.)], 10),
+                spanned([end, b1], &[(end, 0.), (b1, 1.)], 20),
+            ];
+            let source_nodes = vec![0; m.vertices.len()];
+            let r = join_bar_tees(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut vec![],
+                },
+                0.05 * place.scale,
+                &BTreeSet::new(),
+                &source_nodes,
+            );
+            assert_eq!(r.joined.len(), 1, "{:?}", r.rejected);
+            assert_eq!(m.vertices[end], before);
+            assert!(axes[0].anchors.iter().any(|x| x.vertex == end));
         }
     }
 

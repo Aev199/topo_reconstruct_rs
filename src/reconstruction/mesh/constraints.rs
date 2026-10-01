@@ -85,7 +85,7 @@ fn insert_axis_node(
             .get(vertex)
             .ok_or("invalid axis constraint vertex")?,
     );
-    if p.distance(axis_start + axis * t) > precision {
+    if p.distance(axis_start + axis * t) > ENDPOINT_SLACK * precision {
         return Err("axis constraint vertex is off axis");
     }
     if let Some((u, _existing)) = chain.iter().find(|(_, n)| *n == vertex) {
