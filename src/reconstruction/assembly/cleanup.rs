@@ -1103,8 +1103,9 @@ pub struct TeeReport {
 /// next to a beam): the end moves onto that bar, its own bars staying
 /// straight, and becomes a node of it. Closest first; an end next to a node
 /// of the other bar (within the minimum edge) is left to the end and node
-/// merges, an end that is an interior node of a bar never moves, and the end
-/// must stay on the planes of the surfaces it belongs to.
+/// merges, an end that is an interior node of a bar never moves, a bar
+/// running along the other one (a parallel duplicate) is not joined, and the
+/// end must stay on the planes of the surfaces it belongs to.
 pub fn join_bar_tees(
     model: &mut Model,
     bars: &mut Bars<'_>,
@@ -1204,6 +1205,28 @@ pub fn join_bar_tees(
             continue;
         }
         let [p, q] = bars.axes[k].endpoints.map(|w| point(model, w));
+        // A bar running along the other one (both its ends near its line: a
+        // parallel duplicate a few millimetres off) is not a T junction.
+        let line_distance = |x: DVec3| {
+            let d = q - p;
+            (p + d * ((x - p).dot(d) / d.length_squared())).distance(x)
+        };
+        let along = bars
+            .axes
+            .iter()
+            .filter(|a| a.endpoints.contains(&v))
+            .any(|a| {
+                let other = if a.endpoints[0] == v {
+                    a.endpoints[1]
+                } else {
+                    a.endpoints[0]
+                };
+                line_distance(point(model, other)) <= tolerance
+            });
+        if along {
+            reject(&mut report, distance, "bar_along_bar");
+            continue;
+        }
         let target = p + (q - p) * u;
         let mut planes: Vec<usize> = users(model, v);
         for c in bars.contacts.iter() {
@@ -1593,6 +1616,36 @@ mod tests {
                     assert_eq!(r.rejected.len(), usize::from(node_on_a));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn bar_parallel_to_a_span_is_not_joined() {
+        for place in Placement::all() {
+            // A 1 m bar 3 mm beside beam A along its span: a parallel
+            // duplicate, not a T junction; it does not move.
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [4., 1., 1.]));
+            let (b0, b1) = (v(&mut m, [1., 1.003, 1.]), v(&mut m, [2., 1.003, 1.]));
+            let mut axes = vec![
+                spanned([a0, a1], &[(a0, 0.), (a1, 1.)], 10),
+                spanned([b0, b1], &[(b0, 0.), (b1, 1.)], 20),
+            ];
+            let source_nodes = vec![0; m.vertices.len()];
+            let r = join_bar_tees(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut vec![],
+                },
+                0.05 * place.scale,
+                &BTreeSet::new(),
+                &source_nodes,
+            );
+            assert!(r.joined.is_empty());
+            assert!(r.rejected.iter().all(|x| x.reason == "bar_along_bar"));
+            assert_eq!(axes[0].anchors.len(), 2);
         }
     }
 
