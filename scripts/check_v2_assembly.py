@@ -232,7 +232,7 @@ def check(data, baseline=None):
     # are re-placed straight.
     tees = topology.get("bar_tees") or {}
     for j in tees.get("joined", []):
-        assert 0. < j["distance"] <= tees["tolerance"] + epsilon
+        assert 0. <= j["distance"] <= tees["tolerance"] + epsilon
         for axis in ends.get(j["vertex"], []):
             closures += [(a["source_node"], j["distance"]) for a in axis["anchors"]]
     for n, tolerance in closures:

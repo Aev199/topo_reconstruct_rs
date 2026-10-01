@@ -1155,10 +1155,9 @@ pub fn join_bar_tees(
         let length = d.length();
         let u = (point(model, v) - p).dot(d) / (length * length);
         let distance = (p + d * u).distance(point(model, v));
-        (u * length > minimum
-            && (1. - u) * length > minimum
-            && distance <= tolerance
-            && distance > precision)
+        // An end exactly on the span (an overlapping bar) only becomes a
+        // node of it.
+        (u * length > minimum && (1. - u) * length > minimum && distance <= tolerance)
             .then_some((distance, u))
     };
     let mut candidates = vec![];
@@ -1605,9 +1604,11 @@ mod tests {
             // Beam A along y = 1 above a slab; beams B and C meet at a node
             // `off` beside A's span at x = 2. 3 mm off, the node moves onto
             // A (B and C stay straight) and becomes a node of A; 60 mm off,
-            // nothing changes; next to a node of A, it is left alone.
+            // nothing changes; next to a node of A, it is left alone; exactly
+            // on A, it only becomes a node of A.
             for (off, node_on_a, joined) in [
                 (0.003, false, true),
+                (0., false, true),
                 (0.06, false, false),
                 (0.003, true, false),
             ] {
