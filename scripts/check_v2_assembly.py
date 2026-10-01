@@ -340,9 +340,10 @@ def check(data, baseline=None):
             a, b = (vertices[w] for w in bars["axes"][k]["endpoints"])
             p = [x + (y - x) * c["t"] for x, y in zip(a, b)]
             assert math.dist(p, vertices[v]) <= epsilon
-    bar_crossings = collections.Counter(c["vertex"] for c in bars.get("imprinted", [])
-                                        if c["kind"] == "bar_crossing")
-    assert all(n >= 2 for n in bar_crossings.values())
+    # A bar crossing may reuse the crossing of another bar with a surface.
+    generated = collections.Counter(v for (_, v) in crossings)
+    assert all(generated[c["vertex"]] >= 2 for c in bars.get("imprinted", [])
+               if c["kind"] == "bar_crossing")
     for k, axis in enumerate(bars["axes"]):
         original = frame["axes"][axis["source_axis"]]
         assert len(axis["endpoints"]) == 2

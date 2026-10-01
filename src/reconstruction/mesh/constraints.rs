@@ -5,7 +5,7 @@
 //! surface owning the edge.  This keeps surface constraints and bar chains
 //! conforming without welding vertices by proximity.
 
-use super::{parameter, point, sorted, subdivide, Policy};
+use super::{diagnostic, parameter, point, sorted, subdivide, Policy};
 use crate::reconstruction::{
     assembly::bars::{Axis, Contact},
     Model,
@@ -96,6 +96,12 @@ fn insert_axis_node(
     }
     if let Some((_, existing)) = chain.iter().find(|(u, _)| (*u - t).abs() <= tolerance) {
         if *existing != vertex {
+            diagnostic(|| {
+                format!(
+                    "axis vertices {existing} {:?} and {vertex} {:?} at parameter {t}",
+                    vertices[*existing], vertices[vertex]
+                )
+            });
             return Err("distinct axis constraint vertices share a parameter");
         }
         return Ok(false);

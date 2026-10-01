@@ -200,7 +200,7 @@ fn subdivide(
 }
 /// Details of a mesh failure on stderr when TOPO_DIAG is set (the error
 /// itself is a static reason).
-fn diagnostic(message: impl FnOnce() -> String) {
+pub(super) fn diagnostic(message: impl FnOnce() -> String) {
     if std::env::var_os("TOPO_DIAG").is_some() {
         eprintln!("[diag] {}", message());
     }
