@@ -971,12 +971,9 @@ fn solve_impl(
             spans: a.spans.clone(),
         });
     }
-    let plane_families = merge_kinked_families(
-        mesh,
-        planes,
-        support_families(mesh, planes),
-        policy.panel_tolerance,
-    );
+    let support = support_families(mesh, planes);
+    let unmerged: BTreeSet<Vec<usize>> = support.iter().cloned().collect();
+    let plane_families = merge_kinked_families(mesh, planes, support, policy.panel_tolerance);
     let mut plane_to_family = vec![0; planes.patches.len()];
     let mut normals = vec![];
     let mut pending: Vec<(DVec3, Vec<DVec3>)> = vec![];
@@ -1009,12 +1006,19 @@ fn solve_impl(
         };
         // Horizontal slabs and vertical walls, if every node of the family
         // stays within the plane distance (a large slightly tilted family,
-        // 1 degree over 9 m, would move nodes by 16 cm).
+        // 1 degree over 9 m, would move nodes by 16 cm); a merged panel
+        // (already allowed the panel tolerance: a slab with an 18 mm bump)
+        // within the panel tolerance.
         let mean = points.iter().copied().sum::<DVec3>() / points.len() as f64;
+        let allowed = if unmerged.contains(members) {
+            planes.policy.distance
+        } else {
+            planes.policy.distance.max(policy.panel_tolerance)
+        };
         let normal = if snapped == old
             || points
                 .iter()
-                .all(|p| snapped.dot(*p - mean).abs() <= planes.policy.distance)
+                .all(|p| snapped.dot(*p - mean).abs() <= allowed)
         {
             snapped
         } else {
@@ -2632,6 +2636,10 @@ mod tests {
     }
 
     fn slab_with_a_bump_noise(noise: f64) -> MeshData {
+        slab_with_a_bump_at(noise, [1.5, 1.5, 0.018])
+    }
+
+    fn slab_with_a_bump_at(noise: f64, apex: [f64; 3]) -> MeshData {
         let mut m = MeshData::default();
         let mut id = 0;
         let mut node = |m: &mut MeshData, p: [f64; 3]| {
@@ -2650,7 +2658,7 @@ mod tests {
                 *n = node(&mut m, [i as f64, j as f64, z]);
             }
         }
-        let apex = node(&mut m, [1.5, 1.5, 0.018]);
+        let apex = node(&mut m, apex);
         let mut element = 0;
         let mut push = |m: &mut MeshData, nodes: Vec<u32>| {
             element += 1;
@@ -2708,5 +2716,21 @@ mod tests {
         // Without the panel tolerance the faces stay separate.
         p.panel_tolerance = 0.;
         assert!(run(&m, &p).plane_families.len() > 1);
+    }
+
+    #[test]
+    fn merged_slab_panel_stays_exactly_horizontal() {
+        // An off-centre bump tilts the fitted panel slightly; the merged
+        // panel is still snapped horizontal (within the panel tolerance), so
+        // bars lying on the slab stay in its plane.
+        let m = slab_with_a_bump_at(0.004, [1.3, 1.65, 0.018]);
+        let mut p = policy();
+        p.panel_tolerance = 0.05;
+        p.geotechnical = true;
+        let r = run(&m, &p);
+        assert_eq!(r.plane_families.len(), 1);
+        for plane in &r.candidate_planes {
+            assert_eq!(plane.normal, [0., 0., 1.], "{:?}", plane.normal);
+        }
     }
 }
