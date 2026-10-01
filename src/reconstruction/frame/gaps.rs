@@ -10,10 +10,10 @@
 use super::super::planes;
 use crate::input::MeshData;
 use glam::{DVec2, DVec3};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Incidence {
     pub node_id: u32,
     /// Plane patch the node is made incident to.
@@ -23,7 +23,7 @@ pub struct Incidence {
     pub distance: f64,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Report {
     pub tolerance: f64,
     pub candidates: usize,

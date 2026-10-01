@@ -119,6 +119,14 @@ struct Args {
     /// (плиты на разных уровнях) не сводятся никогда.
     #[arg(long)]
     v2_keep_gap_offsets: bool,
+
+    /// v2, для разработки: файл кэша решённого каркаса. Если файл есть и
+    /// записан для того же входного файла и тех же параметров каркаса,
+    /// каркас берётся из него (сборка и сетка пересчитываются), иначе
+    /// каркас решается и записывается. После изменения кода каркаса кэш
+    /// нужно удалить.
+    #[arg(long, value_name = "PATH")]
+    v2_frame_cache: Option<String>,
 }
 
 /// Geotechnical simplification tolerances of the v2 pipeline (model units).
@@ -130,6 +138,8 @@ struct V2Tolerances {
     edge_collapse: f64,
     gap_closure: f64,
     gap_offsets: bool,
+    /// Development cache of the solved frame (not a tolerance).
+    frame_cache: Option<String>,
 }
 
 fn run_v2_preview(
@@ -233,15 +243,52 @@ fn run_v2_preview(
     // Relaxation ladder: a frame the default rules cannot satisfy is solved
     // again with panels merged at over-constrained nodes (geotechnical
     // only). The step used is reported.
-    let mut relaxation = 0;
-    let mut result = solve(&frame_policy(false))?;
-    if !result.accepted && !preserve_details {
-        let relaxed = solve(&frame_policy(true))?;
-        if relaxed.accepted {
-            result = relaxed;
-            relaxation = 1;
+    let solve_ladder = || -> Result<(frame::Report, usize), Box<dyn std::error::Error>> {
+        let result = solve(&frame_policy(false))?;
+        if !result.accepted && !preserve_details {
+            let relaxed = solve(&frame_policy(true))?;
+            if relaxed.accepted {
+                return Ok((relaxed, 1));
+            }
         }
-    }
+        Ok((result, 0))
+    };
+    let (result, relaxation) = match &tolerances.frame_cache {
+        None => solve_ladder()?,
+        Some(path) => {
+            // The key covers what the frame depends on besides the code: the
+            // input text, the policies and the gap tolerance.
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::fs::read(input)?.hash(&mut hasher);
+            serde_json::to_string(&frame_policy(false))?.hash(&mut hasher);
+            gap_tolerance.to_bits().hash(&mut hasher);
+            preserve_details.hash(&mut hasher);
+            let key = format!("{:016x}", hasher.finish());
+            let cached = std::fs::read(path).ok().and_then(|bytes| {
+                let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                (value["key"] == key.as_str()).then_some(())?;
+                let frame = serde_json::from_value(value["frame"].clone()).ok()?;
+                Some((frame, value["relaxation"].as_u64()? as usize))
+            });
+            match cached {
+                Some(hit) => {
+                    eprintln!("[V2] каркас взят из кэша {path}");
+                    hit
+                }
+                None => {
+                    let (frame, relaxation) = solve_ladder()?;
+                    let value = serde_json::json!({
+                        "key": key,
+                        "relaxation": relaxation,
+                        "frame": frame,
+                    });
+                    std::fs::write(path, serde_json::to_vec(&value)?)?;
+                    (frame, relaxation)
+                }
+            }
+        }
+    };
     lap("frame");
     let assembly_policy = assembly::Policy {
         closure_tolerance: 0.001,
@@ -333,6 +380,7 @@ fn main() {
         edge_collapse: args.v2_edge_collapse,
         gap_closure: args.v2_gap_closure,
         gap_offsets: !args.v2_keep_gap_offsets,
+        frame_cache: args.v2_frame_cache.clone(),
     };
     let mut config = ReconstructionConfig::default();
     for value in [

@@ -11,7 +11,7 @@ pub struct Policy {
     pub line_tolerance: f64,
     pub numerical_precision: f64,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SourceSpan {
     pub element: u32,
     pub stiffness: u32,

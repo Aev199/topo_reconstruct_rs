@@ -23,7 +23,7 @@ pub enum Error {
     ShortEdge,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct PlaneFrame {
     origin: [f64; 3],
     normal: [f64; 3],

@@ -3,13 +3,13 @@
 use super::{planes, recognize, PlaneFrame};
 use crate::input::MeshData;
 use glam::DVec3;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub mod gaps;
 mod segments;
 mod sliding;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
     pub up: [f64; 3],
     pub angle: f64,
@@ -35,12 +35,12 @@ pub struct Policy {
     /// they move their corners far.
     pub over_constrained_panels: bool,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Anchor {
     pub node: usize,
     pub t: f64,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Axis {
     /// Geometric segment of a chain; shared endpoints do not imply releases.
     pub constructive_segment: bool,
@@ -48,14 +48,14 @@ pub struct Axis {
     pub anchors: Vec<Anchor>,
     pub spans: Vec<recognize::SourceSpan>,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Surface {
     pub plane: PlaneFrame,
     pub nodes: Vec<usize>,
     pub source_elements: Vec<u32>,
     pub stiffness_regions: BTreeMap<u32, Vec<u32>>,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConstraintOrigin {
     AxisAnchor {
@@ -80,18 +80,18 @@ pub enum ConstraintOrigin {
         node_id: u32,
     },
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConstraintFailure {
     pub origin: ConstraintOrigin,
     pub residual: f64,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovementFailure {
     pub node_id: u32,
     pub movement: f64,
     pub budget: f64,
 }
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AxisFailure {
     pub axis: usize,
     pub original_length: f64,
@@ -99,7 +99,7 @@ pub struct AxisFailure {
     pub source_elements: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     /// Experimental nonlinear solve; original Axis::anchors and spans stay immutable.
     pub sliding_parameters: Option<Vec<Vec<f64>>>,
