@@ -198,6 +198,14 @@ fn subdivide(
     }
     Ok(out)
 }
+/// Details of a mesh failure on stderr when TOPO_DIAG is set (the error
+/// itself is a static reason).
+fn diagnostic(message: impl FnOnce() -> String) {
+    if std::env::var_os("TOPO_DIAG").is_some() {
+        eprintln!("[diag] {}", message());
+    }
+}
+
 fn sorted(
     chain: &mut Vec<(f64, usize)>,
     vertices: &[[f64; 3]],
@@ -205,10 +213,16 @@ fn sorted(
 ) -> Result<(), &'static str> {
     chain.sort_by(|a, b| a.0.total_cmp(&b.0));
     chain.dedup_by(|a, b| a.1 == b.1);
-    if chain
+    if let Some(w) = chain
         .windows(2)
-        .any(|w| point(&vertices[w[0].1]).distance(point(&vertices[w[1].1])) <= eps)
+        .find(|w| point(&vertices[w[0].1]).distance(point(&vertices[w[1].1])) <= eps)
     {
+        diagnostic(|| {
+            format!(
+                "coinciding constraint vertices {} {:?} and {} {:?}",
+                w[0].1, vertices[w[0].1], w[1].1, vertices[w[1].1]
+            )
+        });
         return Err("distinct constraint vertices coincide");
     }
     Ok(())
@@ -544,6 +558,12 @@ fn build_impl(
         }
         for &[a, b] in &constraints {
             if !cdt.can_add_constraint(handles[&a], handles[&b]) {
+                diagnostic(|| {
+                    format!(
+                        "surface {s}: constraint {a} {:?} - {b} {:?} crosses another",
+                        vertices[a], vertices[b]
+                    )
+                });
                 return Err("constraint crossing requires explicit shared vertex");
             }
             cdt.add_constraint(handles[&a], handles[&b]);
