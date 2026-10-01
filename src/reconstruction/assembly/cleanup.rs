@@ -1103,9 +1103,9 @@ pub struct TeeReport {
 /// next to a beam): the end moves onto that bar, its own bars staying
 /// straight, and becomes a node of it. Closest first; an end next to a node
 /// of the other bar (within the minimum edge) is left to the end and node
-/// merges, an end that is an interior node of a bar never moves, a bar
-/// running along the other one (a parallel duplicate) is not joined, and the
-/// end must stay on the planes of the surfaces it belongs to.
+/// merges, an end that is an interior node of a bar never moves, a bar is
+/// never joined by both ends (a parallel duplicate would lie on the other
+/// bar), and the end must stay on the planes of the surfaces it belongs to.
 pub fn join_bar_tees(
     model: &mut Model,
     bars: &mut Bars<'_>,
@@ -1205,12 +1205,9 @@ pub fn join_bar_tees(
             continue;
         }
         let [p, q] = bars.axes[k].endpoints.map(|w| point(model, w));
-        // A bar running along the other one (both its ends near its line: a
-        // parallel duplicate a few millimetres off) is not a T junction.
-        let line_distance = |x: DVec3| {
-            let d = q - p;
-            (p + d * ((x - p).dot(d) / d.length_squared())).distance(x)
-        };
+        // A bar whose other end is already a node of the other bar would lie
+        // on it (a parallel duplicate a few millimetres off, both ends
+        // joined): not a T junction.
         let along = bars
             .axes
             .iter()
@@ -1221,7 +1218,7 @@ pub fn join_bar_tees(
                 } else {
                     a.endpoints[0]
                 };
-                line_distance(point(model, other)) <= tolerance
+                bars.axes[k].anchors.iter().any(|x| x.vertex == other)
             });
         if along {
             reject(&mut report, distance, "bar_along_bar");
@@ -1620,10 +1617,10 @@ mod tests {
     }
 
     #[test]
-    fn bar_parallel_to_a_span_is_not_joined() {
+    fn bar_parallel_to_a_span_is_joined_by_one_end_only() {
         for place in Placement::all() {
-            // A 1 m bar 3 mm beside beam A along its span: a parallel
-            // duplicate, not a T junction; it does not move.
+            // A 1 m bar 3 mm beside beam A along its span: one end joins A,
+            // the other stays (both joined, the bar would lie on A).
             let mut m = build(&place, &[slab(0., 4.)]);
             let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
             let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [4., 1., 1.]));
@@ -1643,9 +1640,10 @@ mod tests {
                 &BTreeSet::new(),
                 &source_nodes,
             );
-            assert!(r.joined.is_empty());
-            assert!(r.rejected.iter().all(|x| x.reason == "bar_along_bar"));
-            assert_eq!(axes[0].anchors.len(), 2);
+            assert_eq!(r.joined.len(), 1);
+            assert_eq!(r.rejected.len(), 1);
+            assert_eq!(r.rejected[0].reason, "bar_along_bar");
+            assert_eq!(axes[0].anchors.len(), 3);
         }
     }
 
