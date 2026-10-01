@@ -1146,15 +1146,18 @@ fn solve_impl(
     });
     let valid = valid_parameters
         && candidate.iter().all(|p| p.is_finite())
-        && new_axes.iter().all(|a| {
+        && new_axes.iter().enumerate().all(|(k, a)| {
             let [i, j] = a.endpoints;
             let d = candidate[j] - candidate[i];
+            // A short axis flattened onto its plane keeps its in-plane length.
+            let expected = flattened_lengths
+                .get(&k)
+                .copied()
+                .unwrap_or(reference[j].distance(reference[i]));
             // Acceptance still requires convergence (residual within the
             // tolerance); before it, a change below the residual is numerical.
             d.length() + policy.residual_tolerance.max(residual)
-                >= policy
-                    .minimum_length
-                    .min(reference[j].distance(reference[i]))
+                >= policy.minimum_length.min(expected)
                 && d.dot(reference[j] - reference[i]) > 0.0
                 && (sliding_parameters.is_none()
                     || d.normalize().dot((reference[j] - reference[i]).normalize())
@@ -2473,5 +2476,24 @@ mod tests {
         assert!(r.accepted, "{:?}", r.movement_failures);
         let k = |id: u32| r.node_ids.iter().position(|&n| n == id).unwrap();
         assert!(DVec3::from_array(r.points[k(5)]).distance(m.nodes[&5]) <= 0.01);
+    }
+
+    #[test]
+    fn flattened_short_axis_is_valid_with_its_in_plane_length() {
+        // A 6.3 mm bar between two nodes of one slab, 2 mm across the slab
+        // plane: flattened, it is 0.3 mm shorter, which is not a collapse.
+        let mut m = short_feature(true);
+        m.nodes.insert(4, DVec3::new(0.006, 0., 0.002));
+        let mut p = policy();
+        p.geotechnical = true;
+        let r = run(&m, &p);
+        assert!(r.accepted, "{}: {}", r.reason, r.candidate_max_residual);
+        let [i, j] = r.axes[0].endpoints;
+        let new = DVec3::from_array(r.points[j]) - DVec3::from_array(r.points[i]);
+        assert!(
+            new.length() < 0.0062 && new.length() > 0.0058,
+            "{}",
+            new.length()
+        );
     }
 }
