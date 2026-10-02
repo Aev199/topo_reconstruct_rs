@@ -113,6 +113,35 @@ impl LiraParser {
         })
     }
 
+    /// Численно заданные жёсткости (блок 3/): номер -> значения (EF, EIy,
+    /// EIz, GIk, ...). Жёсткости, заданные типом сечения (S0, GEI, ...),
+    /// пропускаются; файл без блока даёт пустой набор.
+    pub fn parse_stiffness<P: AsRef<Path>>(filepath: P) -> io::Result<HashMap<u32, Vec<f64>>> {
+        let file = File::open(filepath)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self::stiffness_bytes(&mmap))
+    }
+
+    fn stiffness_bytes(content: &[u8]) -> HashMap<u32, Vec<f64>> {
+        let Some(block) = Self::extract_block(content, b"3") else {
+            return HashMap::new();
+        };
+        block
+            .split(|&b| b == b'/')
+            .filter_map(|row| {
+                let mut words = Self::split_ascii_whitespace_bytes(row);
+                let id = std::str::from_utf8(words.next()?)
+                    .ok()?
+                    .parse::<u32>()
+                    .ok()?;
+                let values: Option<Vec<f64>> = words
+                    .map(|w| fast_parse_f64::<f64, _>(w).ok().filter(|v| v.is_finite()))
+                    .collect();
+                values.filter(|v| !v.is_empty()).map(|v| (id, v))
+            })
+            .collect()
+    }
+
     /// Быстрый поиск содержимого блока `( <id>/ ... )` без аллокаций строк
     fn extract_block<'a>(content: &'a [u8], block_id: &[u8]) -> Option<&'a [u8]> {
         let mut i = 0;

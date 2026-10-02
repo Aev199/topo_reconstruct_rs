@@ -179,7 +179,18 @@ fn run_v2_preview(
         }
         clock = Instant::now();
     };
-    let mesh = V2LiraParser::parse(input)?;
+    let mut mesh = V2LiraParser::parse(input)?;
+    // Rigid links of the analysis model (fans spreading a column into a
+    // slab, offsets) are not structures: geotechnical mode leaves them out.
+    let rigid_links = if preserve_details {
+        vec![]
+    } else {
+        let links =
+            topo_reconstruct_rs::input::rigid_links(&mesh, &V2LiraParser::parse_stiffness(input)?);
+        let removed: std::collections::HashSet<u32> = links.iter().copied().collect();
+        mesh.elements.retain(|e| !removed.contains(&e.id));
+        links
+    };
     lap("parse");
     let axes = recognize::recognize(
         &mesh,
@@ -264,6 +275,10 @@ fn run_v2_preview(
             serde_json::to_string(&frame_policy(false))?.hash(&mut hasher);
             gap_tolerance.to_bits().hash(&mut hasher);
             preserve_details.hash(&mut hasher);
+            // Only when links were removed: other caches stay valid.
+            if !rigid_links.is_empty() {
+                rigid_links.hash(&mut hasher);
+            }
             let key = format!("{:016x}", hasher.finish());
             let cached = std::fs::read(path).ok().and_then(|bytes| {
                 let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
@@ -349,6 +364,7 @@ fn run_v2_preview(
         "axis_recognition": axes,
         "plane_recognition": plane_report,
         "relaxation": { "frame": relaxation },
+        "rigid_links": { "removed": rigid_links.len(), "elements": rigid_links },
     });
     if include_mesh {
         report["mesh"] = serde_json::to_value(mesh_report)?;
