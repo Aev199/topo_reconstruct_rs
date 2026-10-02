@@ -198,11 +198,12 @@ fn subdivide(
     }
     Ok(out)
 }
-/// Points within this many precisions are one point: bar interval ends and
-/// bar nodes, a bar node and its axis (separately computed intersections
-/// of one bar with a surface edge and with another bar differ by floating
-/// error).
-pub const ENDPOINT_SLACK: f64 = 10.;
+/// Points within this many precisions are one point (10 um at the default
+/// 1e-7 m): bar interval ends and bar nodes, a bar node and its axis
+/// (separately computed intersections of one bar with a surface edge and
+/// with another bar differ by floating error; frame and gap closures leave
+/// micrometre residuals).
+pub const ENDPOINT_SLACK: f64 = 100.;
 
 /// Details of a mesh failure on stderr when TOPO_DIAG is set (the error
 /// itself is a static reason).

@@ -361,6 +361,31 @@ pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprin
                     continue;
                 };
                 let v = axes[k].anchors[n].vertex;
+                // Within the point slack of the other axis already: shared
+                // as it is.
+                let [o0, o1] = ends(axes, other);
+                let q = DVec3::from_array(model.vertices[v]);
+                let at = (q - o0).dot(o1 - o0) / (o1 - o0).length_squared();
+                let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * precision;
+                if at > 0. && at < 1. && (o0 + (o1 - o0) * at).distance(q) <= slack {
+                    let source_node = axes[k].anchors[n].source_node;
+                    axes[other].anchors.push(Anchor {
+                        source_node,
+                        vertex: v,
+                        t: at,
+                    });
+                    axes[other].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+                    out.push(Imprint {
+                        axis: other,
+                        vertex: v,
+                        source_node,
+                        t: at,
+                        kind: "shared_node".into(),
+                        surface: None,
+                        movement: 0.,
+                    });
+                    continue;
+                }
                 let movement = DVec3::from_array(model.vertices[v]).distance(p);
                 if movement > minimum || !slides_with_ends(model, axes, k, v, p, minimum) {
                     continue;
@@ -498,7 +523,9 @@ pub fn imprint_surface_vertices(
         .flat_map(|e| model.edges[e])
         .filter(|&v| v < source_nodes.len())
         .collect();
-    let bar_nodes: BTreeSet<usize> = axes
+    // Vertices imprinted here become bar nodes too: a later bar never moves
+    // them off the first one.
+    let mut bar_nodes: BTreeSet<usize> = axes
         .iter()
         .flat_map(|a| a.anchors.iter().map(|x| x.vertex))
         .collect();
@@ -560,9 +587,12 @@ pub fn imprint_surface_vertices(
             }
             let q = a + d * t;
             let movement = DVec3::from_array(model.vertices[v]).distance(q);
-            if movement > precision && model.move_vertex(v, q.to_array()).is_err() {
+            if movement > precision
+                && (bar_nodes.contains(&v) || model.move_vertex(v, q.to_array()).is_err())
+            {
                 continue;
             }
+            bar_nodes.insert(v);
             axes[i].anchors.push(Anchor {
                 source_node: source_nodes[v],
                 vertex: v,
@@ -1506,6 +1536,46 @@ mod tests {
     }
 
     #[test]
+    fn bar_end_within_the_point_slack_of_a_crossing_bar_is_shared() {
+        use super::super::junctions::tests::Placement;
+        for place in Placement::all() {
+            // Bar B starts 5 um short of bar A (y = 1) and crosses it at once:
+            // its end becomes a node of A where it is (within the 10 um point
+            // slack); nothing moves.
+            let mut m = Model::new(1e-7 * place.scale, 0.001 * place.scale).unwrap();
+            let mut bar = |p: [f64; 3], q: [f64; 3], source_axis: usize| {
+                let [a, b] = [p, q].map(|x| m.add_vertex(place.point(x)).unwrap());
+                Axis {
+                    source_axis,
+                    endpoints: [a, b],
+                    anchors: [(a, 0.), (b, 1.)]
+                        .map(|(vertex, t)| Anchor {
+                            source_node: vertex as u32,
+                            vertex,
+                            t,
+                        })
+                        .to_vec(),
+                    spans: vec![],
+                }
+            };
+            let mut axes = vec![
+                bar([0., 1., 0.], [4., 1., 0.], 0),
+                bar([2., 1. - 5e-6, 0.], [2., 3., 0.], 1),
+            ];
+            let end = axes[1].endpoints[0];
+            let before = m.vertices.clone();
+            let r = imprint_bar_crossings(&mut m, &mut axes);
+            let kinds: Vec<_> = r.iter().map(|c| (c.axis, c.kind.as_str())).collect();
+            assert_eq!(kinds, vec![(0, "shared_node")]);
+            assert_eq!(m.vertices, before);
+            assert!(axes[0]
+                .anchors
+                .iter()
+                .any(|x| x.vertex == end && (x.t - 0.5).abs() < 1e-9));
+        }
+    }
+
+    #[test]
     fn crossings_next_to_each_other_are_both_shared() {
         use super::super::junctions::tests::Placement;
         for place in Placement::all() {
@@ -1610,6 +1680,46 @@ mod tests {
             let spans: Vec<_> = axes[0].spans.iter().map(|s| (s.start_t, s.end_t)).collect();
             assert_eq!(spans, vec![(0., t), (t, 1.)]);
             assert_eq!(axes[2].endpoints[0], corner);
+        }
+    }
+
+    #[test]
+    fn corner_imprinted_on_one_bar_is_not_moved_off_it_by_another() {
+        use super::super::junctions::tests::{build, slab, Placement};
+        for place in Placement::all() {
+            // Bar A along y = 4.0003 takes the slab corner (4, 4), moved
+            // 0.3 mm onto it; diagonal bar B passes 0.28 mm from it then
+            // and would move it off A: it does not.
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let mut v = |p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            let ends = [
+                [v([2., 4.0003, 0.]), v([6., 4.0003, 0.])],
+                [v([2.0004, 2.0003, 0.]), v([6.0004, 6.0003, 0.])],
+            ];
+            let mut axes: Vec<Axis> = ends
+                .iter()
+                .enumerate()
+                .map(|(i, &[a, b])| Axis {
+                    source_axis: i,
+                    endpoints: [a, b],
+                    anchors: [(a, 0.), (b, 1.)]
+                        .map(|(vertex, t)| Anchor {
+                            source_node: vertex as u32,
+                            vertex,
+                            t,
+                        })
+                        .to_vec(),
+                    spans: vec![],
+                })
+                .collect();
+            let source_nodes: Vec<u32> = (0..m.vertices.len() as u32).collect();
+            let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes);
+            let corner = r.iter().find(|c| c.axis == 0).unwrap().vertex;
+            assert!(r.iter().all(|c| c.axis == 0 || c.vertex != corner), "{r:?}");
+            let p = DVec3::from_array(m.vertices[corner]);
+            assert!(
+                p.distance(DVec3::from_array(place.point([4., 4.0003, 0.]))) < 1e-9 * place.scale
+            );
         }
     }
 
