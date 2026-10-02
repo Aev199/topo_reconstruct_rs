@@ -146,6 +146,21 @@ def check_mesh(mesh, model, bars):
     }
 
 
+def collapsed_bars(topology):
+    """Collapsed bar pieces: short ones, and pieces between a bar end and the
+    bar node it merged into (a tee onto a node)."""
+    return (topology.get("short_bars", {}).get("collapsed", [])
+            + (topology.get("bar_tees") or {}).get("collapsed", []))
+
+
+def collapse_limit(topology, c):
+    """Movement limit of a collapse: the short bar tolerance, or for a tee the
+    tee tolerance beside the bar and the minimum edge along it."""
+    if c in (topology.get("bar_tees") or {}).get("collapsed", []):
+        return topology["bar_tees"]["tolerance"] + topology["policy"]["minimum_edge"]
+    return topology["short_bars"]["tolerance"]
+
+
 def check(data, baseline=None):
     frame, topology = data["frame"], data["topology"]
     model, bars = topology["preview"], topology["axis_assembly"]
@@ -160,7 +175,7 @@ def check(data, baseline=None):
     lookup = {n: i for i, n in enumerate(frame["node_ids"])}
     budget = {n: frame["policy"]["maximum_movement"] for n in source_nodes}
     # A bar collapsed as too short no longer bounds the movement of its nodes.
-    removed_axes = {c["source_axis"] for c in topology.get("short_bars", {}).get("collapsed", [])
+    removed_axes = {c["source_axis"] for c in collapsed_bars(topology)
                     if c["removed"]}
     # So does a bar represented by another one (a duplicate).
     removed_axes |= {d["source_axis"] for d in topology.get("short_bars", {}).get("duplicates", [])}
@@ -185,12 +200,12 @@ def check(data, baseline=None):
     # (within the collapse tolerance: a beam node onto a wall 50 mm away
     # when the 50 mm bar joining them collapses).
     short_bars = topology.get("short_bars", {})
-    for c in short_bars.get("collapsed", []):
+    for c in collapsed_bars(topology):
         if c["dropped_source_node"] in budget:
             budget[c["dropped_source_node"]] = frame["policy"]["maximum_movement"]
-    for c in short_bars.get("collapsed", []):
+    for c in collapsed_bars(topology):
         movement = c.get("kept_movement", 0.)
-        assert 0. <= movement <= short_bars["tolerance"] + epsilon
+        assert 0. <= movement <= collapse_limit(topology, c) + epsilon
         if c["kept_source_node"] in budget:
             budget[c["kept_source_node"]] += movement
     # A node moved by a recorded geotechnical closure (a gap closed onto a
@@ -223,7 +238,7 @@ def check(data, baseline=None):
     for axis in bars["axes"]:
         for v in axis["endpoints"]:
             ends.setdefault(v, []).append(axis)
-    merges = [(c["kept"], short_bars["tolerance"]) for c in short_bars.get("collapsed", [])]
+    merges = [(c["kept"], collapse_limit(topology, c)) for c in collapsed_bars(topology)]
     for key in ("bar_ends", "wall_ends", "short_edge_merges", "coincident_vertices", "bar_anchors"):
         report = topology.get(key) or {}
         merges += [(m["kept"], report["tolerance"]) for m in report.get("merged", [])]
@@ -307,7 +322,7 @@ def check(data, baseline=None):
         if j.get("merged_into_source_node") is not None:
             merged[j["source_node"]] = j["merged_into_source_node"]
     # Collapsed short bars: their nodes merge and their elements are reported.
-    for c in topology.get("short_bars", {}).get("collapsed", []):
+    for c in collapsed_bars(topology):
         if c["dropped_source_node"] is not None and c["kept_source_node"] is not None:
             merged[c["dropped_source_node"]] = c["kept_source_node"]
 
@@ -321,7 +336,7 @@ def check(data, baseline=None):
     expected_bars = [s["element"] for a in frame["axes"] for s in a["spans"]]
     actual_bars = [s["element"] for a in bars["axes"] for s in a["spans"]]
     actual_bars += [e for i in bars["issues"] for e in i["source_elements"]]
-    actual_bars += [e for c in topology.get("short_bars", {}).get("collapsed", [])
+    actual_bars += [e for c in collapsed_bars(topology)
                     for e in c["elements"]]
     # A bar through exactly the vertices of a kept bar with the same
     # stiffness sequence is represented once; its elements are reported.
@@ -329,7 +344,7 @@ def check(data, baseline=None):
     actual_bars += [e for d in duplicates for e in d["elements"]]
     assert collections.Counter(expected_bars) == collections.Counter(actual_bars)
     assert len(actual_bars) == len(set(actual_bars))
-    collapsed = topology.get("short_bars", {}).get("collapsed", [])
+    collapsed = collapsed_bars(topology)
     collapsed_elements = {e for c in collapsed for e in c["elements"]}
     represented = [a["source_axis"] for a in bars["axes"]] + [i["source_axis"] for i in bars["issues"]]
     represented += [c["source_axis"] for c in collapsed if c["removed"]]

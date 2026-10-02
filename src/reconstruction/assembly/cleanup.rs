@@ -778,7 +778,7 @@ pub fn collapse_short_bars(
                 }
             }
         }
-        let Some((d, i, u, v)) = best else {
+        let Some((d, _, u, v)) = best else {
             return report;
         };
         tried.insert((u.min(v), u.max(v)));
@@ -796,77 +796,8 @@ pub fn collapse_short_bars(
             } else {
                 (u, v)
             };
-        // Every bar with this piece between consecutive anchors loses it
-        // (duplicate pieces of coincident bars collapse together).
-        let consecutive = |axis: &Axis| {
-            let mut anchors = axis.anchors.clone();
-            anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
-            anchors.windows(2).any(|w| {
-                let pair = (w[0].vertex, w[1].vertex);
-                pair == (drop, keep) || pair == (keep, drop)
-            })
-        };
-        let affected: Vec<usize> = (0..bars.axes.len())
-            .filter(|&k| k == i || consecutive(&bars.axes[k]))
-            .collect();
-        let mut collapsed = vec![];
-        let mut axes = vec![];
-        let mut index = vec![None; bars.axes.len()];
-        for (k, axis) in bars.axes.iter().enumerate() {
-            if !affected.contains(&k) {
-                index[k] = Some(axes.len());
-                axes.push(axis.clone());
-                continue;
-            }
-            let (shortened, elements) = shorten(axis, drop, keep);
-            collapsed.push((k, axis.source_axis, shortened.is_none(), elements));
-            if let Some(axis) = shortened {
-                index[k] = Some(axes.len());
-                axes.push(axis);
-            }
-        }
-        let mut contacts: Vec<Contact> = bars
-            .contacts
-            .iter()
-            .filter_map(|c| {
-                let mut c = c.clone();
-                let (Contact::Point { axis, .. } | Contact::Interval { axis, .. }) = &mut c;
-                *axis = index[*axis]?;
-                Some(c)
-            })
-            .collect();
-        let mut trial = model.clone();
-        let result = merge(
-            &mut trial,
-            &mut Bars {
-                axes: &mut axes,
-                contacts: &mut contacts,
-            },
-            drop,
-            keep,
-            tolerance,
-            fixed,
-        );
-        match result {
-            Ok(movement) => {
-                *model = trial;
-                *bars.axes = axes;
-                *bars.contacts = contacts;
-                for (axis, source_axis, removed, elements) in collapsed {
-                    report.collapsed.push(CollapsedBar {
-                        axis,
-                        source_axis,
-                        removed,
-                        dropped: drop,
-                        kept: keep,
-                        dropped_source_node: source_nodes.get(drop).copied(),
-                        kept_source_node: source_nodes.get(keep).copied(),
-                        length: d,
-                        kept_movement: movement,
-                        elements,
-                    });
-                }
-            }
+        match collapse_piece(model, bars, drop, keep, d, tolerance, fixed, source_nodes) {
+            Ok(collapsed) => report.collapsed.extend(collapsed),
             Err(reason) => report.rejected.push(RejectedMerge {
                 vertices: [drop, keep],
                 source_nodes: [
@@ -878,6 +809,90 @@ pub fn collapse_short_bars(
             }),
         }
     }
+}
+
+/// Collapse the piece `drop`-`keep` of every bar having it between
+/// consecutive anchors (duplicate pieces of coincident bars collapse
+/// together): `drop` merges into `keep` within `limit`, a bar left without
+/// length is removed. Nothing changes on failure.
+#[allow(clippy::too_many_arguments)]
+fn collapse_piece(
+    model: &mut Model,
+    bars: &mut Bars<'_>,
+    drop: usize,
+    keep: usize,
+    length: f64,
+    limit: f64,
+    fixed: &BTreeSet<usize>,
+    source_nodes: &[u32],
+) -> Result<Vec<CollapsedBar>, String> {
+    let consecutive = |axis: &Axis| {
+        let mut anchors = axis.anchors.clone();
+        anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+        anchors.windows(2).any(|w| {
+            let pair = (w[0].vertex, w[1].vertex);
+            pair == (drop, keep) || pair == (keep, drop)
+        })
+    };
+    let affected: Vec<usize> = (0..bars.axes.len())
+        .filter(|&k| consecutive(&bars.axes[k]))
+        .collect();
+    let mut collapsed = vec![];
+    let mut axes = vec![];
+    let mut index = vec![None; bars.axes.len()];
+    for (k, axis) in bars.axes.iter().enumerate() {
+        if !affected.contains(&k) {
+            index[k] = Some(axes.len());
+            axes.push(axis.clone());
+            continue;
+        }
+        let (shortened, elements) = shorten(axis, drop, keep);
+        collapsed.push((k, axis.source_axis, shortened.is_none(), elements));
+        if let Some(axis) = shortened {
+            index[k] = Some(axes.len());
+            axes.push(axis);
+        }
+    }
+    let mut contacts: Vec<Contact> = bars
+        .contacts
+        .iter()
+        .filter_map(|c| {
+            let mut c = c.clone();
+            let (Contact::Point { axis, .. } | Contact::Interval { axis, .. }) = &mut c;
+            *axis = index[*axis]?;
+            Some(c)
+        })
+        .collect();
+    let mut trial = model.clone();
+    let movement = merge(
+        &mut trial,
+        &mut Bars {
+            axes: &mut axes,
+            contacts: &mut contacts,
+        },
+        drop,
+        keep,
+        limit,
+        fixed,
+    )?;
+    *model = trial;
+    *bars.axes = axes;
+    *bars.contacts = contacts;
+    Ok(collapsed
+        .into_iter()
+        .map(|(axis, source_axis, removed, elements)| CollapsedBar {
+            axis,
+            source_axis,
+            removed,
+            dropped: drop,
+            kept: keep,
+            dropped_source_node: source_nodes.get(drop).copied(),
+            kept_source_node: source_nodes.get(keep).copied(),
+            length,
+            kept_movement: movement,
+            elements,
+        })
+        .collect())
 }
 
 /// Merge the free end of a junction line (a wall end inside a surface) into
@@ -1197,6 +1212,8 @@ pub struct TeeReport {
     pub tolerance: f64,
     pub joined: Vec<BarTee>,
     pub rejected: Vec<RejectedTee>,
+    /// Bar pieces between an end and the bar node it merged into.
+    pub collapsed: Vec<CollapsedBar>,
     /// Nodes exchanged between bars lying on each other afterwards.
     pub shared_nodes: usize,
 }
@@ -1204,10 +1221,11 @@ pub struct TeeReport {
 /// Join a bar end lying within `tolerance` of the span of another bar (beams
 /// meeting a beam a few millimetres off it; a node where several beams meet
 /// next to a beam): the end moves onto that bar, its own bars staying
-/// straight, and becomes a node of it. Closest first; an end next to a node
-/// of the other bar (within the minimum edge) is left to the end and node
-/// merges, an end that is an interior node of a bar never moves, and the
-/// end must stay on the planes of the surfaces it belongs to. A bar joined
+/// straight, and becomes a node of it. Closest first; an end projecting
+/// within the minimum edge of a node of the other bar merges into that node
+/// (a bar piece joining them collapses, its elements reported), an end that
+/// is an interior node of a bar never moves, and the end must stay on the
+/// planes of the surfaces it belongs to. A bar joined
 /// by both ends lies on the other one (a beam modelled twice a few
 /// millimetres apart): `share_overlapping_bars` gives both the same nodes.
 pub fn join_bar_tees(
@@ -1273,12 +1291,15 @@ pub fn join_bar_tees(
             }
         }
         if let Some((distance, k, _)) = best {
-            candidates.push((distance, v, k));
+            candidates.push((distance, v, bars.axes[k].source_axis));
         }
     }
     candidates.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)).then(x.2.cmp(&y.2)));
-    for (_, v, k) in candidates {
-        let source_axis = bars.axes[k].source_axis;
+    // Bars are found by source axis: a collapse removes bars.
+    for (_, v, source_axis) in candidates {
+        let Some(k) = bars.axes.iter().position(|a| a.source_axis == source_axis) else {
+            continue;
+        };
         let reject = |report: &mut TeeReport, distance: f64, reason: &str| {
             report.rejected.push(RejectedTee {
                 vertex: v,
@@ -1318,9 +1339,25 @@ pub fn join_bar_tees(
                 .t;
             let from = point(model, v);
             // Beside the bar within the tolerance and along it within the
-            // minimum edge of the node.
-            match merge(model, bars, v, w, tolerance + minimum, fixed) {
-                Ok(_) => report.joined.push(BarTee {
+            // minimum edge of the node. A bar piece joining the end to the
+            // node collapses (both are one junction now).
+            let joined = bars.axes.iter().any(|a| {
+                let mut anchors: Vec<_> = a.anchors.iter().map(|x| (x.t, x.vertex)).collect();
+                anchors.sort_by(|x, y| x.0.total_cmp(&y.0));
+                anchors
+                    .windows(2)
+                    .any(|p| p[0].1 == v && p[1].1 == w || p[0].1 == w && p[1].1 == v)
+            });
+            let limit = tolerance + minimum;
+            let result = if joined {
+                let length = from.distance(point(model, w));
+                collapse_piece(model, bars, v, w, length, limit, fixed, source_nodes)
+                    .map(|collapsed| report.collapsed.extend(collapsed))
+            } else {
+                merge(model, bars, v, w, limit, fixed).map(|_| ())
+            };
+            match result {
+                Ok(()) => report.joined.push(BarTee {
                     vertex: v,
                     source_node: source_nodes[v],
                     source_axis,
@@ -1837,6 +1874,48 @@ mod tests {
             assert_eq!(r.joined[0].merged_into, Some(a));
             assert_eq!((axes[1].endpoints[0], axes[2].endpoints[0]), (a, a));
             assert_eq!(axes[0].anchors.len(), 3);
+        }
+    }
+
+    #[test]
+    fn bar_joining_an_end_to_the_bar_node_it_merges_into_collapses() {
+        for place in Placement::all() {
+            // A hub of beams B and C 49 mm beside node `a` of beam A (within
+            // the 1 mm minimum edge along it), joined to `a` by bar D: the
+            // hub merges into `a`, D collapses and its element is reported.
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [4., 1., 1.]));
+            let a = v(&mut m, [2., 1., 1.]);
+            let hub = v(&mut m, [2.0005, 1.049, 1.]);
+            let (b1, c1) = (v(&mut m, [2., 3., 1.]), v(&mut m, [3., 3., 1.]));
+            let mut axes = vec![
+                spanned([a0, a1], &[(a0, 0.), (a, 0.5), (a1, 1.)], 10),
+                spanned([hub, b1], &[(hub, 0.), (b1, 1.)], 20),
+                spanned([hub, c1], &[(hub, 0.), (c1, 1.)], 30),
+                spanned([hub, a], &[(hub, 0.), (a, 1.)], 40),
+            ];
+            for (i, axis) in axes.iter_mut().enumerate() {
+                axis.source_axis = i;
+            }
+            let source_nodes: Vec<u32> = (0..m.vertices.len() as u32).collect();
+            let r = join_bar_tees(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut vec![],
+                },
+                0.05 * place.scale,
+                &BTreeSet::new(),
+                &source_nodes,
+            );
+            assert_eq!(r.joined.len(), 1, "{:?}", r.rejected);
+            assert_eq!(r.joined[0].merged_into, Some(a));
+            assert_eq!(r.collapsed.len(), 1);
+            assert!(r.collapsed[0].removed);
+            assert_eq!(r.collapsed[0].source_axis, 3);
+            assert_eq!(axes.len(), 3);
+            assert!(axes[1..].iter().all(|x| x.endpoints[0] == a));
         }
     }
 

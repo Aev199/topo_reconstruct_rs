@@ -85,8 +85,9 @@ pub struct Imprint {
     pub t: f64,
     /// `surface_vertex` (a surface vertex on the axis), `crossing` (the
     /// bar passes through the surface), `slid_anchor` (a bar node slid
-    /// along its bar onto the crossing next to it) or `bar_crossing` (a
-    /// vertex shared with a crossing bar).
+    /// along its bar onto the crossing next to it), `bar_crossing` (a
+    /// vertex shared with a crossing bar) or `shared_node` (a node of a
+    /// crossing bar slid onto the crossing).
     pub kind: String,
     pub surface: Option<usize>,
     /// Movement of the vertex (onto the axis, or along it).
@@ -232,9 +233,9 @@ pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
 /// Two bars crossing at a point away from their nodes (beams lying in one
 /// slab, one passing through the span of another) share a generated vertex
 /// there: it becomes an anchor of both (and of a third bar through the
-/// same point). Crossings within the minimum edge of another node of either
-/// bar are left alone, as are bars already sharing a node and parallel
-/// bars.
+/// same point). A node of one bar within the minimum edge of the crossing
+/// slides onto it when it may (see `slides_with_ends`) and is shared; other crossings next to nodes are left alone, as are bars
+/// already sharing a node and parallel bars.
 pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
     let precision = model.precision;
     let minimum = model.minimum_edge;
@@ -337,6 +338,61 @@ pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprin
             }
             (Some(Some(v)), None) => (v, vec![(j, t)]),
             (None, Some(Some(v))) => (v, vec![(i, s)]),
+            // A node of one bar next to the crossing (a slab corner where a
+            // beam leaves the slab, micrometres off a crossing beam) slides
+            // along its bar onto the crossing, keeping its planes, and is
+            // shared: the bars meet at one vertex instead of a near touch.
+            (Some(None), None) | (None, Some(None)) => {
+                let (k, u, other, w) = if near(i, s).is_some() {
+                    (i, s, j, t)
+                } else {
+                    (j, t, i, s)
+                };
+                let Some(n) = axes[k]
+                    .anchors
+                    .iter()
+                    .position(|x| (x.t - u).abs() * lengths[k] < minimum)
+                else {
+                    continue;
+                };
+                let v = axes[k].anchors[n].vertex;
+                let movement = DVec3::from_array(model.vertices[v]).distance(p);
+                if movement > minimum || !slides_with_ends(model, axes, k, v, p, minimum) {
+                    continue;
+                }
+                // Element spans bounded by the node follow it.
+                let old = axes[k].anchors[n].t;
+                for span in &mut axes[k].spans {
+                    for x in [&mut span.start_t, &mut span.end_t] {
+                        if *x == old {
+                            *x = u;
+                        }
+                    }
+                }
+                axes[k].anchors[n].t = u;
+                let source_node = axes[k].anchors[n].source_node;
+                axes[other].anchors.push(Anchor {
+                    source_node,
+                    vertex: v,
+                    t: w,
+                });
+                axes[other].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+                for (axis, t, kind, movement) in [
+                    (k, u, "slid_anchor", movement),
+                    (other, w, "shared_node", 0.),
+                ] {
+                    out.push(Imprint {
+                        axis,
+                        vertex: v,
+                        source_node,
+                        t,
+                        kind: kind.into(),
+                        surface: None,
+                        movement,
+                    });
+                }
+                continue;
+            }
             _ => continue,
         };
         for (k, u) in bars {
@@ -364,8 +420,6 @@ pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprin
 /// node of no other axis and no surface contour, and only when every plane
 /// whose material holds it (the slab a beam lies in) holds `p` too.
 fn slides_onto(model: &mut Model, axes: &[Axis], i: usize, v: usize, p: DVec3) -> bool {
-    let precision = model.precision;
-    let q = DVec3::from_array(model.vertices[v]);
     if axes[i].endpoints.contains(&v)
         || axes.iter().enumerate().any(|(j, a)| {
             j != i && (a.endpoints.contains(&v) || a.anchors.iter().any(|x| x.vertex == v))
@@ -375,13 +429,48 @@ fn slides_onto(model: &mut Model, axes: &[Axis], i: usize, v: usize, p: DVec3) -
     {
         return false;
     }
-    let keeps_planes = model.surfaces.iter().all(|surface| {
+    keeps_planes(model, v, p) && model.move_vertex(v, p.to_array()).is_ok()
+}
+
+/// Every plane whose material holds vertex `v` holds `p` too.
+fn keeps_planes(model: &Model, v: usize, p: DVec3) -> bool {
+    let precision = model.precision;
+    let q = DVec3::from_array(model.vertices[v]);
+    model.surfaces.iter().all(|surface| {
         let plane = &model.planes[surface.plane];
         plane.distance(q.to_array()).abs() > precision
             || location(plane.project(q.to_array()), &surface.contours, precision).is_none()
             || plane.distance(p.to_array()).abs() <= precision
-    });
-    keeps_planes && model.move_vertex(v, p.to_array()).is_ok()
+    })
+}
+
+/// Move the interior node `v` of axis `k` along it to `p` (within `limit`),
+/// keeping its planes: a contour vertex may move, and bars ending at `v`
+/// follow it as ends (see `move_with_axes`); `v` must be an interior node
+/// of no other bar. Nothing changes on failure.
+fn slides_with_ends(
+    model: &mut Model,
+    axes: &[Axis],
+    k: usize,
+    v: usize,
+    p: DVec3,
+    limit: f64,
+) -> bool {
+    let interior = |a: &Axis| !a.endpoints.contains(&v) && a.anchors.iter().any(|x| x.vertex == v);
+    if !interior(&axes[k])
+        || axes.iter().enumerate().any(|(j, a)| j != k && interior(a))
+        || !keeps_planes(model, v, p)
+    {
+        return false;
+    }
+    let mut others = axes.to_vec();
+    others[k].anchors.retain(|x| x.vertex != v);
+    let mut trial = model.clone();
+    if super::cleanup::move_with_axes(&mut trial, &others, v, p, limit).is_err() {
+        return false;
+    }
+    *model = trial;
+    true
 }
 
 /// A surface vertex lying on a bar axis inside its span (a bar running
@@ -1376,6 +1465,79 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn node_next_to_a_bar_crossing_slides_onto_it_and_is_shared() {
+        use super::super::junctions::tests::{build, slab, Placement};
+        for place in Placement::all() {
+            // Bar A along y = 4 has a node at the slab corner (4, 4, 0); bar
+            // B along x = 4.0004 crosses A 0.4 mm from it (beyond the point
+            // slack, within the minimum edge). The corner slides along A onto
+            // the crossing, staying in the slab plane, and becomes a node of
+            // B; A's element spans follow it, and bar C ending at the corner
+            // follows it with its end.
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let at = |m: &Model, p: [f64; 3]| {
+                (0..m.vertices.len()).find(|&v| {
+                    DVec3::from_array(m.vertices[v]).distance(DVec3::from_array(place.point(p)))
+                        < 1e-9 * place.scale
+                })
+            };
+            let corner = at(&m, [4., 4., 0.]).unwrap();
+            let mut v = |p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            let (a0, a1) = (v([2., 4., 0.]), v([6., 4., 0.]));
+            let (b0, b1) = (v([4.0004, 3., 0.]), v([4.0004, 5., 0.]));
+            let c1 = v([5., 6., 0.]);
+            let anchor = |vertex: usize, t: f64| Anchor {
+                source_node: vertex as u32,
+                vertex,
+                t,
+            };
+            let span = |start_t: f64, end_t: f64, element: u32| SourceSpan {
+                element,
+                stiffness: 0,
+                start_t,
+                end_t,
+            };
+            let mut axes = vec![
+                Axis {
+                    source_axis: 0,
+                    endpoints: [a0, a1],
+                    anchors: vec![anchor(a0, 0.), anchor(corner, 0.5), anchor(a1, 1.)],
+                    spans: vec![span(0., 0.5, 1), span(0.5, 1., 2)],
+                },
+                Axis {
+                    source_axis: 1,
+                    endpoints: [b0, b1],
+                    anchors: vec![anchor(b0, 0.), anchor(b1, 1.)],
+                    spans: vec![span(0., 1., 3)],
+                },
+                Axis {
+                    source_axis: 2,
+                    endpoints: [corner, c1],
+                    anchors: vec![anchor(corner, 0.), anchor(c1, 1.)],
+                    spans: vec![span(0., 1., 4)],
+                },
+            ];
+            let r = imprint_bar_crossings(&mut m, &mut axes);
+            let kinds: Vec<_> = r.iter().map(|c| (c.axis, c.kind.as_str())).collect();
+            assert_eq!(kinds, vec![(0, "slid_anchor"), (1, "shared_node")]);
+            assert!((r[0].movement - 0.0004 * place.scale).abs() < 1e-9 * place.scale);
+            let p = DVec3::from_array(m.vertices[corner]);
+            assert!(
+                p.distance(DVec3::from_array(place.point([4.0004, 4., 0.]))) < 1e-9 * place.scale
+            );
+            assert!(axes[1]
+                .anchors
+                .iter()
+                .any(|x| x.vertex == corner && (x.t - 0.5).abs() < 1e-9));
+            let t = axes[0].anchors[1].t;
+            assert!((t - 2.0004 / 4.).abs() < 1e-9);
+            let spans: Vec<_> = axes[0].spans.iter().map(|s| (s.start_t, s.end_t)).collect();
+            assert_eq!(spans, vec![(0., t), (t, 1.)]);
+            assert_eq!(axes[2].endpoints[0], corner);
         }
     }
 
