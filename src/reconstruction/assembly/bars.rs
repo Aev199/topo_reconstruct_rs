@@ -620,12 +620,17 @@ fn allowed_turn(angle: f64, budgets: f64, length: f64) -> f64 {
     angle.max((budgets / length).min(1.).asin())
 }
 
-/// Clip a coplanar axis to the material, including holes and nonconvex outlines.
+/// Clip a coplanar axis to the material, including holes and nonconvex
+/// outlines. A crossing of a contour edge within `snap` of a contour vertex
+/// on the axis (or of an axis end) is no cut of its own: the interval ends
+/// at the vertex (an edge leaving a bar node at a shallow angle crosses the
+/// axis micrometres from it).
 fn intervals(
     a: [f64; 2],
     b: [f64; 2],
     contours: &[Vec<[f64; 2]>],
     precision: f64,
+    snap: f64,
 ) -> Vec<(f64, f64, Location)> {
     let a = DVec2::from_array(a);
     let b = DVec2::from_array(b);
@@ -638,6 +643,7 @@ fn intervals(
     let parameter =
         |x: geo::Coord<f64>| ((DVec2::new(x.x, x.y) - a).dot(d) / d.length_squared()).clamp(0., 1.);
     let mut cuts = vec![0., 1.];
+    let mut crossings = vec![];
     for ring in contours {
         for i in 0..ring.len() {
             let p = ring[i];
@@ -652,16 +658,22 @@ fn intervals(
             let q = ring[(i + 1) % ring.len()];
             match line_intersection(line, Line::new((p[0], p[1]), (q[0], q[1]))) {
                 Some(LineIntersection::SinglePoint { intersection, .. }) => {
-                    cuts.push(parameter(intersection))
+                    crossings.push(parameter(intersection))
                 }
                 Some(LineIntersection::Collinear { intersection }) => {
-                    cuts.push(parameter(intersection.start));
-                    cuts.push(parameter(intersection.end));
+                    crossings.push(parameter(intersection.start));
+                    crossings.push(parameter(intersection.end));
                 }
                 None => {}
             }
         }
     }
+    let vertices = cuts.clone();
+    cuts.extend(
+        crossings
+            .into_iter()
+            .filter(|t| vertices.iter().all(|u| (t - u).abs() * length > snap)),
+    );
     cuts.sort_by(f64::total_cmp);
     cuts.dedup_by(|a, b| (*a - *b).abs() * length <= precision);
     let mut result: Vec<(f64, f64, Location)> = vec![];
@@ -1131,6 +1143,7 @@ pub(super) fn assemble(
                     plane.project(b),
                     &surface.contours,
                     policy.precision,
+                    policy.minimum_edge,
                 ) {
                     report.contacts.push(Contact::Interval {
                         axis: output_axis,
@@ -1279,6 +1292,7 @@ pub fn refresh_contacts(model: &Model, axes: &[Axis], contacts: &mut Vec<Contact
                 plane.project(b),
                 &surface.contours,
                 precision,
+                model.minimum_edge,
             ) {
                 result.push(Contact::Interval {
                     axis: i,
@@ -1311,6 +1325,24 @@ mod tests {
         assert!((turn - 0.1f64.asin()).abs() < 1e-12 && turn > 2.3f64.to_radians());
         // Budgets beyond the length never exceed a right angle.
         assert_eq!(allowed_turn(angle, 1., 0.1), std::f64::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    fn edge_crossing_next_to_a_contour_vertex_on_the_axis_is_no_cut() {
+        // The contour vertex (0, 0) lies on the axis y = 0 and the edge
+        // x = -30 um crosses it 30 um away: within the 1 mm snap the
+        // interval starts at the vertex; without it, at the crossing.
+        let contour = vec![vec![
+            [0., 0.],
+            [2., -1.],
+            [4., 0.],
+            [4., 2.],
+            [-3e-5, 2.],
+            [-3e-5, -0.5],
+        ]];
+        let start = |snap| intervals([-1., 0.], [5., 0.], &contour, 1e-8, snap)[0].0;
+        assert!((start(0.001) - 1. / 6.).abs() < 1e-12);
+        assert!((start(0.) - (1. - 3e-5) / 6.).abs() < 1e-9);
     }
 
     #[test]
@@ -1643,7 +1675,7 @@ mod tests {
         // The axis runs along the bottom edge and leaves the material at the
         // vertex (1, 1e-9), within precision of it but not exactly on it.
         let square = vec![vec![[0., 0.], [0.5, 0.], [1., 1e-9], [1., 1.], [0., 1.]]];
-        let r = intervals([0., 0.], [1.5, 0.], &square, 1e-8);
+        let r = intervals([0., 0.], [1.5, 0.], &square, 1e-8, 0.);
         assert_eq!(r.len(), 1, "{r:?}");
         assert_eq!(r[0].2, Location::Boundary);
         assert!(
@@ -2178,17 +2210,17 @@ mod tests {
             vec![[1., 1.], [3., 1.], [3., 3.], [1., 3.]],
         ];
         assert_eq!(
-            intervals([0., 2.], [4., 2.], &contours, 1e-8),
+            intervals([0., 2.], [4., 2.], &contours, 1e-8, 0.),
             vec![
                 (0., 0.25, Location::Interior),
                 (0.75, 1., Location::Interior)
             ]
         );
         assert_eq!(
-            intervals([0., 0.], [4., 0.], &contours, 1e-8),
+            intervals([0., 0.], [4., 0.], &contours, 1e-8, 0.),
             vec![(0., 1., Location::Boundary)]
         );
-        assert_eq!(intervals([1.1, 2.], [2.9, 2.], &contours, 1e-8), vec![]);
+        assert_eq!(intervals([1.1, 2.], [2.9, 2.], &contours, 1e-8, 0.), vec![]);
         assert_eq!(location([2., 2.], &contours, 1e-8), None);
     }
     #[test]

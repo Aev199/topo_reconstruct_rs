@@ -19,6 +19,9 @@
 //! 25 mm below a slab) is closed too (`offsets`, the default), except
 //! between parallel structures: a vertex of a surface parallel to the other
 //! one (two slabs at different levels) never moves across to it.
+//! A vertex inside another surface of its plane by less than the minimum
+//! edge (neighbouring slabs overlapping by micrometres along their common
+//! edge) is closed onto that surface's contour the same way.
 //! Junction insertion afterwards represents the new contacts.
 use super::cleanup::{self, Bars};
 use super::intersection;
@@ -39,6 +42,8 @@ pub struct Closure {
     pub movement: f64,
     /// For "merged": the source node of the vertex it was merged into.
     pub kept_source_node: Option<u32>,
+    /// The vertex was inside the surface (an overlap), `gap` its depth.
+    pub overlap: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +66,8 @@ struct Gap {
     distance: f64,
     height: f64,
     outside: f64,
+    /// Inside the material: distance to its contour (an overlap past it).
+    depth: f64,
 }
 
 fn surface_vertices(model: &Model, s: usize) -> BTreeSet<usize> {
@@ -72,10 +79,15 @@ fn surface_vertices(model: &Model, s: usize) -> BTreeSet<usize> {
 
 /// Distance from a plane point to the closed material of a surface.
 fn outside(model: &Model, s: usize, uv: [f64; 2]) -> f64 {
-    let contours = &model.surfaces[s].contours;
-    if closed_contains(contours, uv, model.precision) {
+    if closed_contains(&model.surfaces[s].contours, uv, model.precision) {
         return 0.;
     }
+    to_contour(model, s, uv)
+}
+
+/// Distance from a plane point to the contour of a surface.
+fn to_contour(model: &Model, s: usize, uv: [f64; 2]) -> f64 {
+    let contours = &model.surfaces[s].contours;
     let p = DVec2::from_array(uv);
     contours
         .iter()
@@ -99,10 +111,16 @@ fn gap(model: &Model, v: usize, s: usize, members: &BTreeSet<usize>) -> Option<G
     let height = plane.distance(p);
     let outside = outside(model, s, plane.project(p));
     let distance = height.hypot(outside);
+    let depth = if outside > 0. {
+        0.
+    } else {
+        to_contour(model, s, plane.project(p))
+    };
     Some(Gap {
         distance,
         height,
         outside,
+        depth,
     })
 }
 
@@ -134,6 +152,7 @@ fn close_one(
     tolerance: f64,
     fixed: &BTreeSet<usize>,
     origin: &[[f64; 3]],
+    overlap: bool,
 ) -> Result<(Model, String, f64, Option<usize>), String> {
     let mut trial = model.clone();
     let from = DVec3::from_array(model.vertices[v]);
@@ -174,7 +193,7 @@ fn close_one(
             return Ok((merged, "merged".into(), reach, Some(w)));
         }
     }
-    if outside(&trial, s, plane.project(p.to_array())) <= trial.precision {
+    if !overlap && outside(&trial, s, plane.project(p.to_array())) <= trial.precision {
         let movement = p.distance(start);
         return Ok((trial, "settled".into(), movement, None));
     }
@@ -256,8 +275,16 @@ fn close_one(
     Ok((trial, "bent_edge".into(), movement, None))
 }
 
+/// A vertex in the plane of a surface, inside it by less than the minimum
+/// edge (neighbouring slabs overlapping by micrometres along their common
+/// edge): closed onto its contour like a gap.
+fn overlaps(model: &Model, g: &Gap) -> bool {
+    g.height.abs() <= model.precision && g.depth > model.precision && g.depth < model.minimum_edge
+}
+
 /// Close gaps narrower than `tolerance` between surface vertices (and bar
-/// nodes) and other surfaces.
+/// nodes) and other surfaces, and overlaps shallower than the minimum edge
+/// within a plane.
 pub fn close(
     model: &mut Model,
     bars: &mut Bars<'_>,
@@ -282,6 +309,7 @@ pub fn close(
         g.distance > model.precision
             && g.distance < tolerance
             && (g.height.abs() <= model.minimum_edge || (offsets && !parallel(model, v, s)))
+            || overlaps(model, g)
     };
     let mut report = Report {
         tolerance,
@@ -312,7 +340,7 @@ pub fn close(
                     // are closed here too: junction insertion only imprints
                     // intersection lines.
                     if eligible(model, v, s, &g) {
-                        gaps.push((g.distance, v, s));
+                        gaps.push((g.distance.max(g.depth), v, s));
                     }
                 }
             }
@@ -335,7 +363,8 @@ pub fn close(
             // The operation is atomic: a merge redirects bar ends, anchors and
             // point contacts, which are restored if it is rejected.
             let saved = (bars.axes.clone(), bars.contacts.clone());
-            let closed = close_one(model, bars, v, s, tolerance, fixed, &origin).and_then(
+            let overlap = overlaps(model, &g);
+            let closed = close_one(model, bars, v, s, tolerance, fixed, &origin, overlap).and_then(
                 |(trial, kind, movement, kept)| {
                     // Whole operation within the tolerance: the closed vertex
                     // and every vertex it moved, from their original places.
@@ -373,7 +402,8 @@ pub fn close(
                         vertex: v,
                         source_node: source_nodes.get(v).copied(),
                         surface: s,
-                        gap: g.distance,
+                        gap: g.distance.max(g.depth),
+                        overlap,
                         movement,
                         kept_source_node: kept.and_then(|w| source_nodes.get(w).copied()),
                     });
@@ -406,6 +436,54 @@ mod tests {
         Bars {
             axes: Box::leak(Box::new(vec![])),
             contacts: Box::leak(Box::new(vec![])),
+        }
+    }
+
+    #[test]
+    fn slab_overlapping_its_neighbour_by_micrometres_is_closed_onto_its_edge() {
+        for place in Placement::all() {
+            // Slab B (y from 1 to 3) starts 3 um inside slab A (x < 4): its
+            // two corners move onto A's edge x = 4, which is split there; 3 mm
+            // inside (beyond the 1 mm minimum edge), nothing changes.
+            for (inside, closed) in [(3e-6, true), (0.003, false)] {
+                let b = (
+                    vec![vec![
+                        [4. - inside, 1., 0.],
+                        [8., 1., 0.],
+                        [8., 3., 0.],
+                        [4. - inside, 3., 0.],
+                    ]],
+                    [0., 0., 1.],
+                );
+                let mut m = build(&place, &[slab(0., 4.), b]);
+                let r = close(
+                    &mut m,
+                    &mut no_bars(),
+                    0.05 * place.scale,
+                    true,
+                    &BTreeSet::new(),
+                    &[],
+                    &[],
+                    f64::INFINITY,
+                );
+                let onto: Vec<_> = r
+                    .closed
+                    .iter()
+                    .filter(|c| c.overlap && c.surface == 0)
+                    .collect();
+                assert_eq!(onto.len(), if closed { 2 } else { 0 }, "{r:?}");
+                if closed {
+                    assert!(onto.iter().all(|c| c.kind == "onto_edge"));
+                    assert_eq!(m.surface_edges(0).count(), 6);
+                    for y in [1., 3.] {
+                        let p = DVec3::from_array(place.point([4., y, 0.]));
+                        assert!(m
+                            .vertices
+                            .iter()
+                            .any(|v| DVec3::from_array(*v).distance(p) < 1e-9 * place.scale));
+                    }
+                }
+            }
         }
     }
 
