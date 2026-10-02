@@ -234,7 +234,9 @@ def check(data, baseline=None):
     # are re-placed straight.
     tees = topology.get("bar_tees") or {}
     for j in tees.get("joined", []):
-        assert 0. <= j["distance"] <= tees["tolerance"] + epsilon
+        # A merge into a node: also up to the minimum edge along the bar.
+        slack = topology["policy"]["minimum_edge"] if j.get("merged_into") is not None else 0.
+        assert 0. <= j["distance"] <= tees["tolerance"] + slack + epsilon
         closures.append((j["source_node"], j["distance"]))
         for axis in ends.get(j["vertex"], []):
             closures += [(a["source_node"], j["distance"]) for a in axis["anchors"]]
