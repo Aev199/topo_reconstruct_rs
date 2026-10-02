@@ -74,7 +74,9 @@ pass as before (byte-identical where no rule applies). Open:
   Strict audit: 26 coplanar overlaps of 1-3 mm2, 23 unshared point
   contacts (0.2 um - 0.9 mm), 4 unrepresented intersections;
 - Багратион bedding: mesh valid, 18 bars in a slab plane without contact,
-  1 overlapping bar, trial mesh angles (mesher gate false);
+  1 overlapping bar, trial mesh angles (mesher gate false). Closed crack
+  voids keep only shared nodes (2026-10-02): triangles under 1 degree
+  195 -> 99, sites 154 -> 63;
 - Багратион v4: frame accepted on the relaxation step, assembly checker
   passes, every surface built, 1 of 40 600 bars rejected
   (axis_direction_conflict), trial mesh topologically valid (2.1 M
@@ -102,6 +104,17 @@ contour with a hanging node of the source mesh closes its seam (crack
 width, filled-area budget; reported as a `seam` simplified hole); mesh
 promotion of Steiner vertices and edge/bar chain synchronization use the
 point slack (ten precisions) like the assembly.
+
+Sharp-triangle sites left (2026-10-02, under 1 degree, clustered within
+5 cm): mostly real source geometry, not numerical noise:
+- wedges between a bar and a slab edge it leaves at 0.1-4 degrees, the
+  bar ends being contour vertices (Багратион bedding ~25 sites, Багратион
+  v4 slab 2782 ~16). Aligning the bar moves the kink into the neighbouring
+  contour (tried, reverted);
+- fans of rigid links leaving one node at small angles (Багратион v4
+  slab 3999, ~10 sites);
+- bar pieces of 1-10 mm between bar nodes (all three models, a few sites).
+Candidates for the manual editor rather than further automatic rules.
 
 Speed: frame retries continue one LSQR run (ЖК Остров frame 34 -> 11 min),
 `--v2-frame-cache PATH` reuses a solved frame (development), trial mesh
