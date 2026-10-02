@@ -78,8 +78,11 @@ pass as before (byte-identical where no rule applies). Open:
 - Багратион v4: frame accepted on the relaxation step, assembly checker
   passes, every surface built, 1 of 40 600 bars rejected
   (axis_direction_conflict), trial mesh topologically valid (2.1 M
-  triangles). Mesher gate: 115 triangles under 1 degree (needles at
-  source/generated vertex pairs micrometres apart), as for ЖК Остров.
+  triangles). Micrometre vertex pairs removed (interval ends snap to
+  contour vertices, micro-overlaps of coplanar slabs close): no triangle
+  edge under 0.1 mm, 51 triangles under 1 degree (minimum 0.037), all at
+  millimetre features (0.45 mm - 1 cm), as for ЖК Остров and Багратион
+  bedding.
 
 Rules added 2026-10-01/02 (geotechnical; deviation from the source is
 allowed, user decision 2026-10-01): over-constrained panel merges only as a
