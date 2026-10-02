@@ -547,6 +547,13 @@ impl Model {
             .filter(|&s| self.surface_edges(s).any(|e| e == edge))
             .collect();
         for &s in &users {
+            // A contour through the vertex already would touch itself there.
+            let boundary = || self.surfaces[s].boundaries.iter().flatten();
+            if boundary().any(|u| u.edge == edge)
+                && boundary().any(|u| self.edges[u.edge].contains(&vertex))
+            {
+                return Err(Error::InvalidRing);
+            }
             if self.planes[self.surfaces[s].plane]
                 .distance(p.to_array())
                 .abs()
@@ -863,6 +870,27 @@ mod tests {
             .to_vec();
         (model, plane, ring)
     }
+    #[test]
+    fn split_through_a_vertex_of_the_same_contour_is_rejected() {
+        // A notch reaching within precision of the edge x = 2 (a gap closure
+        // moved its tip there): splitting that edge at the tip, an exact
+        // split without contour revalidation, would make the contour pass
+        // through the tip twice.
+        let (mut m, slab, r) = square();
+        let tip = m.add_vertex([2. - 5e-9, 1., 0.]).unwrap();
+        let (u, w) = (
+            m.add_vertex([0., 1.05, 0.]).unwrap(),
+            m.add_vertex([0., 0.95, 0.]).unwrap(),
+        );
+        m.add_surface(slab, vec![vec![r[0], r[1], r[2], r[3], u, tip, w]], vec![1])
+            .unwrap();
+        let edge = m.surfaces()[0].boundaries[0][1].edge;
+        assert_eq!(m.edges[edge], [r[1].min(r[2]), r[1].max(r[2])]);
+        let before = serde_json::to_string(&m).unwrap();
+        assert_eq!(m.split_edge(edge, tip), Err(Error::InvalidRing));
+        assert_eq!(before, serde_json::to_string(&m).unwrap());
+    }
+
     #[test]
     fn perpendicular_surfaces_reuse_one_boundary() {
         let (mut m, slab, r) = square();
