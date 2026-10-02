@@ -68,6 +68,10 @@ pub struct SimplifiedHole {
     pub patch: usize,
     pub source_elements: Vec<u32>,
     pub source_nodes: Vec<u32>,
+    /// Source nodes kept as interior vertices: all of a collapsed opening;
+    /// of a crack void or seam (source mesh discretization) only those
+    /// shared with another surface or a bar. Set by the assembly.
+    pub retained_nodes: Vec<u32>,
     pub source_area: f64,
     pub source_width: f64,
     pub candidate_area: f64,
@@ -193,6 +197,7 @@ fn close_seams(
             reason: "seam".into(),
             patch,
             source_elements: ids.to_vec(),
+            retained_nodes: tips.clone(),
             source_nodes: tips,
             source_area: area,
             source_width: seam_width,
@@ -278,6 +283,7 @@ pub(super) fn simplify(
                 patch,
                 source_elements: ids.to_vec(),
                 source_nodes: ring.clone(),
+                retained_nodes: ring.clone(),
                 source_area,
                 source_width,
                 candidate_area,

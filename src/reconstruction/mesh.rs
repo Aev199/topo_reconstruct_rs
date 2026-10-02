@@ -409,7 +409,7 @@ fn build_impl(
             if hole.source_elements != surface.source_elements {
                 continue;
             }
-            for n in &hole.source_nodes {
+            for n in &hole.retained_nodes {
                 let vertex = source
                     .vertex_source_nodes
                     .iter()

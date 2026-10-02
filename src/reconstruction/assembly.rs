@@ -1196,11 +1196,46 @@ fn assemble_impl(
     // Mandatory interior nodes per surface, the vertices that must stay
     // (all bar vertices and retained nodes), and the retained nodes that no
     // merge may move. Recomputed after merges, which renumber vertices.
+    // Nodes of a closed crack void or seam (source mesh discretization) stay
+    // only where shared with another surface or a bar: alone they are pairs
+    // of vertices millimetres apart inside the material.
+    for hole in simplified_holes
+        .iter_mut()
+        .filter(|hole| hole.reason != "collapsed_opening")
+    {
+        let own: Vec<usize> = model
+            .surfaces
+            .iter()
+            .enumerate()
+            .filter(|(_, surface)| surface.source_elements == hole.source_elements)
+            .map(|(s, _)| s)
+            .collect();
+        let shared = |v: usize| {
+            (0..model.surfaces.len())
+                .filter(|s| !own.contains(s))
+                .any(|s| model.surface_edges(s).any(|e| model.edges[e].contains(&v)))
+                || axis_assembly
+                    .axes
+                    .iter()
+                    .any(|a| a.endpoints.contains(&v) || a.anchors.iter().any(|x| x.vertex == v))
+        };
+        hole.retained_nodes = hole
+            .source_nodes
+            .iter()
+            .copied()
+            .filter(|n| {
+                vertex_source_nodes
+                    .iter()
+                    .position(|m| m == n)
+                    .is_some_and(shared)
+            })
+            .collect();
+    }
     let hole_nodes: Vec<(usize, Vec<usize>)> = simplified_holes
         .iter()
         .flat_map(|hole| {
             let nodes: Vec<usize> = hole
-                .source_nodes
+                .retained_nodes
                 .iter()
                 .filter_map(|n| vertex_source_nodes.iter().position(|m| m == n))
                 .collect();

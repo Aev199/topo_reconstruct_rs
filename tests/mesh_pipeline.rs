@@ -981,3 +981,81 @@ fn region_no_wider_than_a_crack_is_removed_with_provenance() {
         }
     }
 }
+
+/// A slab of triangles around a 4 mm wide void between non-conforming
+/// elements; a column stands on the void apex (node 12).
+fn crack_void_source() -> topo_reconstruct_rs::input::MeshData {
+    use topo_reconstruct_rs::input::{ElementData, MeshData};
+    let mut mesh = MeshData::default();
+    for (id, p) in [
+        (1, [0., 0., 0.]),
+        (2, [4., 0., 0.]),
+        (3, [4., 4., 0.]),
+        (4, [0., 4., 0.]),
+        (10, [1.9, 2., 0.]),
+        (11, [2.1, 2., 0.]),
+        (12, [2., 2.004, 0.]),
+        (13, [2., 2.004, 1.]),
+    ] {
+        mesh.nodes.insert(id, DVec3::from_array(p));
+    }
+    for nodes in [
+        [1, 2, 11],
+        [1, 11, 10],
+        [2, 3, 11],
+        [3, 12, 11],
+        [3, 4, 12],
+        [4, 10, 12],
+        [4, 1, 10],
+    ] {
+        mesh.elements.push(ElementData {
+            id: mesh.elements.len() as u32 + 1,
+            elem_type: 42,
+            stiff_id: 1,
+            nodes: nodes.to_vec(),
+        });
+    }
+    mesh.elements.push(ElementData {
+        id: 20,
+        elem_type: 10,
+        stiff_id: 2,
+        nodes: vec![12, 13],
+    });
+    mesh
+}
+
+#[test]
+fn closed_crack_void_keeps_only_its_shared_nodes() {
+    for scale in [0.1, 1., 10.] {
+        for rotated in [false, true] {
+            let features = assembly::FeaturePolicy {
+                maximum_crack_width: 0.01 * scale,
+                ..Default::default()
+            };
+            let (topology, mesh) = run_with(crack_void_source(), scale, rotated, Some(features));
+            let id = |n: u32| if rotated { 1000 - n } else { n };
+            assert_eq!(topology.simplified_holes.len(), 1, "{:?}", topology.issues);
+            let hole = &topology.simplified_holes[0];
+            assert_eq!(hole.reason, "crack_void");
+            assert_eq!(hole.source_nodes.len(), 3);
+            // The column node stays; the other two void corners go.
+            assert_eq!(hole.retained_nodes, vec![id(12)]);
+            assert!(
+                mesh.topology_valid,
+                "scale={scale} rotated={rotated}: {:?}",
+                mesh.blockers
+            );
+            let used: std::collections::BTreeSet<_> =
+                mesh.triangles.iter().flat_map(|t| t.vertices).collect();
+            let vertex = |n: u32| {
+                topology
+                    .vertex_source_nodes
+                    .iter()
+                    .position(|&m| m == id(n))
+                    .unwrap()
+            };
+            assert!(used.contains(&vertex(12)));
+            assert!(!used.contains(&vertex(10)) && !used.contains(&vertex(11)));
+        }
+    }
+}

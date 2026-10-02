@@ -464,7 +464,7 @@ def check(data, baseline=None):
                     # A node merged onto another vertex is represented by a
                     # used mesh vertex at the same point.
                     points = [mesh["vertices"][v] for v in used]
-                    for n in hole["source_nodes"]:
+                    for n in hole.get("retained_nodes", hole["source_nodes"]):
                         v = source_nodes.index(n)
                         assert v in used or any(
                             math.dist(vertices[v], p) <= epsilon for p in points)
