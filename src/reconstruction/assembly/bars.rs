@@ -234,8 +234,10 @@ pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
 /// slab, one passing through the span of another) share a generated vertex
 /// there: it becomes an anchor of both (and of a third bar through the
 /// same point). A node of one bar within the minimum edge of the crossing
-/// slides onto it when it may (see `slides_with_ends`) and is shared; other crossings next to nodes are left alone, as are bars
-/// already sharing a node and parallel bars.
+/// slides onto it when it may (see `slides_with_ends`) and is shared; other
+/// crossings next to source nodes are left alone (a crossing next to
+/// another generated crossing is not), as are bars already sharing a node
+/// and parallel bars.
 pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
     let precision = model.precision;
     let minimum = model.minimum_edge;
@@ -302,18 +304,21 @@ pub fn imprint_bar_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprin
         }
         let p = (pa + pb) * 0.5;
         // A node of a bar next to the crossing: a vertex generated for a
-        // crossing with a third bar at the same point is shared; any other
-        // node there is a near touch.
+        // crossing with a third bar at the same point is shared; a source
+        // node there is a near touch. A crossing with a third bar elsewhere
+        // (bars fanning out from a node, crossed next to it) does not
+        // block this one: unshared crossings fail the mesh, a short piece
+        // is only a review item.
         let near = |k: usize, u: f64| {
             axes[k]
                 .anchors
                 .iter()
-                .find(|x| (x.t - u).abs() * lengths[k] < minimum)
-                .map(|x| {
-                    (x.source_node == NO_SOURCE_NODE
-                        && DVec3::from_array(model.vertices[x.vertex]).distance(p) <= precision)
-                        .then_some(x.vertex)
+                .filter(|x| (x.t - u).abs() * lengths[k] < minimum)
+                .find(|x| {
+                    x.source_node != NO_SOURCE_NODE
+                        || DVec3::from_array(model.vertices[x.vertex]).distance(p) <= precision
                 })
+                .map(|x| (x.source_node == NO_SOURCE_NODE).then_some(x.vertex))
         };
         let (v, bars) = match (near(i, s), near(j, t)) {
             (None, None) => {
@@ -1465,6 +1470,41 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn crossings_next_to_each_other_are_both_shared() {
+        use super::super::junctions::tests::Placement;
+        for place in Placement::all() {
+            // Bars B and C fan out from (0, 0, 0) at about 12 degrees; bar A
+            // along y = 0.004 crosses both 4 mm from their node, 0.8 mm
+            // apart: each crossing gets its own vertex.
+            let mut m = Model::new(1e-7 * place.scale, 0.001 * place.scale).unwrap();
+            let mut bar = |p: [f64; 3], q: [f64; 3], source_axis: usize| {
+                let [a, b] = [p, q].map(|x| m.add_vertex(place.point(x)).unwrap());
+                Axis {
+                    source_axis,
+                    endpoints: [a, b],
+                    anchors: [(a, 0.), (b, 1.)]
+                        .map(|(vertex, t)| Anchor {
+                            source_node: vertex as u32,
+                            vertex,
+                            t,
+                        })
+                        .to_vec(),
+                    spans: vec![],
+                }
+            };
+            let mut axes = vec![
+                bar([-1., 0.004, 0.], [1., 0.004, 0.], 0),
+                bar([0., 0., 0.], [1., 1., 0.], 1),
+                bar([0., 0., 0.], [0.8, 1., 0.], 2),
+            ];
+            let r = imprint_bar_crossings(&mut m, &mut axes);
+            assert_eq!(r.len(), 4, "{r:?}");
+            assert_eq!(axes[0].anchors.len(), 4);
+            assert!(axes[1..].iter().all(|a| a.anchors.len() == 3));
         }
     }
 
