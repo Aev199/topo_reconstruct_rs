@@ -1,6 +1,6 @@
 # Development state
 
-Updated: 2026-09-30
+Updated: 2026-10-02
 Repository baseline reviewed through the surface-junction batch (see git log).
 
 This file is intentionally short. It is the entry point for the next development
@@ -64,36 +64,35 @@ PLAXIS (`docs/GEOTECHNICAL_GEOMETRY.md`, "PLAXIS profile"):
 `scripts/check_plaxis_profile.py` is the readiness gate at a target element
 size of 0.5 m. типовая секция and тест 5 pass it. Remaining:
 
-New fixtures (2026-09-30): test slab, АЖТ tests, скала seismic and "для
-testa" build fully (assembly checker, strict audit, trial mesh). Duplicate
-bars, sliver regions and kinked walls are handled by general rules
-(`docs/GEOTECHNICAL_GEOMETRY.md`, 2026-09-30 batch). Open:
+Scoreboard 2026-10-02 (12 fixtures; assembly checker, strict audit, trial
+mesh valid / external-mesher ready, PLAXIS profile): скала1, типовая секция,
+тест 5, тест 6, the test slab, both АЖТ tests, скала seismic and "для testa"
+pass as before (byte-identical where no rule applies). Open:
 
-- Багратион bedding: all surfaces build, overlapping bars 8 -> 0, coplanar
-  overlaps 8 -> 0 (17 needle regions <= 6.6 mm removed), trial mesh builds.
-  Open: 18 bars lying in the slab plane along the former seam without a
-  contact (micrometre to 0.5 m), one bar anchor outside its surface, trial
-  mesh angles (external mesher gate still false);
-- ЖК Остров: kinked walls merged into panels, the 175 mm frame movement and
-  all 24 contour issues are gone, the frame converges (about 4800
-  iterations, fourth retry; frame stage about 34 minutes, maximum movement
-  68 mm). Open: trial mesh "constraint crossing requires explicit shared
-  vertex"; frame runtime (retries restart from the source);
-- Багратион v4: runtime hours -> about 30 minutes (quadratic stages
-  removed; the frame needs the 8x retry). Frame now accepted after the
-  geotechnical rules below; 0 rejected vertices (was 11), surface issues
-  20 -> 1 (one contour_InvalidRing), unbuilt-region bars ~1400 -> 20.
-  Open: that ring, 17 axis length/orientation and 1 direction conflict,
-  trial mesh "distinct constraint vertices coincide". The global geometry
-  audit takes over 30 minutes on it.
+- ЖК Остров: frame accepted (default step, 11 min), all surfaces and bars
+  built, assembly checker passes, trial mesh valid and mesher-ready.
+  Strict audit: 26 coplanar overlaps of 1-3 mm2, 23 unshared point
+  contacts (0.2 um - 0.9 mm), 4 unrepresented intersections;
+- Багратион bedding: mesh valid, 18 bars in a slab plane without contact,
+  1 overlapping bar, trial mesh angles (mesher gate false);
+- Багратион v4: frame accepted on the relaxation step, assembly checker
+  passes (1956 bar tees); trial mesh fails at a hub of beams 50 mm beside
+  a beam node joined to it by a 49.99 mm bar (not collapsed).
 
-Geotechnical rules added for these (PLAXIS geometry; deviation from the
-source scheme is allowed, user decision 2026-10-01): bar nodes may move at
-least the plane distance; short axes keep length and direction class, not
-transverse noise; support families with nodes on four non-parallel planes
-or whose planes do not meet near a node merge into panels within 50 mm;
-merged panels snap horizontal/vertical within 50 mm; concurrent support
-offsets apply per support.
+Rules added 2026-10-01/02 (geotechnical; deviation from the source is
+allowed, user decision 2026-10-01): over-constrained panel merges only as a
+frame relaxation step (`relaxation.frame` in the report); bar-bar crossings
+share a generated vertex; bar ends within 50 mm of another bar's span join
+it (`bar_tees`), merging into a bar node they project onto; bars lying on
+each other exchange nodes and same-stiffness contained bars are removed as
+duplicates; points within ten precisions are one point (interval ends, bar
+nodes); short bars may shorten within their end budgets; bar nodes slide
+onto an adjacent crossing.
+
+Speed: frame retries continue one LSQR run (ЖК Остров frame 34 -> 11 min),
+`--v2-frame-cache PATH` reuses a solved frame (development), trial mesh
+contacts indexed by surface (Багратион v4 mesh 9 min -> under 1 min),
+`TOPO_DIAG=1` prints mesh failure details.
 
 Previous fixtures:
 
