@@ -1371,8 +1371,8 @@ pub fn join_bar_tees(
 /// A bar lying on another one (both its ends are nodes of it: a beam
 /// modelled twice, one element over two) takes the other bar's nodes inside
 /// its span and gives it its own, so both run through the same vertices
-/// (the mesh shares their subdivision). Only nodes within precision of the
-/// other axis are exchanged. Returns the number of nodes added.
+/// (the mesh shares their subdivision). Only nodes within the point slack
+/// (ten precisions) of the other axis are exchanged. Returns the number of nodes added.
 pub fn share_overlapping_bars(model: &Model, axes: &mut [Axis]) -> usize {
     let point = |v: usize| DVec3::from_array(model.vertices[v]);
     let mut by_vertex = std::collections::BTreeMap::<usize, Vec<usize>>::new();
@@ -1414,7 +1414,8 @@ pub fn share_overlapping_bars(model: &Model, axes: &mut [Axis]) -> usize {
                         let u = (point(x.vertex) - p).dot(d) / d.length_squared();
                         (u > lo
                             && u < hi
-                            && (p + d * u).distance(point(x.vertex)) <= model.precision)
+                            && (p + d * u).distance(point(x.vertex))
+                                <= crate::reconstruction::mesh::ENDPOINT_SLACK * model.precision)
                             .then_some(Anchor {
                                 source_node: x.source_node,
                                 vertex: x.vertex,
