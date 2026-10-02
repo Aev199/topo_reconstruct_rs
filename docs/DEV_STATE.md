@@ -105,16 +105,23 @@ width, filled-area budget; reported as a `seam` simplified hole); mesh
 promotion of Steiner vertices and edge/bar chain synchronization use the
 point slack (ten precisions) like the assembly.
 
-Sharp-triangle sites left (2026-10-02, under 1 degree, clustered within
-5 cm): mostly real source geometry, not numerical noise:
-- wedges between a bar and a slab edge it leaves at 0.1-4 degrees, the
-  bar ends being contour vertices (Багратион bedding ~25 sites, Багратион
-  v4 slab 2782 ~16). Aligning the bar moves the kink into the neighbouring
-  contour (tried, reverted);
-- fans of rigid links leaving one node at small angles (Багратион v4
-  slab 3999, ~10 sites);
-- bar pieces of 1-10 mm between bar nodes (all three models, a few sites).
-Candidates for the manual editor rather than further automatic rules.
+Rigid links (user decision 2026-10-02): geotechnical mode removes bars
+whose numeric stiffness gives a radius of gyration sqrt(EI/EF) beyond
+their length and 1 m (LIRA "1000 200000 200000 200000"; Багратион v4
+36 011 elements, Багратион bedding 2143, none elsewhere). Point slack is
+10 um. Other rules for the reviewed defect classes use the 5 cm gap
+tolerance (variant A).
+
+State after this batch:
+- Багратион v4: frame 25 min without links (relaxation step), no
+  rejected bar or surface, assembly checker passes, trial mesh valid and
+  mesher-ready; 22 triangles under 1 degree at 4 bars along slab edges
+  with a 1-2 mm kink (one contour neighbour on the bar).
+- Багратион bedding: mesher-ready, no bar audit issue; 12 sites, all in
+  slab contours; 5 surfaces flagged by the global audit's ring check
+  (pre-existing, to examine).
+- ЖК Остров unchanged (mesher-ready; strict audit: 25 coplanar overlaps,
+  21 unshared point contacts, 4 unrepresented intersections).
 
 Speed: frame retries continue one LSQR run (ЖК Остров frame 34 -> 11 min),
 `--v2-frame-cache PATH` reuses a solved frame (development), trial mesh
