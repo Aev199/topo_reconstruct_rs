@@ -21,7 +21,8 @@
 //! one (two slabs at different levels) never moves across to it.
 //! A vertex inside another surface of its plane by less than the minimum
 //! edge (neighbouring slabs overlapping by micrometres along their common
-//! edge) is closed onto that surface's contour the same way.
+//! edge) is closed onto that surface's contour the same way, and a vertex
+//! touching another surface's contour edge (within precision) splits it.
 //! Junction insertion afterwards represents the new contacts.
 use super::cleanup::{self, Bars};
 use super::intersection;
@@ -197,11 +198,13 @@ fn close_one(
         let movement = p.distance(start);
         return Ok((trial, "settled".into(), movement, None));
     }
-    // 2a. Into a nearby contour vertex of the surface.
+    // 2a. Into a nearby contour vertex of the surface (a vertex already on
+    //     its contour is split into the edge instead, without moving).
+    let on_contour = to_contour(&trial, s, plane.project(p.to_array())) <= trial.precision;
     let nearest = members
         .iter()
         .map(|&w| (DVec3::from_array(trial.vertices[w]).distance(p), w))
-        .filter(|&(d, _)| d <= tolerance)
+        .filter(|&(d, _)| d <= tolerance && !on_contour)
         .min_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
     if let Some((_, w)) = nearest {
         let mut merged = trial.clone();
@@ -282,6 +285,13 @@ fn overlaps(model: &Model, g: &Gap) -> bool {
     g.height.abs() <= model.precision && g.depth > model.precision && g.depth < model.minimum_edge
 }
 
+/// A vertex touching the contour of a surface (within precision of a
+/// contour edge, not one of its vertices): a contact like a closed gap, so
+/// the edge is split there.
+fn touches(model: &Model, g: &Gap) -> bool {
+    g.height.abs() <= model.precision && g.outside == 0. && g.depth <= model.precision
+}
+
 /// Close gaps narrower than `tolerance` between surface vertices (and bar
 /// nodes) and other surfaces, and overlaps shallower than the minimum edge
 /// within a plane.
@@ -310,6 +320,7 @@ pub fn close(
             && g.distance < tolerance
             && (g.height.abs() <= model.minimum_edge || (offsets && !parallel(model, v, s)))
             || overlaps(model, g)
+            || touches(model, g)
     };
     let mut report = Report {
         tolerance,
@@ -363,7 +374,7 @@ pub fn close(
             // The operation is atomic: a merge redirects bar ends, anchors and
             // point contacts, which are restored if it is rejected.
             let saved = (bars.axes.clone(), bars.contacts.clone());
-            let overlap = overlaps(model, &g);
+            let overlap = overlaps(model, &g) || touches(model, &g);
             let closed = close_one(model, bars, v, s, tolerance, fixed, &origin, overlap).and_then(
                 |(trial, kind, movement, kept)| {
                     // Whole operation within the tolerance: the closed vertex
@@ -436,6 +447,49 @@ mod tests {
         Bars {
             axes: Box::leak(Box::new(vec![])),
             contacts: Box::leak(Box::new(vec![])),
+        }
+    }
+
+    #[test]
+    fn corner_touching_a_slab_edge_splits_it() {
+        for place in Placement::all() {
+            // A wall in the plane x + y = 6 touches the slab edge x = 4 only
+            // with its corner (4, 2, 0): the edge is split there, nothing
+            // moves.
+            let wall = (
+                vec![vec![[4., 2., 0.], [5., 1., 1.], [5., 1., 3.], [4., 2., 3.]]],
+                [1., 1., 0.],
+            );
+            let mut m = build(&place, &[slab(0., 4.), wall]);
+            let before = m.vertices.clone();
+            let corner = (0..m.vertices.len())
+                .find(|&v| {
+                    DVec3::from_array(m.vertices[v])
+                        .distance(DVec3::from_array(place.point([4., 2., 0.])))
+                        < 1e-9 * place.scale
+                })
+                .unwrap();
+            assert!(!m.surface_edges(0).any(|e| m.edges[e].contains(&corner)));
+            let r = close(
+                &mut m,
+                &mut no_bars(),
+                0.05 * place.scale,
+                true,
+                &BTreeSet::new(),
+                &[],
+                &[],
+                f64::INFINITY,
+            );
+            assert!(
+                r.closed
+                    .iter()
+                    .any(|c| c.vertex == corner && c.surface == 0),
+                "{r:?}"
+            );
+            assert!(m.surface_edges(0).any(|e| m.edges[e].contains(&corner)));
+            for (a, b) in before.iter().zip(&m.vertices) {
+                assert!(DVec3::from_array(*a).distance(DVec3::from_array(*b)) < 1e-9 * place.scale);
+            }
         }
     }
 
