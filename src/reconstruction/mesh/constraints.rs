@@ -502,8 +502,12 @@ pub(super) fn synchronize(
             if !owners[edge_id].contains(&surface) {
                 continue;
             }
+            // Bar nodes lie within the point slack of their axis, so the
+            // edge they run along is within it too.
             for vertex in candidates {
-                if let Some(t) = parameter(point(&vertices[vertex]), pa, pb, precision) {
+                if let Some(t) =
+                    parameter(point(&vertices[vertex]), pa, pb, ENDPOINT_SLACK * precision)
+                {
                     chain.push((t, vertex));
                 }
             }
@@ -548,7 +552,7 @@ pub(super) fn synchronize(
                     point(&vertices[vertex]),
                     point(&vertices[a]),
                     point(&vertices[b]),
-                    precision,
+                    ENDPOINT_SLACK * precision,
                 ) {
                     let length = point(&vertices[a]).distance(point(&vertices[b]));
                     let tolerance = precision / length;
@@ -702,6 +706,28 @@ mod tests {
         // The nominal spacing exceeds the panels. The 4 m outer edges are 2 m
         // from the opposite shared edge, so graded sizing splits each once.
         assert_eq!(synced.report.edge_node_count, 18);
+    }
+
+    #[test]
+    fn bar_node_within_the_point_slack_of_a_shared_edge_subdivides_it() {
+        // A bar node 5 precisions off the common edge (within ten): the
+        // edge chain takes it, so the edge and the bar share one subdivision.
+        let (model, mut vertices, mut axes, contacts) = shared_edge_case();
+        vertices.push([2., 5e-8, 0.]);
+        let node = vertices.len() - 1;
+        axes[0].anchors.insert(
+            1,
+            Anchor {
+                source_node: 12,
+                vertex: node,
+                t: 0.5,
+            },
+        );
+        let synced = synchronize(&model, &axes, &contacts, &mut vertices, &policy(), 1e-8).unwrap();
+        assert!(synced.edge_nodes[0].iter().any(|&(_, v)| v == node));
+        let edge: Vec<_> = synced.edge_nodes[0].iter().map(|&(_, v)| v).collect();
+        let bar: Vec<_> = synced.axis_nodes[0].iter().map(|&(_, v)| v).collect();
+        assert_eq!(edge, bar);
     }
 
     #[test]
