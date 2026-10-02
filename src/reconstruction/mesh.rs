@@ -644,11 +644,13 @@ fn build_impl(
             let length = point(&vertices[a]).distance(point(&vertices[b]));
             let tolerance = eps / length;
             for node in face_nodes.iter().copied() {
+                // Bar nodes lie within the point slack of the axis, and so
+                // do Steiner vertices on the constraint pieces between them.
                 let Some(t) = parameter(
                     point(&vertices[node]),
                     point(&vertices[a]),
                     point(&vertices[b]),
-                    eps,
+                    ENDPOINT_SLACK * eps,
                 ) else {
                     continue;
                 };
@@ -680,6 +682,39 @@ fn build_impl(
         for chain in &mut axis_nodes {
             sorted(chain, &vertices, eps)?;
         }
+        // Bar pieces split by promoted vertices are checked as split.
+        let mut promoted = BTreeSet::new();
+        for c in by_surface[s].iter().map(|&k| &contacts[k]) {
+            let Contact::Interval {
+                axis,
+                surface,
+                start_t,
+                end_t,
+                ..
+            } = *c
+            else {
+                continue;
+            };
+            if surface != s {
+                continue;
+            }
+            let length = point(&vertices[axes[axis].endpoints[0]])
+                .distance(point(&vertices[axes[axis].endpoints[1]]));
+            let tolerance = eps / length;
+            for pair in axis_nodes[axis].windows(2) {
+                if pair[0].0 >= start_t - ENDPOINT_SLACK * tolerance
+                    && pair[1].0 <= end_t + ENDPOINT_SLACK * tolerance
+                {
+                    promoted.insert(key(pair[0].1, pair[1].1));
+                }
+            }
+        }
+        let constraints: BTreeSet<[usize; 2]> = constraints
+            .iter()
+            .filter(|edge| !internal_constraint_edges.contains(*edge) || promoted.contains(*edge))
+            .copied()
+            .chain(promoted.iter().copied())
+            .collect();
         let mut counts = BTreeMap::new();
         let mut area = 0.;
         let mut used = BTreeSet::new();
