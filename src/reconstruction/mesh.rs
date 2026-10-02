@@ -566,6 +566,12 @@ fn build_impl(
                     handles.insert(n, h);
                     continue;
                 }
+                diagnostic(|| {
+                    format!(
+                        "surface {s}: vertices {first} {:?} and {n} {:?} merge in the triangulation",
+                        vertices[first], vertices[n]
+                    )
+                });
                 return Err("implicit vertex merge in CDT");
             }
             global.insert(h.index(), n);

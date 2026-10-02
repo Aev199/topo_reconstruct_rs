@@ -284,7 +284,22 @@ pub(super) fn synchronize(
     }
 
     let mut endpoint_bindings = Vec::new();
+    // Interval ends are looked up among surface vertices and ends generated
+    // so far (an end at a contour vertex, or two bars leaving a surface at
+    // one point).
+    let radius = ENDPOINT_SLACK * precision;
+    let cell = |p: DVec3| (p / radius).floor().as_i64vec3().to_array();
     let mut generated_ends = BTreeMap::<[i64; 3], Vec<usize>>::new();
+    for surface in 0..model.surfaces.len() {
+        for edge in model.surface_edges(surface) {
+            for v in model.edges[edge] {
+                let list = generated_ends.entry(cell(point(&vertices[v]))).or_default();
+                if !list.contains(&v) {
+                    list.push(v);
+                }
+            }
+        }
+    }
     let mut interval_contact_count = 0;
     for (contact, item) in contacts.iter().enumerate() {
         match item {
@@ -342,11 +357,9 @@ pub(super) fn synchronize(
                     let (t, vertex, generated) = if let Some((u, vertex)) = existing {
                         (u, vertex, false)
                     } else {
-                        // The end of another bar's interval at the same point
-                        // (two bars leaving a slab at one point) is shared.
+                        // A surface vertex or the end of another bar's
+                        // interval at the same point is shared.
                         let p = start.lerp(end, t);
-                        let radius = ENDPOINT_SLACK * precision;
-                        let cell = |p: DVec3| (p / radius).floor().as_i64vec3().to_array();
                         let c = cell(p);
                         let mut shared = None;
                         'search: for dx in -1..=1 {
@@ -809,6 +822,54 @@ mod tests {
         };
         assert_eq!(at(0), at(1));
         assert!(synced.edge_nodes[0].iter().any(|&(_, v)| v == at(0)));
+    }
+
+    #[test]
+    fn interval_end_at_a_contour_vertex_is_that_vertex() {
+        // A bar through the common corner (0, 0) of both panels: its
+        // interval ends there use the corner vertex, none is generated.
+        let (model, mut vertices, _, _) = shared_edge_case();
+        vertices.push([0., -1., 0.]);
+        vertices.push([0., 1., 0.]);
+        let (a, b) = (vertices.len() - 2, vertices.len() - 1);
+        let axes = vec![Axis {
+            source_axis: 0,
+            endpoints: [a, b],
+            anchors: vec![
+                Anchor {
+                    source_node: 20,
+                    vertex: a,
+                    t: 0.,
+                },
+                Anchor {
+                    source_node: 21,
+                    vertex: b,
+                    t: 1.,
+                },
+            ],
+            spans: vec![],
+        }];
+        let contacts: Vec<_> = [(1, 0., 0.5), (0, 0.5, 1.)]
+            .into_iter()
+            .map(|(surface, start_t, end_t)| Contact::Interval {
+                axis: 0,
+                surface,
+                start_t,
+                end_t,
+                location: Location::Boundary,
+            })
+            .collect();
+        let count = vertices.len();
+        let synced = synchronize(&model, &axes, &contacts, &mut vertices, &policy(), 1e-8).unwrap();
+        let at_corner: Vec<_> = synced
+            .report
+            .endpoint_bindings
+            .iter()
+            .filter(|b| (b.parameter - 0.5).abs() < 1e-12)
+            .collect();
+        assert_eq!(at_corner.len(), 2);
+        assert!(at_corner.iter().all(|b| b.vertex == 0 && !b.generated));
+        assert!(vertices[count..].iter().all(|p| *p != [0., 0., 0.]));
     }
 
     #[test]
