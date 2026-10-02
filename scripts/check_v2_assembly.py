@@ -228,6 +228,12 @@ def check(data, baseline=None):
     # A bar node slid along its bar onto a crossing next to it (within the
     # minimum edge) by its reported movement.
     for c in bars.get("imprinted", []):
+        # A surface vertex moved onto a bar (a slab edge zigzagging along a
+        # beam, within the gap tolerance).
+        if c["kind"] == "surface_vertex":
+            assert 0. <= c["movement"] <= max(features.get("maximum_gap", 0.),
+                                               topology["policy"]["minimum_edge"]) + epsilon
+            closures.append((c["source_node"], c["movement"]))
         if c["kind"] == "slid_anchor":
             assert 0. <= c["movement"] <= topology["policy"]["minimum_edge"] + epsilon
             closures.append((c["source_node"], c["movement"]))

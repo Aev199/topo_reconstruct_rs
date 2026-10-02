@@ -1490,8 +1490,12 @@ fn assemble_impl(
     };
     timer.lap("short_edges");
     model.refresh_orphaned_edges();
-    axis_assembly.imprinted =
-        bars::imprint_surface_vertices(&mut model, &mut axis_assembly.axes, &vertex_source_nodes);
+    axis_assembly.imprinted = bars::imprint_surface_vertices(
+        &mut model,
+        &mut axis_assembly.axes,
+        &vertex_source_nodes,
+        features.map_or(0., |f| f.maximum_gap),
+    );
     if features.is_some() {
         let mut crossings = bars::imprint_crossings(&mut model, &mut axis_assembly.axes);
         crossings.extend(bars::imprint_bar_crossings(

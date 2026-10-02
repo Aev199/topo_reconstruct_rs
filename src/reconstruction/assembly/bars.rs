@@ -512,17 +512,29 @@ pub fn imprint_surface_vertices(
     model: &mut Model,
     axes: &mut [Axis],
     source_nodes: &[u32],
+    zigzag: f64,
 ) -> Vec<Imprint> {
     let precision = model.precision;
+    let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * precision;
     // A vertex nearly on the axis (within the minimum edge, e.g. a slab
     // edge 1 um off a beam along it) is moved onto the axis when it stays
-    // on all its planes; bar nodes themselves never move here.
+    // on all its planes; bar nodes themselves never move here. A contour
+    // vertex between two contour neighbours on the axis (a slab edge along
+    // a beam zigzagging a few millimetres off it) moves within `zigzag`.
     let snap = model.minimum_edge;
     let used: BTreeSet<usize> = (0..model.surfaces.len())
         .flat_map(|s| model.surface_edges(s).collect::<Vec<_>>())
         .flat_map(|e| model.edges[e])
         .filter(|&v| v < source_nodes.len())
         .collect();
+    let mut neighbours = BTreeMap::<usize, BTreeSet<usize>>::new();
+    for s in 0..model.surfaces.len() {
+        for e in model.surface_edges(s) {
+            let [a, b] = model.edges[e];
+            neighbours.entry(a).or_default().insert(b);
+            neighbours.entry(b).or_default().insert(a);
+        }
+    }
     // Vertices imprinted here become bar nodes too: a later bar never moves
     // them off the first one.
     let mut bar_nodes: BTreeSet<usize> = axes
@@ -552,7 +564,13 @@ pub fn imprint_surface_vertices(
         if length <= precision {
             continue;
         }
-        let (lo, hi) = (key(a.min(b) - snap), key(a.max(b) + snap));
+        let reach = snap.max(zigzag);
+        let (lo, hi) = (key(a.min(b) - reach), key(a.max(b) + reach));
+        let on_axis = |model: &Model, w: usize| {
+            let p = DVec3::from_array(model.vertices[w]);
+            let t = (p - a).dot(d) / (length * length);
+            (-1e-9..=1. + 1e-9).contains(&t) && (a + d * t).distance(p) <= slack
+        };
         let mut found = vec![];
         for x in lo.0..=hi.0 {
             for y in lo.1..=hi.1 {
@@ -564,9 +582,16 @@ pub fn imprint_surface_vertices(
                         let p = DVec3::from_array(model.vertices[v]);
                         let t = (p - a).dot(d) / (length * length);
                         let off = (a + d * t).distance(p);
+                        let between = || {
+                            neighbours.get(&v).is_some_and(|n| {
+                                n.iter().filter(|&&w| on_axis(model, w)).count() >= 2
+                            })
+                        };
                         if t * length > snap
                             && (1. - t) * length > snap
-                            && (off <= precision || (off <= snap && !bar_nodes.contains(&v)))
+                            && (off <= precision
+                                || (off <= snap && !bar_nodes.contains(&v))
+                                || (off <= zigzag && !bar_nodes.contains(&v) && between()))
                         {
                             found.push((t, v));
                         }
@@ -1684,6 +1709,79 @@ mod tests {
     }
 
     #[test]
+    fn slab_edge_zigzagging_along_a_beam_is_straightened_onto_it() {
+        use super::super::junctions::tests::{build, Placement};
+        for place in Placement::all() {
+            // The slab edge y = 0 has vertices 2 mm off it at x = 1 and 3,
+            // between beam nodes at x = 0, 2, 4: within the 50 mm gap
+            // tolerance both move onto the beam; without it they stay.
+            for (zigzag, moved) in [(0.05, true), (0., false)] {
+                let edge = [
+                    [0., 0., 0.],
+                    [1., 0.002, 0.],
+                    [2., 0., 0.],
+                    [3., 0.002, 0.],
+                    [4., 0., 0.],
+                    [4., 4., 0.],
+                    [0., 4., 0.],
+                ];
+                let mut m = build(&place, &[(vec![edge.to_vec()], [0., 0., 1.])]);
+                let at = |m: &Model, p: [f64; 3]| {
+                    (0..m.vertices.len())
+                        .find(|&v| {
+                            DVec3::from_array(m.vertices[v])
+                                .distance(DVec3::from_array(place.point(p)))
+                                < 1e-9 * place.scale
+                        })
+                        .unwrap()
+                };
+                let nodes = [0., 2., 4.].map(|x| at(&m, [x, 0., 0.]));
+                let (a, b) = (
+                    m.add_vertex(place.point([-1., 0., 0.])).unwrap(),
+                    m.add_vertex(place.point([5., 0., 0.])).unwrap(),
+                );
+                let mut anchors: Vec<(usize, f64)> = vec![(a, 0.), (b, 1.)];
+                anchors.extend(
+                    nodes
+                        .iter()
+                        .zip([1. / 6., 0.5, 5. / 6.])
+                        .map(|(&v, t)| (v, t)),
+                );
+                anchors.sort_by(|x, y| x.1.total_cmp(&y.1));
+                let mut axes = vec![Axis {
+                    source_axis: 0,
+                    endpoints: [a, b],
+                    anchors: anchors
+                        .into_iter()
+                        .map(|(vertex, t)| Anchor {
+                            source_node: vertex as u32,
+                            vertex,
+                            t,
+                        })
+                        .collect(),
+                    spans: vec![],
+                }];
+                let teeth = [1., 3.].map(|x| at(&m, [x, 0.002, 0.]));
+                let source_nodes: Vec<u32> = (0..m.vertices.len() as u32).collect();
+                let r = imprint_surface_vertices(
+                    &mut m,
+                    &mut axes,
+                    &source_nodes,
+                    zigzag * place.scale,
+                );
+                assert_eq!(r.len(), if moved { 2 } else { 0 }, "{r:?}");
+                for (v, x) in teeth.iter().zip([1., 3.]) {
+                    let y = if moved { 0. } else { 0.002 };
+                    let p = DVec3::from_array(m.vertices[*v]);
+                    assert!(
+                        p.distance(DVec3::from_array(place.point([x, y, 0.]))) < 1e-9 * place.scale
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn corner_imprinted_on_one_bar_is_not_moved_off_it_by_another() {
         use super::super::junctions::tests::{build, slab, Placement};
         for place in Placement::all() {
@@ -1713,7 +1811,7 @@ mod tests {
                 })
                 .collect();
             let source_nodes: Vec<u32> = (0..m.vertices.len() as u32).collect();
-            let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes);
+            let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes, 0.);
             let corner = r.iter().find(|c| c.axis == 0).unwrap().vertex;
             assert!(r.iter().all(|c| c.axis == 0 || c.vertex != corner), "{r:?}");
             let p = DVec3::from_array(m.vertices[corner]);
@@ -1760,7 +1858,7 @@ mod tests {
                 }];
                 let source_nodes: Vec<u32> =
                     (0..m.vertices.len() as u32).map(|v| 100 + v).collect();
-                let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes);
+                let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes, 0.);
                 assert_eq!(r.len(), usize::from(imprinted), "{r:?}");
                 if imprinted {
                     let anchors: Vec<_> = axes[0].anchors.iter().map(|x| x.vertex).collect();
