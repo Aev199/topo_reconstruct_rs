@@ -1178,6 +1178,10 @@ pub struct BarTee {
     pub source_axis: usize,
     pub t: f64,
     pub distance: f64,
+    /// The end merged into this node of the bar (its projection fell on
+    /// it) instead of becoming a new node.
+    pub merged_into: Option<usize>,
+    pub merged_into_source_node: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1210,7 +1214,7 @@ pub fn join_bar_tees(
     model: &mut Model,
     bars: &mut Bars<'_>,
     tolerance: f64,
-    _fixed: &BTreeSet<usize>,
+    fixed: &BTreeSet<usize>,
     source_nodes: &[u32],
 ) -> TeeReport {
     let mut report = TeeReport {
@@ -1283,7 +1287,10 @@ pub fn join_bar_tees(
                 reason: reason.into(),
             })
         };
-        // Geometry may have changed by earlier joins.
+        // Geometry may have changed by earlier joins; a merged end is gone.
+        if !bars.axes.iter().any(|a| a.endpoints.contains(&v)) {
+            continue;
+        }
         let Some((distance, u)) = candidate(model, bars.axes, v, k) else {
             continue;
         };
@@ -1291,12 +1298,37 @@ pub fn join_bar_tees(
             let [p, q] = bars.axes[k].endpoints.map(|w| point(model, w));
             p.distance(q)
         };
-        if bars.axes[k]
+        // The projection on a node of the bar: the end merges into it (a
+        // hub of beams beside a beam node), its bars staying straight.
+        if let Some(w) = bars.axes[k]
             .anchors
             .iter()
-            .any(|x| (x.t - u).abs() * length < minimum)
+            .filter(|x| (x.t - u).abs() * length < minimum)
+            .min_by(|x, y| (x.t - u).abs().total_cmp(&(y.t - u).abs()))
+            .map(|x| x.vertex)
         {
-            reject(&mut report, distance, "near_bar_node");
+            if w == v || v >= source_nodes.len() {
+                continue;
+            }
+            let t = bars.axes[k]
+                .anchors
+                .iter()
+                .find(|x| x.vertex == w)
+                .unwrap()
+                .t;
+            let from = point(model, v);
+            match merge(model, bars, v, w, tolerance, fixed) {
+                Ok(_) => report.joined.push(BarTee {
+                    vertex: v,
+                    source_node: source_nodes[v],
+                    source_axis,
+                    t,
+                    distance: point(model, w).distance(from),
+                    merged_into: Some(w),
+                    merged_into_source_node: source_nodes.get(w).copied(),
+                }),
+                Err(reason) => reject(&mut report, distance, &format!("node_merge_{reason}")),
+            }
             continue;
         }
         // A retained node (a simplified hole corner) may move: it stays a
@@ -1363,6 +1395,8 @@ pub fn join_bar_tees(
             source_axis,
             t: u,
             distance,
+            merged_into: None,
+            merged_into_source_node: None,
         });
     }
     report
@@ -1711,13 +1745,12 @@ mod tests {
             // Beam A along y = 1 above a slab; beams B and C meet at a node
             // `off` beside A's span at x = 2. 3 mm off, the node moves onto
             // A (B and C stay straight) and becomes a node of A; 60 mm off,
-            // nothing changes; next to a node of A, it is left alone; exactly
-            // on A, it only becomes a node of A.
+            // nothing changes; exactly on A, it only becomes a node of A;
+            // next to a node of A, it merges into that node.
             for (off, node_on_a, joined) in [
                 (0.003, false, true),
                 (0., false, true),
                 (0.06, false, false),
-                (0.003, true, false),
             ] {
                 let mut m = build(&place, &[slab(0., 4.)]);
                 let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
@@ -1765,9 +1798,43 @@ mod tests {
                         p.distance(DVec3::from_array(place.point([2., 1. + off, 1.])))
                             < 1e-12 * place.scale
                     );
-                    assert_eq!(r.rejected.len(), usize::from(node_on_a));
+                    assert!(r.rejected.is_empty());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn bar_end_beside_a_bar_node_merges_into_it() {
+        for place in Placement::all() {
+            // Beams B and C meet 30 mm beside node `a` of beam A: their end
+            // merges into `a`, both stay straight.
+            let mut m = build(&place, &[slab(0., 4.)]);
+            let v = |m: &mut Model, p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            let (a0, a1) = (v(&mut m, [0., 1., 1.]), v(&mut m, [4., 1., 1.]));
+            let a = v(&mut m, [2., 1., 1.]);
+            let end = v(&mut m, [2.0004, 1.03, 1.]);
+            let (b1, c1) = (v(&mut m, [2., 3., 1.]), v(&mut m, [3., 3., 1.]));
+            let mut axes = vec![
+                spanned([a0, a1], &[(a0, 0.), (a, 0.5), (a1, 1.)], 10),
+                spanned([end, b1], &[(end, 0.), (b1, 1.)], 20),
+                spanned([end, c1], &[(end, 0.), (c1, 1.)], 30),
+            ];
+            let source_nodes = vec![0; m.vertices.len()];
+            let r = join_bar_tees(
+                &mut m,
+                &mut Bars {
+                    axes: &mut axes,
+                    contacts: &mut vec![],
+                },
+                0.05 * place.scale,
+                &BTreeSet::new(),
+                &source_nodes,
+            );
+            assert_eq!(r.joined.len(), 1, "{:?}", r.rejected);
+            assert_eq!(r.joined[0].merged_into, Some(a));
+            assert_eq!((axes[1].endpoints[0], axes[2].endpoints[0]), (a, a));
+            assert_eq!(axes[0].anchors.len(), 3);
         }
     }
 

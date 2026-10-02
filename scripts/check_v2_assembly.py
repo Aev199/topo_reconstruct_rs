@@ -300,6 +300,10 @@ def check(data, baseline=None):
         if c["kind"] == "merged" and c.get("source_node") is not None \
                 and c.get("kept_source_node") is not None:
             merged[c["source_node"]] = c["kept_source_node"]
+    # A bar end merged into a node of another bar (a tee onto a node).
+    for j in (topology.get("bar_tees") or {}).get("joined", []):
+        if j.get("merged_into_source_node") is not None:
+            merged[j["source_node"]] = j["merged_into_source_node"]
     # Collapsed short bars: their nodes merge and their elements are reported.
     for c in topology.get("short_bars", {}).get("collapsed", []):
         if c["dropped_source_node"] is not None and c["kept_source_node"] is not None:
