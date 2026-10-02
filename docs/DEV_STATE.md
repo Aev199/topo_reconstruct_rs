@@ -76,8 +76,10 @@ pass as before (byte-identical where no rule applies). Open:
 - Багратион bedding: mesh valid, 18 bars in a slab plane without contact,
   1 overlapping bar, trial mesh angles (mesher gate false);
 - Багратион v4: frame accepted on the relaxation step, assembly checker
-  passes (1956 bar tees); trial mesh fails at a hub of beams 50 mm beside
-  a beam node joined to it by a 49.99 mm bar (not collapsed).
+  passes, every surface built, 1 of 40 600 bars rejected
+  (axis_direction_conflict), trial mesh topologically valid (2.1 M
+  triangles). Mesher gate: 115 triangles under 1 degree (needles at
+  source/generated vertex pairs micrometres apart), as for ЖК Остров.
 
 Rules added 2026-10-01/02 (geotechnical; deviation from the source is
 allowed, user decision 2026-10-01): over-constrained panel merges only as a
@@ -88,6 +90,15 @@ each other exchange nodes and same-stiffness contained bars are removed as
 duplicates; points within ten precisions are one point (interval ends, bar
 nodes); short bars may shorten within their end budgets; bar nodes slide
 onto an adjacent crossing.
+
+Rules added 2026-10-02 (Багратион v4 mesh): a bar end merging into the
+bar node it projects onto collapses the bar piece joining them; a node of
+one bar next to a bar crossing slides onto it (bars ending there follow);
+a crossing next to another generated crossing is still shared; an invalid
+contour with a hanging node of the source mesh closes its seam (crack
+width, filled-area budget; reported as a `seam` simplified hole); mesh
+promotion of Steiner vertices and edge/bar chain synchronization use the
+point slack (ten precisions) like the assembly.
 
 Speed: frame retries continue one LSQR run (ЖК Остров frame 34 -> 11 min),
 `--v2-frame-cache PATH` reuses a solved frame (development), trial mesh
