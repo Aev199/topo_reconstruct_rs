@@ -935,9 +935,7 @@ pub fn merge_wall_ends(
                     u
                 };
                 let kept_from = model.vertices[w];
-                // Beside the bar within the tolerance and along it within the
-                // minimum edge of the node.
-                match merge(model, bars, v, w, tolerance + minimum, fixed) {
+                match merge(model, bars, v, w, tolerance, fixed) {
                     Ok(movement) => {
                         report.merged.push(MergedVertex {
                             kind: "wall_end_at_vertex".into(),
