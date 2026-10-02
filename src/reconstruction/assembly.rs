@@ -1495,6 +1495,7 @@ fn assemble_impl(
         &mut axis_assembly.axes,
         &vertex_source_nodes,
         features.map_or(0., |f| f.maximum_gap),
+        source.policy.angle,
     );
     if features.is_some() {
         let mut crossings = bars::imprint_crossings(&mut model, &mut axis_assembly.axes);

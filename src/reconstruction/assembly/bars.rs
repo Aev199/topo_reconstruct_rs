@@ -83,7 +83,9 @@ pub struct Imprint {
     /// `NO_SOURCE_NODE` for a crossing.
     pub source_node: u32,
     pub t: f64,
-    /// `surface_vertex` (a surface vertex on the axis), `crossing` (the
+    /// `surface_vertex` (a surface vertex on the axis),
+    /// `merged_surface_vertex` (a surface vertex merged into the bar node
+    /// next to it; `source_node` is the dropped one), `crossing` (the
     /// bar passes through the surface), `slid_anchor` (a bar node slid
     /// along its bar onto the crossing next to it), `bar_crossing` (a
     /// vertex shared with a crossing bar) or `shared_node` (a node of a
@@ -513,14 +515,16 @@ pub fn imprint_surface_vertices(
     axes: &mut [Axis],
     source_nodes: &[u32],
     zigzag: f64,
+    angle: f64,
 ) -> Vec<Imprint> {
     let precision = model.precision;
     let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * precision;
     // A vertex nearly on the axis (within the minimum edge, e.g. a slab
     // edge 1 um off a beam along it) is moved onto the axis when it stays
     // on all its planes; bar nodes themselves never move here. A contour
-    // vertex between two contour neighbours on the axis (a slab edge along
-    // a beam zigzagging a few millimetres off it) moves within `zigzag`.
+    // vertex between two contour neighbours on the axis, or next to one
+    // along an edge within `angle` of the axis (a slab edge along a beam
+    // zigzagging or kinked a few millimetres off it), moves within `zigzag`.
     let snap = model.minimum_edge;
     let used: BTreeSet<usize> = (0..model.surfaces.len())
         .flat_map(|s| model.surface_edges(s).collect::<Vec<_>>())
@@ -582,9 +586,17 @@ pub fn imprint_surface_vertices(
                         let p = DVec3::from_array(model.vertices[v]);
                         let t = (p - a).dot(d) / (length * length);
                         let off = (a + d * t).distance(p);
+                        // Between two neighbours on the axis, or next to one
+                        // along an edge within the recognition angle of it.
                         let between = || {
                             neighbours.get(&v).is_some_and(|n| {
-                                n.iter().filter(|&&w| on_axis(model, w)).count() >= 2
+                                let on: Vec<usize> =
+                                    n.iter().copied().filter(|&w| on_axis(model, w)).collect();
+                                on.len() >= 2
+                                    || on.iter().any(|&w| {
+                                        let e = p - DVec3::from_array(model.vertices[w]);
+                                        e.normalize().cross(d / length).length() <= angle.sin()
+                                    })
                             })
                         };
                         if t * length > snap
@@ -602,12 +614,31 @@ pub fn imprint_surface_vertices(
         found.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
         found.dedup_by(|x, y| x.1 == y.1);
         for (t, v) in found {
-            // Not next to an existing anchor (that would be a coincident node).
-            if axes[i]
+            // Next to an existing node of the bar: the surface vertex is that
+            // node (merged into it) when it is not a bar node itself.
+            if let Some(w) = axes[i]
                 .anchors
                 .iter()
-                .any(|x| (x.t - t).abs() * length <= snap)
+                .find(|x| (x.t - t).abs() * length <= snap)
+                .map(|x| x.vertex)
             {
+                let movement = DVec3::from_array(model.vertices[v])
+                    .distance(DVec3::from_array(model.vertices[w]));
+                if w != v
+                    && !bar_nodes.contains(&v)
+                    && movement <= snap.max(zigzag)
+                    && model.merge_vertices(v, w).is_ok()
+                {
+                    out.push(Imprint {
+                        axis: i,
+                        vertex: w,
+                        source_node: source_nodes[v],
+                        t,
+                        kind: "merged_surface_vertex".into(),
+                        surface: None,
+                        movement,
+                    });
+                }
                 continue;
             }
             let q = a + d * t;
@@ -1768,6 +1799,7 @@ mod tests {
                     &mut axes,
                     &source_nodes,
                     zigzag * place.scale,
+                    0.02,
                 );
                 assert_eq!(r.len(), if moved { 2 } else { 0 }, "{r:?}");
                 for (v, x) in teeth.iter().zip([1., 3.]) {
@@ -1778,6 +1810,137 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn slab_edge_kinked_off_a_beam_is_straightened_onto_it() {
+        use super::super::junctions::tests::{build, Placement};
+        for place in Placement::all() {
+            // The slab edge leaves the beam (y = 0) at x = 2 and reaches
+            // x = 3 at y = off: 2 mm off (0.1 degrees) the vertex moves onto
+            // the beam; 40 mm off (2.3 degrees, a real turn) it stays.
+            for (off, moved) in [(0.002, true), (0.04, false)] {
+                let ring = vec![
+                    [0., 0., 0.],
+                    [2., 0., 0.],
+                    [3., off, 0.],
+                    [3., 4., 0.],
+                    [0., 4., 0.],
+                ];
+                let mut m = build(&place, &[(vec![ring], [0., 0., 1.])]);
+                let at = |m: &Model, p: [f64; 3]| {
+                    (0..m.vertices.len())
+                        .find(|&v| {
+                            DVec3::from_array(m.vertices[v])
+                                .distance(DVec3::from_array(place.point(p)))
+                                < 1e-9 * place.scale
+                        })
+                        .unwrap()
+                };
+                let nodes = [0., 2.].map(|x| at(&m, [x, 0., 0.]));
+                let kink = at(&m, [3., off, 0.]);
+                let (a, b) = (
+                    m.add_vertex(place.point([-1., 0., 0.])).unwrap(),
+                    m.add_vertex(place.point([5., 0., 0.])).unwrap(),
+                );
+                let anchors = [(a, 0.), (nodes[0], 1. / 6.), (nodes[1], 0.5), (b, 1.)];
+                let mut axes = vec![Axis {
+                    source_axis: 0,
+                    endpoints: [a, b],
+                    anchors: anchors
+                        .into_iter()
+                        .map(|(vertex, t)| Anchor {
+                            source_node: vertex as u32,
+                            vertex,
+                            t,
+                        })
+                        .collect(),
+                    spans: vec![],
+                }];
+                let source_nodes: Vec<u32> = (0..m.vertices.len() as u32).collect();
+                let r = imprint_surface_vertices(
+                    &mut m,
+                    &mut axes,
+                    &source_nodes,
+                    0.05 * place.scale,
+                    0.02,
+                );
+                assert_eq!(r.iter().any(|c| c.vertex == kink), moved, "{r:?}");
+                let y = if moved { 0. } else { off };
+                let p = DVec3::from_array(m.vertices[kink]);
+                assert!(
+                    p.distance(DVec3::from_array(place.point([3., y, 0.]))) < 1e-9 * place.scale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slab_vertex_next_to_a_beam_node_is_merged_into_it() {
+        use super::super::junctions::tests::{build, Placement};
+        for place in Placement::all() {
+            // The slab edge kinks 2 mm off the beam at x = 3, where the beam
+            // already has a node: the contour vertex becomes that node.
+            let ring = vec![
+                [0., 0., 0.],
+                [2., 0., 0.],
+                [3., 0.002, 0.],
+                [3., 4., 0.],
+                [0., 4., 0.],
+            ];
+            let mut m = build(&place, &[(vec![ring], [0., 0., 1.])]);
+            let at = |m: &Model, p: [f64; 3]| {
+                (0..m.vertices.len())
+                    .find(|&v| {
+                        DVec3::from_array(m.vertices[v]).distance(DVec3::from_array(place.point(p)))
+                            < 1e-9 * place.scale
+                    })
+                    .unwrap()
+            };
+            let nodes = [0., 2.].map(|x| at(&m, [x, 0., 0.]));
+            let kink = at(&m, [3., 0.002, 0.]);
+            let mut v = |p: [f64; 3]| m.add_vertex(place.point(p)).unwrap();
+            let (a, b, node) = (v([-1., 0., 0.]), v([5., 0., 0.]), v([3., 0., 0.]));
+            let anchors = [
+                (a, 0.),
+                (nodes[0], 1. / 6.),
+                (nodes[1], 0.5),
+                (node, 4. / 6.),
+                (b, 1.),
+            ];
+            let mut axes = vec![Axis {
+                source_axis: 0,
+                endpoints: [a, b],
+                anchors: anchors
+                    .into_iter()
+                    .map(|(vertex, t)| Anchor {
+                        source_node: vertex as u32,
+                        vertex,
+                        t,
+                    })
+                    .collect(),
+                spans: vec![],
+            }];
+            let source_nodes: Vec<u32> = (0..m.vertices.len() as u32).collect();
+            let r = imprint_surface_vertices(
+                &mut m,
+                &mut axes,
+                &source_nodes,
+                0.05 * place.scale,
+                0.02,
+            );
+            let merged: Vec<_> = r
+                .iter()
+                .filter(|c| c.kind == "merged_surface_vertex")
+                .collect();
+            assert_eq!(merged.len(), 1, "{r:?}");
+            assert_eq!(
+                (merged[0].vertex, merged[0].source_node),
+                (node, kink as u32)
+            );
+            assert!(m.surface_edges(0).any(|e| m.edges[e].contains(&node)));
+            assert!(!m.surface_edges(0).any(|e| m.edges[e].contains(&kink)));
         }
     }
 
@@ -1811,7 +1974,7 @@ mod tests {
                 })
                 .collect();
             let source_nodes: Vec<u32> = (0..m.vertices.len() as u32).collect();
-            let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes, 0.);
+            let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes, 0., 0.02);
             let corner = r.iter().find(|c| c.axis == 0).unwrap().vertex;
             assert!(r.iter().all(|c| c.axis == 0 || c.vertex != corner), "{r:?}");
             let p = DVec3::from_array(m.vertices[corner]);
@@ -1858,7 +2021,7 @@ mod tests {
                 }];
                 let source_nodes: Vec<u32> =
                     (0..m.vertices.len() as u32).map(|v| 100 + v).collect();
-                let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes, 0.);
+                let r = imprint_surface_vertices(&mut m, &mut axes, &source_nodes, 0., 0.02);
                 assert_eq!(r.len(), usize::from(imprinted), "{r:?}");
                 if imprinted {
                     let anchors: Vec<_> = axes[0].anchors.iter().map(|x| x.vertex).collect();

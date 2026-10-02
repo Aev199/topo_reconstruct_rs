@@ -230,7 +230,7 @@ def check(data, baseline=None):
     for c in bars.get("imprinted", []):
         # A surface vertex moved onto a bar (a slab edge zigzagging along a
         # beam, within the gap tolerance).
-        if c["kind"] == "surface_vertex":
+        if c["kind"] in ("surface_vertex", "merged_surface_vertex"):
             assert 0. <= c["movement"] <= max(features.get("maximum_gap", 0.),
                                                topology["policy"]["minimum_edge"]) + epsilon
             closures.append((c["source_node"], c["movement"]))
@@ -323,6 +323,12 @@ def check(data, baseline=None):
         if c["kind"] == "merged" and c.get("source_node") is not None \
                 and c.get("kept_source_node") is not None:
             merged[c["source_node"]] = c["kept_source_node"]
+    # A surface vertex merged into the bar node next to it.
+    for c in bars.get("imprinted", []):
+        if c["kind"] == "merged_surface_vertex":
+            kept = source_nodes[c["vertex"]] if c["vertex"] < len(source_nodes) else None
+            if kept is not None and kept != 4294967295:
+                merged[c["source_node"]] = kept
     # A bar end merged into a node of another bar (a tee onto a node).
     for j in (topology.get("bar_tees") or {}).get("joined", []):
         if j.get("merged_into_source_node") is not None:
