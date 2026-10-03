@@ -1498,6 +1498,7 @@ fn assemble_impl(
                 &mut model,
                 features.maximum_gap,
                 &locked,
+                &axis_assembly.axes,
                 &vertex_source_nodes,
             )
         }

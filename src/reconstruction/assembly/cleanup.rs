@@ -1534,6 +1534,9 @@ pub struct GeneralizedContours {
     /// Vertices kept although selected, because removing them would make a
     /// contour invalid.
     pub kept: usize,
+    /// Vertices kept because the shortcut would sweep over another contour,
+    /// junction line, bar or vertex.
+    pub blocked: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -1588,6 +1591,7 @@ pub fn generalize_contours(
     model: &mut Model,
     tolerance: f64,
     locked: &BTreeSet<usize>,
+    axes: &[Axis],
     source_nodes: &[u32],
 ) -> GeneralizedContours {
     let mut report = GeneralizedContours {
@@ -1663,6 +1667,24 @@ pub fn generalize_contours(
         }
     }
     report.chains = chains.len();
+    let bar_pieces = axes.iter().flat_map(|axis| {
+        let mut nodes: Vec<(f64, usize)> = axis.anchors.iter().map(|a| (a.t, a.vertex)).collect();
+        nodes.push((0., axis.endpoints[0]));
+        nodes.push((1., axis.endpoints[1]));
+        nodes.sort_by(|a, b| a.0.total_cmp(&b.0));
+        nodes.dedup_by_key(|n| n.1);
+        nodes
+            .windows(2)
+            .filter(|w| w[0].1 != w[1].1)
+            .map(|w| [w[0].1, w[1].1])
+            .collect::<Vec<_>>()
+    });
+    let segments: Vec<[usize; 2]> = users
+        .keys()
+        .map(|&e| model.edges[e])
+        .chain(bar_pieces)
+        .collect();
+    let mut obstacles = Obstacles::new(model, segments.into_iter(), 20. * tolerance);
     for chain in chains {
         if chain.len() < 3 {
             continue;
@@ -1706,11 +1728,20 @@ pub fn generalize_contours(
         };
         keep.insert(0);
         keep.insert(chain.len() - 1);
+        let mut survivors = vec![0];
         for i in 1..chain.len() - 1 {
             if keep.contains(&i) {
+                survivors.push(i);
                 continue;
             }
             let v = chain[i];
+            // Current neighbours: the last surviving vertex and the next one.
+            let (prev, next) = (chain[*survivors.last().unwrap()], chain[i + 1]);
+            if obstacles.blocks(model, prev, v, next) {
+                survivors.push(i);
+                report.blocked += 1;
+                continue;
+            }
             // Distance from the generalized segment holding it.
             let lo = *keep.range(..i).next_back().unwrap();
             let hi = *keep.range(i..).next().unwrap();
@@ -1720,18 +1751,189 @@ pub fn generalize_contours(
                 ((points[i] - a).dot(d) / d.length_squared().max(f64::MIN_POSITIVE)).clamp(0., 1.);
             let deviation = points[i].distance(a + d * t);
             if model.remove_vertex(v, f64::MAX).is_ok() {
+                obstacles.replace(model, [prev, v], [v, next], [prev, next]);
                 report.removed.push(GeneralizedVertex {
                     vertex: v,
                     source_node: source_nodes.get(v).copied(),
                     deviation,
                 });
             } else {
-                keep.insert(i);
+                survivors.push(i);
                 report.kept += 1;
             }
         }
     }
     report
+}
+
+/// Segments other contours must keep clear of: used edges and bar pieces,
+/// hashed on a grid.
+struct Obstacles {
+    cell: f64,
+    slack: f64,
+    grid: std::collections::HashMap<[i64; 3], Vec<[usize; 2]>>,
+    alive: BTreeSet<[usize; 2]>,
+}
+
+fn key(a: usize, b: usize) -> [usize; 2] {
+    [a.min(b), a.max(b)]
+}
+
+impl Obstacles {
+    fn new(model: &Model, segments: impl Iterator<Item = [usize; 2]>, cell: f64) -> Self {
+        let mut o = Obstacles {
+            cell,
+            slack: model.precision * crate::reconstruction::mesh::ENDPOINT_SLACK,
+            grid: Default::default(),
+            alive: BTreeSet::new(),
+        };
+        for [a, b] in segments {
+            o.insert(model, key(a, b));
+        }
+        o
+    }
+    fn cells(&self, lo: DVec3, hi: DVec3) -> impl Iterator<Item = [i64; 3]> {
+        let (lo, hi) = (
+            ((lo - self.slack) / self.cell).floor().as_i64vec3(),
+            ((hi + self.slack) / self.cell).floor().as_i64vec3(),
+        );
+        (lo.x..=hi.x).flat_map(move |x| {
+            (lo.y..=hi.y).flat_map(move |y| (lo.z..=hi.z).map(move |z| [x, y, z]))
+        })
+    }
+    fn insert(&mut self, model: &Model, k: [usize; 2]) {
+        if !self.alive.insert(k) {
+            return;
+        }
+        let (a, b) = (
+            DVec3::from_array(model.vertices[k[0]]),
+            DVec3::from_array(model.vertices[k[1]]),
+        );
+        let cells: Vec<[i64; 3]> = self.cells(a.min(b), a.max(b)).collect();
+        for c in cells {
+            self.grid.entry(c).or_default().push(k);
+        }
+    }
+    fn replace(&mut self, model: &Model, a: [usize; 2], b: [usize; 2], new: [usize; 2]) {
+        self.alive.remove(&key(a[0], a[1]));
+        self.alive.remove(&key(b[0], b[1]));
+        self.insert(model, key(new[0], new[1]));
+    }
+    /// Whether replacing `p - v - q` by `p - q` sweeps over another segment
+    /// or vertex (it would overlap or touch another contour or bar).
+    fn blocks(&self, model: &Model, p: usize, v: usize, q: usize) -> bool {
+        let at = |x: usize| DVec3::from_array(model.vertices[x]);
+        let tri = [at(p), at(v), at(q)];
+        let lo = tri[0].min(tri[1]).min(tri[2]);
+        let hi = tri[0].max(tri[1]).max(tri[2]);
+        let own = [key(p, v), key(v, q), key(p, q)];
+        let mut tested = BTreeSet::new();
+        for c in self.cells(lo, hi) {
+            for &k in self.grid.get(&c).into_iter().flatten() {
+                if own.contains(&k) || !self.alive.contains(&k) || !tested.insert(k) {
+                    continue;
+                }
+                let [a, b] = k;
+                let shared = [a, b].iter().position(|&x| x == p || x == q);
+                let hit = match shared {
+                    // Touching at a kept end: the far end must stay clear,
+                    // and the segment must not cross the opposite side.
+                    Some(i) => {
+                        let (end, far) = if i == 0 { (a, b) } else { (b, a) };
+                        let side = if end == p {
+                            [tri[1], tri[2]]
+                        } else {
+                            [tri[0], tri[1]]
+                        };
+                        point_triangle_distance(at(far), tri) <= self.slack
+                            || segment_distance(at(end), at(far), side[0], side[1]) <= self.slack
+                    }
+                    None => segment_triangle_distance(at(a), at(b), tri) <= self.slack,
+                };
+                if hit {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn closest_on_segment(p: DVec3, a: DVec3, b: DVec3) -> DVec3 {
+    let d = b - a;
+    let t = if d.length_squared() > 0. {
+        ((p - a).dot(d) / d.length_squared()).clamp(0., 1.)
+    } else {
+        0.
+    };
+    a + d * t
+}
+
+/// Distance between segments `a b` and `c d`.
+fn segment_distance(a: DVec3, b: DVec3, c: DVec3, d: DVec3) -> f64 {
+    let (u, v, w) = (b - a, d - c, a - c);
+    let (aa, bb, cc, dd, ee) = (u.dot(u), u.dot(v), v.dot(v), u.dot(w), v.dot(w));
+    let den = aa * cc - bb * bb;
+    let mut s = if den > 1e-30 * aa * cc && den > 0. {
+        ((bb * ee - cc * dd) / den).clamp(0., 1.)
+    } else {
+        0.
+    };
+    let mut t = if cc > 0. { (bb * s + ee) / cc } else { 0. };
+    if t < 0. || t > 1. {
+        t = t.clamp(0., 1.);
+        s = if aa > 0. {
+            ((bb * t - dd) / aa).clamp(0., 1.)
+        } else {
+            0.
+        };
+    }
+    let best = (a + u * s).distance(c + v * t);
+    // Guard against the degenerate (parallel) branch.
+    best.min(closest_on_segment(a, c, d).distance(a))
+        .min(closest_on_segment(b, c, d).distance(b))
+        .min(closest_on_segment(c, a, b).distance(c))
+        .min(closest_on_segment(d, a, b).distance(d))
+}
+
+fn point_triangle_distance(p: DVec3, [a, b, c]: [DVec3; 3]) -> f64 {
+    let n = (b - a).cross(c - a);
+    let edges = closest_on_segment(p, a, b)
+        .distance(p)
+        .min(closest_on_segment(p, b, c).distance(p))
+        .min(closest_on_segment(p, c, a).distance(p));
+    if n.length_squared() == 0. {
+        return edges;
+    }
+    let inside = [(a, b), (b, c), (c, a)]
+        .iter()
+        .all(|&(x, y)| (y - x).cross(p - x).dot(n) >= 0.);
+    if inside {
+        ((p - a).dot(n) / n.length()).abs()
+    } else {
+        edges
+    }
+}
+
+fn segment_triangle_distance(a: DVec3, b: DVec3, tri: [DVec3; 3]) -> f64 {
+    let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]);
+    if n.length_squared() > 0. {
+        let (da, db) = ((a - tri[0]).dot(n), (b - tri[0]).dot(n));
+        if da * db < 0. {
+            let x = a + (b - a) * (da / (da - db));
+            if [(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])]
+                .iter()
+                .all(|&(x0, y0)| (y0 - x0).cross(x - x0).dot(n) >= 0.)
+            {
+                return 0.;
+            }
+        }
+    }
+    point_triangle_distance(a, tri)
+        .min(point_triangle_distance(b, tri))
+        .min(segment_distance(a, b, tri[0], tri[1]))
+        .min(segment_distance(a, b, tri[1], tri[2]))
+        .min(segment_distance(a, b, tri[2], tri[0]))
 }
 
 /// Remove redundant collinear vertices bounding edges shorter than
@@ -1877,7 +2079,7 @@ mod tests {
                 })
                 .unwrap();
             let locked = BTreeSet::from([middle]);
-            let r = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[]);
+            let r = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[], &[]);
             assert_eq!(r.removed.len(), 3, "{r:?}");
             assert_eq!(r.kept, 0);
             assert!(r
@@ -1893,8 +2095,35 @@ mod tests {
             assert_eq!(shared.len(), 2);
             assert!(shared.iter().all(|&e| m.edges[e].contains(&middle)));
             // Idempotent.
-            let again = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[]);
+            let again = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[], &[]);
             assert!(again.removed.is_empty());
+        }
+    }
+
+    #[test]
+    fn generalization_never_sweeps_over_a_neighbour() {
+        // A 3 mm notch in a slab edge holds the corner of a separate slab;
+        // straightening the edge would overlap it.
+        let a = vec![
+            [0., 0., 0.],
+            [2., 0., 0.],
+            [2., 4., 0.],
+            [0., 4., 0.],
+            [0.003, 2., 0.],
+        ];
+        let c = vec![[-1., 1., 0.], [0.001, 2., 0.], [-1., 3., 0.]];
+        for place in Placement::all() {
+            let mut m = build(
+                &place,
+                &[
+                    (vec![a.clone()], [0., 0., 1.]),
+                    (vec![c.clone()], [0., 0., 1.]),
+                ],
+            );
+            let r = generalize_contours(&mut m, 0.05 * place.scale, &BTreeSet::new(), &[], &[]);
+            assert!(r.removed.is_empty(), "{r:?}");
+            assert_eq!(r.blocked, 1);
+            assert_eq!(m.surfaces[0].boundaries[0].len(), 5);
         }
     }
 
