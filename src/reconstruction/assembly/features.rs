@@ -302,15 +302,21 @@ pub(super) fn simplify(
         // and narrower than the minimum opening, which is filled anyway.
         let degenerate =
             candidate_area <= precision * precision && source_width < policy.minimum_opening_width;
-        if source_valid
-            && (degenerate
-                || (collapsed || crack)
-                    && exterior_area > 0.
-                    && filled + source_area <= policy.maximum_filled_area_ratio * exterior_area)
+        // Collinear in the source already (a hanging node on a neighbouring
+        // element's edge): a seam of the source mesh, not an opening.
+        let seam = source_width <= precision;
+        if seam
+            || source_valid
+                && (degenerate
+                    || (collapsed || crack)
+                        && exterior_area > 0.
+                        && filled + source_area <= policy.maximum_filled_area_ratio * exterior_area)
         {
             filled += source_area;
             changes.push(SimplifiedHole {
-                reason: if collapsed || degenerate {
+                reason: if seam {
+                    "seam"
+                } else if collapsed || degenerate {
                     "collapsed_opening"
                 } else {
                     "crack_void"
@@ -368,6 +374,39 @@ mod tests {
             assert_eq!(changes.len(), filled);
             assert_eq!(loops.len(), 2 - filled);
         }
+    }
+
+    #[test]
+    fn a_collinear_source_ring_is_a_seam() {
+        // A hanging node on an edge leaves a ring of three collinear nodes.
+        let mut mesh = MeshData::default();
+        for (id, p) in [
+            (1, [0., 0., 0.]),
+            (2, [4., 0., 0.]),
+            (3, [4., 4., 0.]),
+            (4, [0., 4., 0.]),
+            (5, [1., 1., 0.]),
+            (6, [2.5, 1., 0.]),
+            (7, [1.7, 1., 0.]),
+        ] {
+            mesh.nodes.insert(id, DVec3::from_array(p));
+        }
+        let points: BTreeMap<u32, DVec3> = mesh.nodes.iter().map(|(&k, &v)| (k, v)).collect();
+        let plane = PlaneFrame::new([0., 0., 0.], [0., 0., 1.]).unwrap();
+        let mut loops = vec![vec![1, 2, 3, 4], vec![5, 6, 7]];
+        let changes = simplify(
+            &mut loops,
+            &mesh,
+            &points,
+            &plane,
+            1e-6,
+            &FeaturePolicy::default(),
+            0,
+            &[1],
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].reason, "seam");
+        assert_eq!(loops.len(), 1);
     }
 
     #[test]
