@@ -31,6 +31,30 @@ impl ElementData {
     }
 }
 
+/// Node pairs a non-shell element ties together (bars, rigid links,
+/// two-node elastic links such as LIRA type 55), plus `groups` of nodes
+/// moving together (absolutely rigid bodies: master node first). Structures
+/// tied this way are joined, never left apart as at an expansion joint.
+pub fn node_links(mesh: &MeshData, groups: &[Vec<u32>]) -> Vec<[u32; 2]> {
+    let mut links: Vec<[u32; 2]> = mesh
+        .elements
+        .iter()
+        .filter(|e| !e.is_shell() && e.nodes.len() >= 2)
+        .flat_map(|e| e.nodes[1..].iter().map(move |&n| [e.nodes[0], n]))
+        .chain(
+            groups
+                .iter()
+                .filter(|g| g.len() >= 2)
+                .flat_map(|g| g[1..].iter().map(move |&n| [g[0], n])),
+        )
+        .filter(|[a, b]| a != b)
+        .map(|[a, b]| [a.min(b), a.max(b)])
+        .collect();
+    links.sort_unstable();
+    links.dedup();
+    links
+}
+
 /// Bar elements whose numerically given stiffness (EF, EIy, EIz, ...) no
 /// real section has: the radius of gyration sqrt(EI / EF) exceeds both the
 /// element length and 1 m (model units, metres; a solid section 3 m deep
@@ -65,6 +89,27 @@ pub fn rigid_links(mesh: &MeshData, stiffness: &HashMap<u32, Vec<f64>>) -> Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_tie_bars_springs_and_rigid_bodies_but_not_shells() {
+        let element = |id, elem_type, nodes: Vec<u32>| ElementData {
+            id,
+            elem_type,
+            stiff_id: 1,
+            nodes,
+        };
+        let mesh = MeshData {
+            nodes: Default::default(),
+            elements: vec![
+                element(1, 44, vec![1, 2, 3, 4]),
+                element(2, 10, vec![5, 4]),
+                element(3, 55, vec![6, 7]),
+                element(4, 56, vec![8]),
+            ],
+        };
+        let links = node_links(&mesh, &[vec![9, 10, 11]]);
+        assert_eq!(links, vec![[4, 5], [6, 7], [9, 10], [9, 11]]);
+    }
 
     #[test]
     fn bar_with_a_gyration_radius_beyond_its_length_is_a_rigid_link() {

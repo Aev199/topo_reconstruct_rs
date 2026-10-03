@@ -1368,6 +1368,39 @@ fn assemble_impl(
     }
     let (_, _, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
+    // Pairs of surfaces tied by links of the analysis model.
+    let connected: BTreeSet<[usize; 2]> = match features {
+        Some(features) if !features.connections.is_empty() => {
+            let nodes: std::collections::HashMap<u32, &Vec<u32>> =
+                mesh.elements.iter().map(|e| (e.id, &e.nodes)).collect();
+            let mut node_surfaces = std::collections::HashMap::<u32, Vec<usize>>::new();
+            for (s, surface) in model.surfaces.iter().enumerate() {
+                for e in &surface.source_elements {
+                    for &n in nodes.get(e).into_iter().flat_map(|v| v.iter()) {
+                        let list = node_surfaces.entry(n).or_default();
+                        if list.last() != Some(&s) {
+                            list.push(s);
+                        }
+                    }
+                }
+            }
+            let empty = vec![];
+            features
+                .connections
+                .iter()
+                .flat_map(|[a, b]| {
+                    let (sa, sb) = (
+                        node_surfaces.get(a).unwrap_or(&empty),
+                        node_surfaces.get(b).unwrap_or(&empty),
+                    );
+                    sa.iter()
+                        .flat_map(move |&x| sb.iter().map(move |&y| [x.min(y), x.max(y)]))
+                        .filter(|[x, y]| x != y)
+                })
+                .collect()
+        }
+        _ => BTreeSet::new(),
+    };
     let gaps = match features {
         Some(features) if features.maximum_gap > 0. => gaps::close_keeping_joints(
             &mut model,
@@ -1379,6 +1412,7 @@ fn assemble_impl(
             features.close_offset_gaps,
             // Gaps up to the crack width are defects of the source mesh.
             features.maximum_crack_width,
+            &connected,
             &fixed,
             &vertex_source_nodes,
             &vertex_source_nodes

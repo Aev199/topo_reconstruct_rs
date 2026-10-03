@@ -295,7 +295,14 @@ fn touches(model: &Model, g: &Gap) -> bool {
 /// Contour vertices of the surfaces of `v` (other than `s`) reached along
 /// their contours from `v` while the in-plane gap to `s` stays within a
 /// quarter of `width`; the length of that run.
-fn joint_length(model: &Model, v: usize, s: usize, width: f64, members: &BTreeSet<usize>) -> f64 {
+fn joint_length(
+    model: &Model,
+    v: usize,
+    s: usize,
+    width: f64,
+    members: &BTreeSet<usize>,
+    connected: &BTreeSet<[usize; 2]>,
+) -> f64 {
     let same = |w: usize| {
         gap(model, w, s, members).is_some_and(|g| {
             g.height.abs() <= model.minimum_edge && (g.outside - width).abs() <= 0.25 * width
@@ -304,7 +311,8 @@ fn joint_length(model: &Model, v: usize, s: usize, width: f64, members: &BTreeSe
     let at = |w: usize| DVec3::from_array(model.vertices[w]);
     let mut best = 0f64;
     for u in cleanup::users(model, v) {
-        if u == s {
+        // Surfaces tied in the analysis model are one structure.
+        if u == s || connected.contains(&[u.min(s), u.max(s)]) {
             continue;
         }
         for ring in &model.surfaces[u].boundaries {
@@ -360,6 +368,7 @@ pub fn close(
         tolerance,
         offsets,
         f64::INFINITY,
+        &BTreeSet::new(),
         fixed,
         source_nodes,
         frame_points,
@@ -370,7 +379,9 @@ pub fn close(
 /// [`close`], keeping expansion joints: an in-plane gap wider than
 /// `joint_width` along a contour of constant width at least twenty widths
 /// long (two slabs side by side with a 30 mm strip between them) is a
-/// joint of the structure, not a defect, and stays open.
+/// joint of the structure, not a defect, and stays open, unless the
+/// analysis model ties the two surfaces (`connected` pairs of surfaces:
+/// links, rigid bodies or bars across the gap, as at a balcony).
 #[allow(clippy::too_many_arguments)]
 pub fn close_keeping_joints(
     model: &mut Model,
@@ -378,6 +389,7 @@ pub fn close_keeping_joints(
     tolerance: f64,
     offsets: bool,
     joint_width: f64,
+    connected: &BTreeSet<[usize; 2]>,
     fixed: &BTreeSet<usize>,
     source_nodes: &[u32],
     frame_points: &[[f64; 3]],
@@ -431,7 +443,8 @@ pub fn close_keeping_joints(
                     if eligible(model, v, s, &g) {
                         let joint = g.height.abs() <= model.minimum_edge
                             && g.outside > joint_width
-                            && joint_length(model, v, s, g.outside, &members) >= 20. * g.outside;
+                            && joint_length(model, v, s, g.outside, &members, connected)
+                                >= 20. * g.outside;
                         if !joint {
                             gaps.push((g.distance.max(g.depth), v, s));
                         } else if tried.insert((v, s)) {
@@ -556,6 +569,7 @@ mod tests {
                 true,
                 0.01 * place.scale,
                 &BTreeSet::new(),
+                &BTreeSet::new(),
                 &[],
                 &before,
                 f64::MAX,
@@ -564,6 +578,21 @@ mod tests {
             assert_eq!(r.rejected.len(), 4);
             assert!(r.rejected.iter().all(|x| x.reason == "expansion_joint"));
             assert_eq!(m.vertices, before);
+            // The same strip with the slabs tied (a balcony on links): closed.
+            let r = close_keeping_joints(
+                &mut m,
+                &mut no_bars(),
+                0.05 * place.scale,
+                true,
+                0.01 * place.scale,
+                &BTreeSet::from([[0, 1]]),
+                &BTreeSet::new(),
+                &[],
+                &before,
+                f64::MAX,
+            );
+            assert!(r.rejected.iter().all(|x| x.reason != "expansion_joint"));
+            assert!(!r.closed.is_empty());
             // One corner 30 mm off, the other edge end touching: closed.
             let tilted = (
                 vec![vec![
@@ -582,6 +611,7 @@ mod tests {
                 0.05 * place.scale,
                 true,
                 0.01 * place.scale,
+                &BTreeSet::new(),
                 &BTreeSet::new(),
                 &[],
                 &before,

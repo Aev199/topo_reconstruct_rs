@@ -198,6 +198,13 @@ fn run_v2_preview(
         clock = Instant::now();
     };
     let mut mesh = V2LiraParser::parse(input)?;
+    // Ties between structures in the analysis model (before rigid links are
+    // dropped): structures tied together are joined, not kept apart.
+    let connections = if preserve_details {
+        vec![]
+    } else {
+        topo_reconstruct_rs::input::node_links(&mesh, &V2LiraParser::parse_rigid_bodies(input)?)
+    };
     // Rigid links of the analysis model (fans spreading a column into a
     // slab, offsets) are not structures: geotechnical mode leaves them out.
     let rigid_links = if preserve_details {
@@ -360,6 +367,7 @@ fn run_v2_preview(
                     .collect(),
                 maximum_simplification: tolerances.simplification_cap,
                 minimum_opening_width: tolerances.min_opening,
+                connections,
                 ..Default::default()
             },
         )?

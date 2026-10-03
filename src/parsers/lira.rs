@@ -149,6 +149,29 @@ impl LiraParser {
             .collect()
     }
 
+    /// Абсолютно жёсткие тела (блок 25/): группы узлов, первый — ведущий.
+    /// Файл без блока даёт пустой список.
+    pub fn parse_rigid_bodies<P: AsRef<Path>>(filepath: P) -> io::Result<Vec<Vec<u32>>> {
+        let file = File::open(filepath)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self::rigid_bodies_bytes(&mmap))
+    }
+
+    fn rigid_bodies_bytes(content: &[u8]) -> Vec<Vec<u32>> {
+        let Some(block) = Self::extract_block(content, b"25") else {
+            return vec![];
+        };
+        block
+            .split(|&b| b == b'/')
+            .filter_map(|row| {
+                let nodes: Option<Vec<u32>> = Self::split_ascii_whitespace_bytes(row)
+                    .map(|w| std::str::from_utf8(w).ok()?.parse::<u32>().ok())
+                    .collect();
+                nodes.filter(|n| n.len() >= 2)
+            })
+            .collect()
+    }
+
     /// Толщины пластин и габариты сечений стержней (блок 3/), в метрах:
     /// `GEI E nu H` — пластина толщиной H (м), `S0 E b h` — прямоугольное
     /// сечение b x h (см). Прочие жёсткости пропускаются.
@@ -301,6 +324,12 @@ mod tests {
         assert!(!mesh.elements[1].is_shell());
         assert!(!mesh.elements[1].is_bar());
         assert!(mesh.elements[2].is_shell());
+    }
+    #[test]
+    fn rigid_bodies_are_node_groups_of_block_25() {
+        let groups =
+            LiraParser::rigid_bodies_bytes(b"(4/0 0 0/)( 25/ 1 9198 9199/ 7741 27 13445/ )");
+        assert_eq!(groups, vec![vec![1, 9198, 9199], vec![7741, 27, 13445]]);
     }
     #[test]
     fn plate_thickness_and_bar_sections_are_read_in_metres() {
