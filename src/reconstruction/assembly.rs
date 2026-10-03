@@ -1472,7 +1472,7 @@ fn assemble_impl(
             })
     });
     timer.lap("wall_end_merges");
-    let consoles = match features {
+    let mut consoles = match features {
         Some(features) => consoles::trim(
             &mut model,
             &consoles::Context {
@@ -1557,6 +1557,27 @@ fn assemble_impl(
         _ => cleanup::GeneralizedContours::default(),
     };
     timer.lap("generalize");
+    // A straightened contour may leave a console beyond a junction line
+    // that its zigzag hid (a slab edge diverging from the wall under it).
+    if let Some(features) = features {
+        let (interior, locked, _) = protected(&model, &axis_assembly);
+        let again = consoles::trim(
+            &mut model,
+            &consoles::Context {
+                maximum_width: features.maximum_console_width,
+                interior: &interior,
+                locked: &locked,
+                axes: &axis_assembly.axes,
+                contacts: &axis_assembly.contacts,
+            },
+        );
+        consoles.trimmed.extend(again.trimmed);
+        for (reason, n) in again.kept {
+            *consoles.kept.entry(reason).or_default() += n;
+        }
+        consoles.passes += again.passes;
+    }
+    timer.lap("consoles_after_generalization");
     model.refresh_orphaned_edges();
     bars::refresh_contacts(&model, &axis_assembly.axes, &mut axis_assembly.contacts);
     Ok(Report {

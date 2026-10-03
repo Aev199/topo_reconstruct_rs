@@ -1692,7 +1692,16 @@ pub fn generalize_contours(
         .map(|&e| model.edges[e])
         .chain(bar_pieces.iter().copied())
         .collect();
-    let mut obstacles = Obstacles::new(model, segments.into_iter(), tolerance, bar_pieces);
+    // Lines inside a surface guide its contour like bars: junction lines.
+    let mut guides = bar_pieces;
+    guides.extend(
+        model
+            .surfaces
+            .iter()
+            .flat_map(|s| s.embedded_edges.iter())
+            .map(|&e| key(model.edges[e][0], model.edges[e][1])),
+    );
+    let mut obstacles = Obstacles::new(model, segments.into_iter(), tolerance, guides);
     for chain in chains {
         if chain.len() < 3 {
             continue;
@@ -1786,8 +1795,8 @@ pub fn generalize_contours(
     report
 }
 
-/// Smallest angle a generalized edge may newly close with another edge or
-/// bar at a kept vertex (the trial mesh quality target): a narrower wedge
+/// Smallest angle a generalized edge may newly close with a bar or a
+/// junction line (the trial mesh quality target): a narrower wedge
 /// would only be meshed with slivers.
 const WEDGE_ANGLE: f64 = 20. * std::f64::consts::PI / 180.;
 
@@ -2246,6 +2255,42 @@ mod tests {
             assert_eq!(r.removed.len(), 2, "{r:?}");
             assert_eq!(r.blocked, 1);
             assert_eq!(m.surfaces[0].boundaries[0].len(), 5);
+        }
+    }
+
+    #[test]
+    fn generalization_never_closes_a_wedge_with_a_junction_line() {
+        // The same stepped slab edge over the top of a wall: the wall top is
+        // a junction line inside the slab ending at the step.
+        let a = vec![
+            [0., -1., 0.],
+            [2.15, -1., 0.],
+            [2.15, 0., 0.],
+            [1.633, 0.035, 0.],
+            [1.116, 0.035, 0.],
+            [0.6, 0.035, 0.],
+            [0., 0.035, 0.],
+        ];
+        let w = vec![
+            [0.3, 0., -1.],
+            [2.15, 0., -1.],
+            [2.15, 0., 0.],
+            [0.3, 0., 0.],
+        ];
+        for place in Placement::all() {
+            let mut m = build(
+                &place,
+                &[
+                    (vec![a.clone()], [0., 0., 1.]),
+                    (vec![w.clone()], [0., 1., 0.]),
+                ],
+            );
+            run(&mut m);
+            assert!(!m.surfaces[0].embedded_edges.is_empty());
+            let tolerance = [0.05 * place.scale; 2];
+            let r = generalize_contours(&mut m, &tolerance, &BTreeSet::new(), &[], &[]);
+            assert_eq!(r.removed.len(), 2, "{r:?}");
+            assert_eq!(r.blocked, 1);
         }
     }
 
