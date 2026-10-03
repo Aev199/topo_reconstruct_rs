@@ -1278,6 +1278,9 @@ pub(super) fn assemble(
 /// material, and an interval for each part of an axis lying in its plane.
 pub fn refresh_contacts(model: &Model, axes: &[Axis], contacts: &mut Vec<Contact>) {
     let precision = model.precision;
+    // On a plane: within a few precisions (a bar end 1.6 um off a slab
+    // lying in it is in the slab, as the global audit counts it).
+    let on_plane = 5. * precision;
     let mut owners = BTreeMap::<usize, BTreeSet<usize>>::new();
     for s in 0..model.surfaces.len() {
         for e in model.surface_edges(s) {
@@ -1336,7 +1339,7 @@ pub fn refresh_contacts(model: &Model, axes: &[Axis], contacts: &mut Vec<Contact
                 }
                 let surface = &model.surfaces[s];
                 let plane = &model.planes[surface.plane];
-                if plane.distance(p).abs() <= precision
+                if plane.distance(p).abs() <= on_plane
                     && location(plane.project(p), &surface.contours, precision).is_some()
                 {
                     previous.insert((i, s, anchor.vertex));
@@ -1355,7 +1358,7 @@ pub fn refresh_contacts(model: &Model, axes: &[Axis], contacts: &mut Vec<Contact
             let p = model.vertices[anchor.vertex];
             // Geometry decides: a node off the plane is no contact, whatever
             // an earlier record or ownership said.
-            if plane.distance(p).abs() > precision {
+            if plane.distance(p).abs() > on_plane {
                 continue;
             }
             if let Some(location) = location(plane.project(p), &surface.contours, precision) {
@@ -1372,7 +1375,7 @@ pub fn refresh_contacts(model: &Model, axes: &[Axis], contacts: &mut Vec<Contact
             model.vertices[axis.endpoints[0]],
             model.vertices[axis.endpoints[1]],
         );
-        if plane.distance(a).abs() <= precision && plane.distance(b).abs() <= precision {
+        if plane.distance(a).abs() <= on_plane && plane.distance(b).abs() <= on_plane {
             for (start_t, end_t, location) in intervals(
                 plane.project(a),
                 plane.project(b),
@@ -1598,7 +1601,7 @@ mod tests {
             // Bar B starts 5 um short of bar A (y = 1) and crosses it at once:
             // its end becomes a node of A where it is (within the 10 um point
             // slack); nothing moves.
-            let mut m = Model::new(1e-7 * place.scale, 0.001 * place.scale).unwrap();
+            let mut m = Model::new(1e-6 * place.scale, 0.001 * place.scale).unwrap();
             let mut bar = |p: [f64; 3], q: [f64; 3], source_axis: usize| {
                 let [a, b] = [p, q].map(|x| m.add_vertex(place.point(x)).unwrap());
                 Axis {

@@ -403,8 +403,8 @@ def check(data, baseline=None):
         for anchor in axis["anchors"]:
             assert 0 <= anchor["t"] <= 1
             interpolated = [x + (y - x) * anchor["t"] for x, y in zip(a, b)]
-            # Points within a hundred precisions are one point (the mesh's slack).
-            assert math.dist(interpolated, vertices[anchor["vertex"]]) <= 100 * epsilon
+            # Points within ten precisions are one point (the mesh's slack).
+            assert math.dist(interpolated, vertices[anchor["vertex"]]) <= 10 * epsilon
             if anchor["source_node"] == no_source:
                 assert (k, anchor["vertex"]) in crossings
                 continue
@@ -421,12 +421,13 @@ def check(data, baseline=None):
 
     for contact in bars["contacts"]:
         axis, surface = bars["axes"][contact["axis"]], model["surfaces"][contact["surface"]]
+        # On a plane within a few precisions, as the global audit counts it.
         if contact["kind"] == "point":
             assert any(x["vertex"] == contact["vertex"] and x["t"] == contact["t"] for x in axis["anchors"])
-            assert abs(distance(surface, vertices[contact["vertex"]])) <= epsilon
+            assert abs(distance(surface, vertices[contact["vertex"]])) <= 5 * epsilon
         else:
             assert 0 <= contact["start_t"] < contact["end_t"] <= 1
-            assert all(abs(distance(surface, vertices[v])) <= epsilon for v in axis["endpoints"])
+            assert all(abs(distance(surface, vertices[v])) <= 5 * epsilon for v in axis["endpoints"])
     # Generalized contour vertices: removed from every surface, each within
     # the generalization tolerance of its simplified chain.
     generalized = topology.get("generalized_contours") or {}
