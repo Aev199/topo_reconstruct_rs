@@ -283,7 +283,8 @@ def check(data, baseline=None):
     slivers = topology.get("removed_slivers", [])
     if slivers:
         crack = topology["feature_policy"]["maximum_crack_width"]
-        assert all(0 < s["width"] <= crack + 1e-12 for s in slivers)
+        assert all(0 < s["width"] <= crack + 1e-12 for s in slivers
+                   if s.get("reason", "sliver") == "sliver")
     actual_shells += [e for s in slivers for e in s["source_elements"]]
     assert collections.Counter(expected_shells) == collections.Counter(actual_shells)
     assert len(actual_shells) == len(set(actual_shells))

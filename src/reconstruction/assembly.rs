@@ -43,6 +43,9 @@ pub struct RegionSplit {
 }
 #[derive(Debug, Serialize)]
 pub struct RemovedSliver {
+    /// `sliver` (no wider than a crack) or `covered` (lying inside another
+    /// surface of the same plane and stiffness once closed).
+    pub reason: String,
     pub patch: usize,
     pub stiffness: u32,
     pub source_elements: Vec<u32>,
@@ -621,6 +624,86 @@ fn region_width(
     (perimeter > 0.).then(|| (area, 2. * area / perimeter, widest))
 }
 
+/// Signed-area magnitude of plane contours (exterior minus holes).
+fn surface_area(contours: &[Vec<[f64; 2]>]) -> f64 {
+    let area = |r: &Vec<[f64; 2]>| {
+        (0..r.len())
+            .map(|i| {
+                let (a, b) = (r[i], r[(i + 1) % r.len()]);
+                a[0] * b[1] - a[1] * b[0]
+            })
+            .sum::<f64>()
+            .abs()
+            / 2.
+    };
+    contours.first().map_or(0., area) - contours.iter().skip(1).map(area).sum::<f64>()
+}
+
+/// Surfaces lying inside another surface of the same plane (within the
+/// point slack) and stiffness: every vertex of the exterior ring and its
+/// mean point inside the other's closed material. Of two equal ones the
+/// later goes; a covering surface is never removed itself.
+fn covered_surfaces(model: &Model, stiffness: &[u32], precision: f64) -> BTreeSet<usize> {
+    let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * precision;
+    let surfaces = model.surfaces();
+    let planes = model.planes();
+    let area: Vec<f64> = surfaces.iter().map(|s| surface_area(&s.contours)).collect();
+    let points: Vec<Vec<[f64; 3]>> = surfaces
+        .iter()
+        .map(|s| {
+            s.contours[0]
+                .iter()
+                .map(|&uv| planes[s.plane].lift(uv))
+                .collect()
+        })
+        .collect();
+    let boxes: Vec<(DVec3, DVec3)> = points
+        .iter()
+        .map(|p| {
+            p.iter().fold(
+                (DVec3::splat(f64::INFINITY), DVec3::splat(f64::NEG_INFINITY)),
+                |(lo, hi), x| (lo.min(DVec3::from_array(*x)), hi.max(DVec3::from_array(*x))),
+            )
+        })
+        .collect();
+    let mut by_stiffness = BTreeMap::<u32, Vec<usize>>::new();
+    for (s, &k) in stiffness.iter().enumerate() {
+        by_stiffness.entry(k).or_default().push(s);
+    }
+    let mut covered = BTreeSet::new();
+    let mut covering = BTreeSet::new();
+    for i in 0..surfaces.len() {
+        let pi = &planes[surfaces[i].plane];
+        let n = points[i].len() as f64;
+        let mean = points[i].iter().fold([0.; 3], |m, p| {
+            [m[0] + p[0] / n, m[1] + p[1] / n, m[2] + p[2] / n]
+        });
+        let found = by_stiffness[&stiffness[i]].iter().copied().find(|&j| {
+            let pj = &planes[surfaces[j].plane];
+            j != i
+                && !covered.contains(&j)
+                && (area[j] > area[i] || (area[j] == area[i] && j < i))
+                && (boxes[i].0 + slack).cmpge(boxes[j].0).all()
+                && (boxes[i].1 - slack).cmple(boxes[j].1).all()
+                && DVec3::from_array(pi.normal)
+                    .cross(DVec3::from_array(pj.normal))
+                    .length()
+                    <= 1e-6
+                && points[i].iter().chain([&mean]).all(|p| {
+                    pj.distance(*p).abs() <= slack
+                        && super::closed_contains(&surfaces[j].contours, pj.project(*p), slack)
+                })
+        });
+        if let Some(j) = found {
+            if !covering.contains(&i) {
+                covered.insert(i);
+                covering.insert(j);
+            }
+        }
+    }
+    covered
+}
+
 fn ring_area(ring: &[u32], plane: &PlaneFrame, point: impl Fn(u32) -> [f64; 3]) -> f64 {
     let uv: Vec<_> = ring.iter().map(|&n| plane.project(point(n))).collect();
     (0..uv.len())
@@ -715,6 +798,7 @@ fn assemble_impl(
             match region_width(mesh, &elements, ids, plane, policy.precision) {
                 Some((area, mean, widest)) if mean <= width && widest <= width => {
                     removed_slivers.push(RemovedSliver {
+                        reason: "sliver".into(),
                         patch: *patch,
                         stiffness: *stiffness,
                         source_elements: ids.clone(),
@@ -1236,7 +1320,7 @@ fn assemble_impl(
             })
             .collect();
     }
-    let hole_nodes: Vec<(usize, Vec<usize>)> = simplified_holes
+    let hole_nodes: std::cell::RefCell<Vec<(usize, Vec<usize>)>> = simplified_holes
         .iter()
         .flat_map(|hole| {
             let nodes: Vec<usize> = hole
@@ -1252,7 +1336,8 @@ fn assemble_impl(
                 .map(|(s, _)| (s, nodes.clone()))
                 .collect::<Vec<_>>()
         })
-        .collect();
+        .collect::<Vec<_>>()
+        .into();
     let protected = |model: &Model, axis_assembly: &bars::Report| {
         let mut interior = vec![BTreeSet::new(); model.surfaces.len()];
         for contact in &axis_assembly.contacts {
@@ -1264,7 +1349,7 @@ fn assemble_impl(
             }
         }
         let mut fixed = BTreeSet::new();
-        for (s, nodes) in &hole_nodes {
+        for (s, nodes) in hole_nodes.borrow().iter() {
             interior[*s].extend(nodes.iter().copied());
             fixed.extend(nodes.iter().copied());
         }
@@ -1530,6 +1615,61 @@ fn assemble_impl(
         _ => cleanup::Report::default(),
     };
     timer.lap("short_edges");
+    // A surface lying inside another surface of the same plane and
+    // stiffness (small elements of a warped corner folded onto each other
+    // by the frame and gap closures; duplicated elements) adds nothing:
+    // removed, the smaller one (equal ones: the later) going.
+    if features.is_some() {
+        let covered = covered_surfaces(&model, &surface_stiffness, policy.precision);
+        if !covered.is_empty() {
+            for &s in &covered {
+                let surface = &model.surfaces()[s];
+                removed_slivers.push(RemovedSliver {
+                    reason: "covered".into(),
+                    patch: surface_source_patches[s],
+                    stiffness: surface_stiffness[s],
+                    source_elements: surface.source_elements.clone(),
+                    area: surface_area(&surface.contours),
+                    mean_width: 0.,
+                    width: 0.,
+                });
+                let ids = surface.source_elements.clone();
+                simplified_holes.retain(|h| h.source_elements != ids);
+            }
+            let index = model.remove_surfaces(&covered);
+            let kept = |s: &usize| index[*s].is_some();
+            surface_source_patches = (0..index.len())
+                .filter(kept)
+                .map(|s| surface_source_patches[s])
+                .collect();
+            surface_stiffness = (0..index.len())
+                .filter(kept)
+                .map(|s| surface_stiffness[s])
+                .collect();
+            // Surface indices held elsewhere follow; contacts with a
+            // removed surface go (contacts are refreshed at the end).
+            axis_assembly.contacts.retain_mut(|c| {
+                let (bars::Contact::Point { surface, .. }
+                | bars::Contact::Interval { surface, .. }) = c;
+                match index[*surface] {
+                    Some(n) => {
+                        *surface = n;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            hole_nodes
+                .borrow_mut()
+                .retain_mut(|(s, _)| match index[*s] {
+                    Some(n) => {
+                        *s = n;
+                        true
+                    }
+                    None => false,
+                });
+        }
+    }
     // Small free openings are filled before bars are imprinted, so a column
     // through a filled opening is imprinted into the slab.
     let filled_openings = match features {

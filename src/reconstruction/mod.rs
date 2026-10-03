@@ -448,6 +448,24 @@ impl Model {
         Ok(())
     }
 
+    /// Remove surfaces (their edges used by no other surface become
+    /// orphaned). Returns the new index of every old surface.
+    pub fn remove_surfaces(&mut self, remove: &BTreeSet<usize>) -> Vec<Option<usize>> {
+        let mut index = vec![];
+        let mut kept = vec![];
+        for (s, surface) in std::mem::take(&mut self.surfaces).into_iter().enumerate() {
+            if remove.contains(&s) {
+                index.push(None);
+            } else {
+                index.push(Some(kept.len()));
+                kept.push(surface);
+            }
+        }
+        self.surfaces = kept;
+        self.refresh_orphaned_edges();
+        index
+    }
+
     /// Recompute the list of edges no surface uses.
     pub fn refresh_orphaned_edges(&mut self) {
         let used: BTreeSet<usize> = (0..self.surfaces.len())

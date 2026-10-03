@@ -1061,3 +1061,53 @@ fn closed_crack_void_keeps_only_its_shared_nodes() {
         }
     }
 }
+
+#[test]
+fn surface_lying_inside_another_of_its_stiffness_is_removed() {
+    use topo_reconstruct_rs::input::{ElementData, MeshData};
+    for scale in [0.1, 1., 10.] {
+        for rotated in [false, true] {
+            // A 2 x 2 slab of quads and a triangle of the same stiffness with
+            // its own nodes inside the first quad (a duplicated element): the
+            // triangle is removed with provenance.
+            let mut mesh = MeshData::default();
+            for j in 0..3 {
+                for i in 0..3 {
+                    mesh.nodes
+                        .insert(1 + i + 3 * j, DVec3::new(i as f64, j as f64, 0.));
+                }
+            }
+            for j in 0..2 {
+                for i in 0..2 {
+                    let a = 1 + i + 3 * j;
+                    mesh.elements.push(ElementData {
+                        id: mesh.elements.len() as u32 + 1,
+                        elem_type: 44,
+                        stiff_id: 1,
+                        nodes: vec![a, a + 1, a + 4, a + 3],
+                    });
+                }
+            }
+            for (id, p) in [(20, [0.2, 0.2]), (21, [0.6, 0.2]), (22, [0.2, 0.6])] {
+                mesh.nodes.insert(id, DVec3::new(p[0], p[1], 0.));
+            }
+            mesh.elements.push(ElementData {
+                id: 5,
+                elem_type: 42,
+                stiff_id: 1,
+                nodes: vec![20, 21, 22],
+            });
+            let (topology, trial) = run_with(mesh, scale, rotated, Some(Default::default()));
+            let covered: Vec<_> = topology
+                .removed_slivers
+                .iter()
+                .filter(|s| s.reason == "covered")
+                .collect();
+            assert_eq!(covered.len(), 1, "scale={scale} rotated={rotated}");
+            assert_eq!(covered[0].source_elements, vec![5]);
+            assert_eq!(topology.preview.surfaces().len(), 1);
+            assert_eq!(topology.surface_stiffness.len(), 1);
+            assert!(trial.topology_valid, "{:?}", trial.blockers);
+        }
+    }
+}
