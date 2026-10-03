@@ -145,9 +145,9 @@ trial triangles; strict audit unchanged unless noted):
 | ЖК Остров | 11/185/5701 | 11/87/7822 | PLAXIS gaps 95 -> 62, narrow 5 -> 0; 25 overlaps unchanged |
 | Багратион v4 | 10/54/1289 | 11/54/1279 | strict fails on both: overlaps 8 -> 2, point contacts 29 -> 1, bar-in-surface without contact 14 -> 6 |
 | для testa | 0/4/195 | 0/4/258 | |
-| скала+seismic, тест 5 (m5), скала1 (m1) | 0/0/11, 0/0/25, 0/0/11 | 0/0/11, 0/0/84, 0/0/13 | |
-| типовая секция (m6) | 0/0/204 | 0/3/525 | min angle 7.1 -> 3.0 |
-| m2, plate, АЖТ x2 | unchanged | unchanged | |
+| скала seismic; m5; m1 | 0/0/11; 0/0/25; 0/0/11 | 0/0/11; 0/0/84; 0/0/13 | |
+| m6 | 0/0/204 | 0/3/525 | min angle 7.1 -> 3.0 |
+| m2, test slab, АЖТ x2 | unchanged | unchanged | |
 
 Багратион v4 at 1d57ec3 re-run with the current frame cache (relaxation
 step 1) fails the strict audit, unlike the earlier record below.
