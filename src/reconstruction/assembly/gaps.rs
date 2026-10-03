@@ -292,6 +292,55 @@ fn touches(model: &Model, g: &Gap) -> bool {
     g.height.abs() <= model.precision && g.outside == 0. && g.depth <= model.precision
 }
 
+/// Contour vertices of the surfaces of `v` (other than `s`) reached along
+/// their contours from `v` while the in-plane gap to `s` stays within a
+/// quarter of `width`; the length of that run.
+fn joint_length(model: &Model, v: usize, s: usize, width: f64, members: &BTreeSet<usize>) -> f64 {
+    let same = |w: usize| {
+        gap(model, w, s, members).is_some_and(|g| {
+            g.height.abs() <= model.minimum_edge && (g.outside - width).abs() <= 0.25 * width
+        })
+    };
+    let at = |w: usize| DVec3::from_array(model.vertices[w]);
+    let mut best = 0f64;
+    for u in cleanup::users(model, v) {
+        if u == s {
+            continue;
+        }
+        for ring in &model.surfaces[u].boundaries {
+            let ids: Vec<usize> = ring
+                .iter()
+                .map(|e| {
+                    let [a, b] = model.edges[e.edge];
+                    if e.reversed {
+                        b
+                    } else {
+                        a
+                    }
+                })
+                .collect();
+            let Some(start) = ids.iter().position(|&w| w == v) else {
+                continue;
+            };
+            let n = ids.len();
+            let mut length = 0.;
+            for step in [1, n - 1] {
+                let mut i = start;
+                for _ in 1..n {
+                    let j = (i + step) % n;
+                    if !same(ids[j]) {
+                        break;
+                    }
+                    length += at(ids[i]).distance(at(ids[j]));
+                    i = j;
+                }
+            }
+            best = best.max(length);
+        }
+    }
+    best
+}
+
 /// Close gaps narrower than `tolerance` between surface vertices (and bar
 /// nodes) and other surfaces, and overlaps shallower than the minimum edge
 /// within a plane.
@@ -300,6 +349,35 @@ pub fn close(
     bars: &mut Bars<'_>,
     tolerance: f64,
     offsets: bool,
+    fixed: &BTreeSet<usize>,
+    source_nodes: &[u32],
+    frame_points: &[[f64; 3]],
+    limit: f64,
+) -> Report {
+    close_keeping_joints(
+        model,
+        bars,
+        tolerance,
+        offsets,
+        f64::INFINITY,
+        fixed,
+        source_nodes,
+        frame_points,
+        limit,
+    )
+}
+
+/// [`close`], keeping expansion joints: an in-plane gap wider than
+/// `joint_width` along a contour of constant width at least twenty widths
+/// long (two slabs side by side with a 30 mm strip between them) is a
+/// joint of the structure, not a defect, and stays open.
+#[allow(clippy::too_many_arguments)]
+pub fn close_keeping_joints(
+    model: &mut Model,
+    bars: &mut Bars<'_>,
+    tolerance: f64,
+    offsets: bool,
+    joint_width: f64,
     fixed: &BTreeSet<usize>,
     source_nodes: &[u32],
     frame_points: &[[f64; 3]],
@@ -351,7 +429,20 @@ pub fn close(
                     // are closed here too: junction insertion only imprints
                     // intersection lines.
                     if eligible(model, v, s, &g) {
-                        gaps.push((g.distance.max(g.depth), v, s));
+                        let joint = g.height.abs() <= model.minimum_edge
+                            && g.outside > joint_width
+                            && joint_length(model, v, s, g.outside, &members) >= 20. * g.outside;
+                        if !joint {
+                            gaps.push((g.distance.max(g.depth), v, s));
+                        } else if tried.insert((v, s)) {
+                            report.rejected.push(Rejected {
+                                vertex: v,
+                                source_node: source_nodes.get(v).copied(),
+                                surface: s,
+                                gap: g.distance,
+                                reason: "expansion_joint".into(),
+                            });
+                        }
                     }
                 }
             }
@@ -447,6 +538,57 @@ mod tests {
         Bars {
             axes: Box::leak(Box::new(vec![])),
             contacts: Box::leak(Box::new(vec![])),
+        }
+    }
+
+    #[test]
+    fn expansion_joint_stays_open_and_a_local_gap_closes() {
+        for place in Placement::all() {
+            // Slabs side by side with a 30 mm strip between them: a joint.
+            let left = slab(0., 2.);
+            let right = slab(2.03, 4.);
+            let mut m = build(&place, &[left.clone(), right]);
+            let before = m.vertices.clone();
+            let r = close_keeping_joints(
+                &mut m,
+                &mut no_bars(),
+                0.05 * place.scale,
+                true,
+                0.01 * place.scale,
+                &BTreeSet::new(),
+                &[],
+                &before,
+                f64::MAX,
+            );
+            assert!(r.closed.is_empty(), "{:?}", r.closed);
+            assert_eq!(r.rejected.len(), 4);
+            assert!(r.rejected.iter().all(|x| x.reason == "expansion_joint"));
+            assert_eq!(m.vertices, before);
+            // One corner 30 mm off, the other edge end touching: closed.
+            let tilted = (
+                vec![vec![
+                    [2.03, 0., 0.],
+                    [4., 0., 0.],
+                    [4., 4., 0.],
+                    [2., 4., 0.],
+                ]],
+                [0., 0., 1.],
+            );
+            let mut m = build(&place, &[left.clone(), tilted]);
+            let before = m.vertices.clone();
+            let r = close_keeping_joints(
+                &mut m,
+                &mut no_bars(),
+                0.05 * place.scale,
+                true,
+                0.01 * place.scale,
+                &BTreeSet::new(),
+                &[],
+                &before,
+                f64::MAX,
+            );
+            assert!(r.rejected.iter().all(|x| x.reason != "expansion_joint"));
+            assert!(!r.closed.is_empty());
         }
     }
 

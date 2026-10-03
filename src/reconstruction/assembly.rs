@@ -1369,7 +1369,7 @@ fn assemble_impl(
     let (_, _, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
     let gaps = match features {
-        Some(features) if features.maximum_gap > 0. => gaps::close(
+        Some(features) if features.maximum_gap > 0. => gaps::close_keeping_joints(
             &mut model,
             &mut cleanup::Bars {
                 axes: &mut axis_assembly.axes,
@@ -1377,6 +1377,8 @@ fn assemble_impl(
             },
             features.maximum_gap,
             features.close_offset_gaps,
+            // Gaps up to the crack width are defects of the source mesh.
+            features.maximum_crack_width,
             &fixed,
             &vertex_source_nodes,
             &vertex_source_nodes
