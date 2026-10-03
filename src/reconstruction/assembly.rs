@@ -743,7 +743,7 @@ fn absorbed_slivers(
             let pj = &planes[surfaces[j].plane];
             j != i
                 && !absorbed.contains(&j)
-                && area[j] > area[i]
+                && (area[j] > area[i] || (area[j] == area[i] && j < i))
                 && DVec3::from_array(pi.normal)
                     .cross(DVec3::from_array(pj.normal))
                     .length()
@@ -762,8 +762,8 @@ fn absorbed_slivers(
                     };
                     let own = polygon(vec![points.iter().map(|p| pj.project(*p)).collect()]);
                     let other = polygon(surfaces[j].contours.clone());
-                    // More than a strip of the point slack along the tolerance.
-                    own.intersection(&other).unsigned_area() > slack * tol
+                    // More than a point (a square of the point slack).
+                    own.intersection(&other).unsigned_area() > slack * slack
                 }
         });
         if let Some(j) = found {
@@ -1860,7 +1860,9 @@ fn assemble_impl(
             },
         );
         junctions.junctions.extend(again.junctions);
-        junctions.generated_vertices.extend(again.generated_vertices);
+        junctions
+            .generated_vertices
+            .extend(again.generated_vertices);
         junctions.split_edges += again.split_edges;
         junctions.embedded_edges += again.embedded_edges;
         junctions.snapped_vertices.extend(again.snapped_vertices);
