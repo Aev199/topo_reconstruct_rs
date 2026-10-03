@@ -323,6 +323,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         straightened_edges: vec![],
         short_edges: assembly::cleanup::Report::default(),
         generalized_contours: assembly::cleanup::GeneralizedContours::default(),
+        filled_openings: assembly::openings::Report::default(),
         coincident_vertices: assembly::cleanup::MergeReport::default(),
         wall_ends: assembly::cleanup::MergeReport::default(),
         bar_ends: assembly::cleanup::MergeReport::default(),

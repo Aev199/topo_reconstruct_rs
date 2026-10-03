@@ -8,6 +8,7 @@ mod features;
 pub mod gaps;
 mod holes;
 pub mod junctions;
+pub mod openings;
 pub mod stacking;
 use super::{frame, planes, Model, PlaneFrame};
 use crate::input::MeshData;
@@ -81,6 +82,8 @@ pub struct Report {
     pub short_edges: cleanup::Report,
     /// Contour and junction chains generalized within the gap tolerance.
     pub generalized_contours: cleanup::GeneralizedContours,
+    /// Free openings narrower than the minimum opening width, filled.
+    pub filled_openings: openings::Report,
     /// Duplicated vertices merged before junction insertion (geotechnical).
     pub coincident_vertices: cleanup::MergeReport,
     /// Wall ends merged into nearby vertices (geotechnical).
@@ -1491,6 +1494,22 @@ fn assemble_impl(
         _ => cleanup::Report::default(),
     };
     timer.lap("short_edges");
+    // Small free openings are filled before bars are imprinted, so a column
+    // through a filled opening is imprinted into the slab.
+    let filled_openings = match features {
+        Some(features) if features.minimum_opening_width > 0. => {
+            let (_, locked, _) = protected(&model, &axis_assembly);
+            openings::fill(
+                &mut model,
+                features.minimum_opening_width,
+                &locked,
+                &axis_assembly.axes,
+                &vertex_source_nodes,
+            )
+        }
+        _ => openings::Report::default(),
+    };
+    timer.lap("openings");
     model.refresh_orphaned_edges();
     axis_assembly.imprinted = bars::imprint_surface_vertices(
         &mut model,
@@ -1557,6 +1576,7 @@ fn assemble_impl(
         straightened_edges,
         short_edges,
         generalized_contours,
+        filled_openings,
         coincident_vertices: coincident,
         wall_ends,
         bar_ends,

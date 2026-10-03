@@ -441,6 +441,11 @@ def check(data, baseline=None):
         assert r["vertex"] not in used
         if r["source_node"] is not None:
             assert r["source_node"] == source_nodes[r["vertex"]]
+    # Filled openings: narrower than the minimum width, their contour gone.
+    openings = topology.get("filled_openings") or {}
+    for f in openings.get("filled", []):
+        assert 0. < f["width"] < openings["minimum_width"]
+        assert f["area"] > 0.
     if baseline:
         before = baseline["topology"]["preview"]
         old_axes = baseline["topology"].get("axis_assembly", {}).get("axes", [])
