@@ -1,6 +1,6 @@
 # Development state
 
-Updated: 2026-10-02
+Updated: 2026-10-03
 Repository baseline reviewed through the surface-junction batch (see git log).
 
 This file is intentionally short. It is the entry point for the next development
@@ -124,6 +124,44 @@ State (2026-10-02, latest):
   only after gap closure, so removing them needs surface removal after
   gaps), 19 unshared point contacts and 4 unrepresented intersections in
   one knot of walls (surfaces 566-569, 595, 596).
+
+Geometry generalization (2026-10-03, `cleanup::generalize_contours`, last
+assembly step, after bar imprinting): every chain of contour/junction edges
+between fixed vertices (branch points, changes of the user-surface set,
+bar anchors and ends, contacts, retained hole nodes) is simplified once by
+Douglas-Peucker within the 5 cm gap tolerance, so all surfaces sharing it
+stay conforming. Vertices are only removed (`generalized_contours.removed`
+with source node and deviation; the assembly checker verifies them). A
+removal is skipped when the shortcut would sweep over another edge, bar or
+vertex, or close a wedge under 20 degrees with a bar (at a kept vertex, or
+a bar within 5 cm) narrower than before.
+
+Generalization A/B (1d57ec3 vs this batch, frame caches, <1/<5/<20 degree
+trial triangles; strict audit unchanged unless noted):
+
+| Model | before | after | notes |
+|---|---|---|---|
+| Багратион bedding | 71/259/2913 | 34/109/343 | PLAXIS narrow faces 12 -> 1, gaps 51 -> 15 |
+| ЖК Остров | 11/185/5701 | 11/87/7822 | PLAXIS gaps 95 -> 62, narrow 5 -> 0; 25 overlaps unchanged |
+| Багратион v4 | 10/54/1289 | 11/54/1279 | strict fails on both: overlaps 8 -> 2, point contacts 29 -> 1, bar-in-surface without contact 14 -> 6 |
+| для testa | 0/4/195 | 0/4/258 | |
+| скала+seismic, тест 5 (m5), скала1 (m1) | 0/0/11, 0/0/25, 0/0/11 | 0/0/11, 0/0/84, 0/0/13 | |
+| типовая секция (m6) | 0/0/204 | 0/3/525 | min angle 7.1 -> 3.0 |
+| m2, plate, АЖТ x2 | unchanged | unchanged | |
+
+Багратион v4 at 1d57ec3 re-run with the current frame cache (relaxation
+step 1) fails the strict audit, unlike the earlier record below.
+The growth of 5-20 degree triangles is a trial-mesh effect, not invalid
+geometry: long generalized edges are subdivided by the refinement of the
+neighbouring surface (a Steiner point 26 mm from a wall corner, because a
+slab vertex lies 5 cm beyond the wall end). Graded subdivision of shared
+edges in the trial mesh, or the external mesher, addresses it.
+
+Next for generalization: snap a contour chain lying within tolerance and
+parallel to a bar or another contour onto it (instead of leaving a 4-5 cm
+strip); bars as straight axes between real joints; panels absorbing warped
+corner elements (ЖК Остров overlaps; covered-surface removal is still in
+`git stash` as an alternative).
 
 Rules of this batch: slab edges kinked off a beam (one neighbour on it,
 within the recognition angle) straightened; a surface vertex next to a
