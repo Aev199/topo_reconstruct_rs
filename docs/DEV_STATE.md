@@ -1,6 +1,6 @@
 # Development state
 
-Updated: 2026-10-03
+Updated: 2026-10-04
 Repository baseline reviewed through the surface-junction batch (see git log).
 
 This file is intentionally short. It is the entry point for the next development
@@ -125,6 +125,25 @@ State (2026-10-02, latest):
   gaps), 19 unshared point contacts and 4 unrepresented intersections in
   one knot of walls (surfaces 566-569, 595, 596).
 
+Automation closed (2026-10-04). Final rules of the batch: numerical
+planarity 1 um (`assembly::Policy.precision`), point slack ten precisions
+(10 um), contacts on a plane within five precisions (as the audit);
+surfaces covered by, or narrower than twice their tolerance and partly
+folded onto, a surface of their plane and stiffness are removed
+(`removed_slivers` reasons `covered` / `absorbed`); junctions are
+inserted again after generalization; hole rings collinear in the source
+are seams, holes the frame closed to no area under the minimum opening
+are filled.
+
+Final scoreboard (strict global audit; <1/<5/<20 degree trial triangles):
+all 12 fixtures mesher-ready; strict passes on 11 of 12 — ЖК Остров now
+passes (8/53/6830; was 25 overlaps, 19 point contacts, 4 intersections),
+Для testa (0/4/260), Багратион bedding (40/112/333), m1, m2, m5, m6,
+test slab, АЖТ x2, скала seismic. Багратион v4 (11/58/1263) keeps 10
+residual items: 2 coplanar overlaps, 1 point contact, 1 bar intersection,
+6 bars in a surface without contact, and one 25 mm unlinked joint (kept
+by rule) — candidates for the manual editor.
+
 Tolerance ladder (user decisions 2026-10-03): section sizes change by
 decimetres in the target model, so the simplification tolerance of a
 surface is half its plate thickness (LIRA `GEI E nu H`), at least the 5 cm
@@ -220,21 +239,27 @@ the upper node, unbuffered report output, slow console trimming.
 
 ### Goal
 
-Actual solver handoff: an exporter for the trial mesh/geometry and an import
-of one fixture into MIDAS GTS NX and/or PLAXIS 3D by the user.
+A simple graphical editor for the residual defects the automation leaves
+(user decision 2026-10-04): view the reconstructed geometry with audit
+findings highlighted, fix a site by hand (merge/move a vertex, delete or
+join a surface, split an edge, mark a gap as a joint or not), re-validate
+with the same Model operations and audits, and save the edited geometry
+for the exporter.
 
 ### Required approach
 
-- Agree the exchange format with the user (for example NASTRAN bulk data for a
-  MIDAS mesh, DXF/STEP faces for PLAXIS geometry).
-- Export shells per stiffness and bars per span with source provenance;
-  shared nodes must stay shared in the file.
-- Keep `export_ready` false until the user confirms a successful import.
+- Agree scope and platform with the user first (browser page on the
+  assembly JSON vs. desktop), mobile-friendly viewing.
+- Edits go through the transactional `Model` operations so topology stays
+  valid; every edit is logged with provenance like automatic rules.
+- Re-run the assembly checker and global audit on the edited model.
 
 ### Also pending
 
+- Exporter (MIDAS/PLAXIS exchange format) and import verification.
 - Load transfer (loads are not in the reconstruction input).
-- Actual MIDAS/PLAXIS import verification.
+- Rigid-body/coupled-displacement docs other than LIRA block 25 (the
+  "объединение перемещений" block is not identified yet).
 - `panic = "abort"` in release makes the Spade `catch_unwind` ineffective.
 
 ## Explicitly not complete yet
