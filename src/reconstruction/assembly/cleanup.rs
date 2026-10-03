@@ -1524,6 +1524,216 @@ fn length(model: &Model, e: usize) -> f64 {
     a.distance(b)
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct GeneralizedContours {
+    /// Largest distance of a removed vertex from the generalized line.
+    pub tolerance: f64,
+    /// Chains of contour and junction edges between fixed vertices.
+    pub chains: usize,
+    pub removed: Vec<GeneralizedVertex>,
+    /// Vertices kept although selected, because removing them would make a
+    /// contour invalid.
+    pub kept: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GeneralizedVertex {
+    pub vertex: usize,
+    pub source_node: Option<u32>,
+    /// Distance from the generalized line of its chain.
+    pub deviation: f64,
+}
+
+/// Indices of `points` kept by Douglas-Peucker within `tolerance` (the ends
+/// always kept).
+fn douglas_peucker(points: &[DVec3], tolerance: f64) -> Vec<usize> {
+    fn recurse(points: &[DVec3], lo: usize, hi: usize, tolerance: f64, keep: &mut Vec<usize>) {
+        let (a, b) = (points[lo], points[hi]);
+        let d = b - a;
+        let (mut far, mut index) = (0., None);
+        for i in lo + 1..hi {
+            let p = points[i];
+            let t = if d.length_squared() > 0. {
+                ((p - a).dot(d) / d.length_squared()).clamp(0., 1.)
+            } else {
+                0.
+            };
+            let e = p.distance(a + d * t);
+            if e > far {
+                (far, index) = (e, Some(i));
+            }
+        }
+        if let (Some(i), true) = (index, far > tolerance) {
+            recurse(points, lo, i, tolerance, keep);
+            keep.push(i);
+            recurse(points, i, hi, tolerance, keep);
+        }
+    }
+    let mut keep = vec![0];
+    if points.len() > 1 {
+        recurse(points, 0, points.len() - 1, tolerance, &mut keep);
+        keep.push(points.len() - 1);
+    }
+    keep
+}
+
+/// Generalize contours and junction lines for a new mesh: every chain of
+/// edges between fixed vertices (branch points, where the set of surfaces
+/// changes, bar nodes and contacts, retained nodes: `locked`) is reduced by
+/// Douglas-Peucker within `tolerance`, once for all surfaces using it, so
+/// neighbours stay conforming. Vertices are only removed, never moved; a
+/// removal making any contour invalid is skipped. Source mesh zigzags,
+/// kinks and short edges along a straight structural edge disappear.
+pub fn generalize_contours(
+    model: &mut Model,
+    tolerance: f64,
+    locked: &BTreeSet<usize>,
+    source_nodes: &[u32],
+) -> GeneralizedContours {
+    let mut report = GeneralizedContours {
+        tolerance,
+        ..Default::default()
+    };
+    if tolerance <= 0. {
+        return report;
+    }
+    let point = |m: &Model, v: usize| DVec3::from_array(m.vertices[v]);
+    // Used edges, their users, and the vertex graph.
+    let mut users = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for s in 0..model.surfaces.len() {
+        for e in model.surface_edges(s) {
+            let list = users.entry(e).or_default();
+            if !list.contains(&s) {
+                list.push(s);
+            }
+        }
+    }
+    let mut incident = std::collections::BTreeMap::<usize, Vec<usize>>::new();
+    for &e in users.keys() {
+        for v in model.edges[e] {
+            incident.entry(v).or_default().push(e);
+        }
+    }
+    let free = |v: usize| {
+        !locked.contains(&v)
+            && incident
+                .get(&v)
+                .is_some_and(|es| es.len() == 2 && users[&es[0]] == users[&es[1]])
+    };
+    // Walk chains from fixed vertices; rings without one start anywhere.
+    let mut seen_edges = BTreeSet::new();
+    let mut chains: Vec<Vec<usize>> = vec![];
+    let starts: Vec<usize> = incident.keys().copied().filter(|&v| !free(v)).collect();
+    let walk = |start: usize, first: usize, seen: &mut BTreeSet<usize>| -> Vec<usize> {
+        let mut chain = vec![start];
+        let (mut v, mut e) = (start, first);
+        loop {
+            seen.insert(e);
+            let [a, b] = model.edges[e];
+            let next = if a == v { b } else { a };
+            chain.push(next);
+            if !free(next) || next == start {
+                break;
+            }
+            let es = &incident[&next];
+            let other = if es[0] == e { es[1] } else { es[0] };
+            if seen.contains(&other) {
+                break;
+            }
+            (v, e) = (next, other);
+        }
+        chain
+    };
+    for &v in &starts {
+        for &e in &incident[&v] {
+            if !seen_edges.contains(&e) {
+                chains.push(walk(v, e, &mut seen_edges));
+            }
+        }
+    }
+    let remaining: Vec<usize> = users
+        .keys()
+        .copied()
+        .filter(|e| !seen_edges.contains(e))
+        .collect();
+    for e in remaining {
+        if !seen_edges.contains(&e) {
+            let v = model.edges[e][0];
+            chains.push(walk(v, e, &mut seen_edges));
+        }
+    }
+    report.chains = chains.len();
+    for chain in chains {
+        if chain.len() < 3 {
+            continue;
+        }
+        let closed = chain.first() == chain.last();
+        let points: Vec<DVec3> = chain.iter().map(|&v| point(model, v)).collect();
+        let mut keep: BTreeSet<usize> = if closed {
+            // A ring: split at the vertex farthest from the first one.
+            let far = (1..chain.len() - 1)
+                .max_by(|&i, &j| {
+                    points[0]
+                        .distance(points[i])
+                        .total_cmp(&points[0].distance(points[j]))
+                })
+                .unwrap_or(1);
+            let mut k: BTreeSet<usize> = douglas_peucker(&points[..=far], tolerance)
+                .into_iter()
+                .collect();
+            k.extend(
+                douglas_peucker(&points[far..], tolerance)
+                    .into_iter()
+                    .map(|i| i + far),
+            );
+            // At least a triangle.
+            if k.len() < 4 {
+                let third = (1..chain.len() - 1)
+                    .filter(|i| !k.contains(i))
+                    .max_by(|&i, &j| {
+                        let line = |x: usize| {
+                            let (a, b) = (points[0], points[far]);
+                            let d = b - a;
+                            (points[x] - a).cross(d).length() / d.length().max(f64::MIN_POSITIVE)
+                        };
+                        line(i).total_cmp(&line(j))
+                    });
+                k.extend(third);
+            }
+            k
+        } else {
+            douglas_peucker(&points, tolerance).into_iter().collect()
+        };
+        keep.insert(0);
+        keep.insert(chain.len() - 1);
+        for i in 1..chain.len() - 1 {
+            if keep.contains(&i) {
+                continue;
+            }
+            let v = chain[i];
+            // Distance from the generalized segment holding it.
+            let lo = *keep.range(..i).next_back().unwrap();
+            let hi = *keep.range(i..).next().unwrap();
+            let (a, b) = (points[lo], points[hi]);
+            let d = b - a;
+            let t =
+                ((points[i] - a).dot(d) / d.length_squared().max(f64::MIN_POSITIVE)).clamp(0., 1.);
+            let deviation = points[i].distance(a + d * t);
+            if model.remove_vertex(v, f64::MAX).is_ok() {
+                report.removed.push(GeneralizedVertex {
+                    vertex: v,
+                    source_node: source_nodes.get(v).copied(),
+                    deviation,
+                });
+            } else {
+                keep.insert(i);
+                report.kept += 1;
+            }
+        }
+    }
+    report
+}
+
 /// Remove redundant collinear vertices bounding edges shorter than
 /// `tolerance`. `locked` vertices (bar anchors, retained nodes) stay.
 pub fn remove_short_edges(
@@ -1631,6 +1841,61 @@ mod tests {
             .map(|p| m.add_vertex(place.point(p)).unwrap())
             .to_vec();
         m.add_surface(plane, vec![ring], vec![]).unwrap();
+    }
+
+    #[test]
+    fn generalization_removes_zigzags_once_for_all_users() {
+        // Two slabs sharing a source zigzag (2 mm) along x = 2; the first
+        // also has a 2 mm bump on its free edge x = 0.
+        let zig = [
+            [2., 0., 0.],
+            [2.002, 1., 0.],
+            [1.998, 2., 0.],
+            [2.002, 3., 0.],
+            [2., 4., 0.],
+        ];
+        let mut a = vec![[0., 0., 0.]];
+        a.extend(zig);
+        a.extend([[0., 4., 0.], [0.002, 2., 0.]]);
+        let mut b: Vec<[f64; 3]> = zig.iter().rev().copied().collect();
+        b.extend([[4., 0., 0.], [4., 4., 0.]]);
+        b.reverse();
+        for place in Placement::all() {
+            let mut m = build(
+                &place,
+                &[
+                    (vec![a.clone()], [0., 0., 1.]),
+                    (vec![b.clone()], [0., 0., 1.]),
+                ],
+            );
+            // A bar node on the middle of the shared line stays.
+            let middle = (0..m.vertices.len())
+                .find(|&v| {
+                    DVec3::from_array(m.vertices[v])
+                        .distance(DVec3::from_array(place.point([1.998, 2., 0.])))
+                        < 1e-9 * place.scale.max(1.) * 1e3
+                })
+                .unwrap();
+            let locked = BTreeSet::from([middle]);
+            let r = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[]);
+            assert_eq!(r.removed.len(), 3, "{r:?}");
+            assert_eq!(r.kept, 0);
+            assert!(r
+                .removed
+                .iter()
+                .all(|x| x.deviation <= 0.0031 * place.scale));
+            let ring_len = |s: usize| m.surfaces[s].boundaries[0].len();
+            assert_eq!((ring_len(0), ring_len(1)), (5, 5));
+            let shared: Vec<usize> = m
+                .surface_edges(0)
+                .filter(|&e| m.surface_edges(1).any(|f| f == e))
+                .collect();
+            assert_eq!(shared.len(), 2);
+            assert!(shared.iter().all(|&e| m.edges[e].contains(&middle)));
+            // Idempotent.
+            let again = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[]);
+            assert!(again.removed.is_empty());
+        }
     }
 
     #[test]

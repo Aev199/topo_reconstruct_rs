@@ -79,6 +79,8 @@ pub struct Report {
     pub straightened_edges: Vec<cleanup::Straightened>,
     /// Redundant collinear vertices removed at short edges (geotechnical).
     pub short_edges: cleanup::Report,
+    /// Contour and junction chains generalized within the gap tolerance.
+    pub generalized_contours: cleanup::GeneralizedContours,
     /// Duplicated vertices merged before junction insertion (geotechnical).
     pub coincident_vertices: cleanup::MergeReport,
     /// Wall ends merged into nearby vertices (geotechnical).
@@ -1489,6 +1491,19 @@ fn assemble_impl(
         _ => cleanup::Report::default(),
     };
     timer.lap("short_edges");
+    let generalized_contours = match features {
+        Some(features) if features.maximum_gap > 0. => {
+            let (_, locked, _) = protected(&model, &axis_assembly);
+            cleanup::generalize_contours(
+                &mut model,
+                features.maximum_gap,
+                &locked,
+                &vertex_source_nodes,
+            )
+        }
+        _ => cleanup::GeneralizedContours::default(),
+    };
+    timer.lap("generalize");
     model.refresh_orphaned_edges();
     axis_assembly.imprinted = bars::imprint_surface_vertices(
         &mut model,
@@ -1531,6 +1546,7 @@ fn assemble_impl(
         stacked_walls,
         straightened_edges,
         short_edges,
+        generalized_contours,
         coincident_vertices: coincident,
         wall_ends,
         bar_ends,
