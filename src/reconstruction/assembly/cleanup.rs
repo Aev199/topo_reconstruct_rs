@@ -1766,6 +1766,11 @@ pub fn generalize_contours(
     report
 }
 
+/// Smallest angle a generalized edge may newly close with another edge or
+/// bar at a kept vertex (the trial mesh quality target): a narrower wedge
+/// would only be meshed with slivers.
+const WEDGE_ANGLE: f64 = 20. * std::f64::consts::PI / 180.;
+
 /// Segments other contours must keep clear of: used edges and bar pieces,
 /// hashed on a grid.
 struct Obstacles {
@@ -1845,8 +1850,14 @@ impl Obstacles {
                         } else {
                             [tri[0], tri[1]]
                         };
+                        // Nor may it close a wedge with the new edge.
+                        let (x, f) = (at(end), at(far) - at(end));
+                        let other = if end == p { tri[2] } else { tri[0] };
+                        let angle = |d: DVec3| d.angle_between(f);
+                        let (before, after) = (angle(tri[1] - x), angle(other - x));
                         point_triangle_distance(at(far), tri) <= self.slack
                             || segment_distance(at(end), at(far), side[0], side[1]) <= self.slack
+                            || (after < WEDGE_ANGLE && after < before - 1e-3)
                     }
                     None => segment_triangle_distance(at(a), at(b), tri) <= self.slack,
                 };
@@ -2122,6 +2133,38 @@ mod tests {
             );
             let r = generalize_contours(&mut m, 0.05 * place.scale, &BTreeSet::new(), &[], &[]);
             assert!(r.removed.is_empty(), "{r:?}");
+            assert_eq!(r.blocked, 1);
+            assert_eq!(m.surfaces[0].boundaries[0].len(), 5);
+        }
+    }
+
+    #[test]
+    fn generalization_never_closes_a_wedge_with_a_bar() {
+        // A slab edge 35 mm off a beam steps onto the beam's end node; the
+        // chord would run at a grazing angle to the beam.
+        let a = vec![
+            [0., -1., 0.],
+            [2.15, -1., 0.],
+            [2.15, 0., 0.],
+            [1.633, 0.035, 0.],
+            [1.116, 0.035, 0.],
+            [0.6, 0.035, 0.],
+            [0., 0.035, 0.],
+        ];
+        for place in Placement::all() {
+            let mut m = build(&place, &[(vec![a.clone()], [0., 0., 1.])]);
+            let end = m.add_vertex(place.point([0.3, 0., 0.])).unwrap();
+            let node = 2;
+            let axis = Axis {
+                source_axis: 0,
+                endpoints: [end, node],
+                anchors: vec![],
+                spans: vec![],
+            };
+            let locked = BTreeSet::from([end, node]);
+            let r = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[axis], &[]);
+            // Collinear vertices go, the step stays.
+            assert_eq!(r.removed.len(), 2, "{r:?}");
             assert_eq!(r.blocked, 1);
             assert_eq!(m.surfaces[0].boundaries[0].len(), 5);
         }
