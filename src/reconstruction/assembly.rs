@@ -704,6 +704,81 @@ fn covered_surfaces(model: &Model, stiffness: &[u32], precision: f64) -> BTreeSe
     covered
 }
 
+/// Surfaces narrower than twice their simplification tolerance that
+/// overlap a larger surface of their stiffness lying in nearly the same
+/// plane (within the plane angle and the tolerance): single elements of a
+/// warped corner folded partly onto the wall. Their material is the wall's.
+fn absorbed_slivers(
+    model: &Model,
+    stiffness: &[u32],
+    tolerance: &[f64],
+    angle: f64,
+    precision: f64,
+) -> BTreeSet<usize> {
+    let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * precision;
+    let surfaces = model.surfaces();
+    let planes = model.planes();
+    let area: Vec<f64> = surfaces.iter().map(|s| surface_area(&s.contours)).collect();
+    let mut by_stiffness = BTreeMap::<u32, Vec<usize>>::new();
+    for (s, &k) in stiffness.iter().enumerate() {
+        by_stiffness.entry(k).or_default().push(s);
+    }
+    let mut absorbed = BTreeSet::new();
+    let mut absorbing = BTreeSet::new();
+    for i in 0..surfaces.len() {
+        let tol = tolerance.get(i).copied().unwrap_or(0.);
+        let uv: Vec<glam::DVec2> = surfaces[i].contours[0]
+            .iter()
+            .map(|&p| glam::DVec2::from_array(p))
+            .collect();
+        if tol <= 0. || openings::minimum_width(&uv) >= 2. * tol {
+            continue;
+        }
+        let pi = &planes[surfaces[i].plane];
+        let points: Vec<[f64; 3]> = surfaces[i].contours[0]
+            .iter()
+            .map(|&p| pi.lift(p))
+            .collect();
+        let n = points.len() as f64;
+        let mean = points.iter().fold([0.; 3], |m, p| {
+            [m[0] + p[0] / n, m[1] + p[1] / n, m[2] + p[2] / n]
+        });
+        let found = by_stiffness[&stiffness[i]].iter().copied().find(|&j| {
+            let pj = &planes[surfaces[j].plane];
+            j != i
+                && !absorbed.contains(&j)
+                && area[j] > area[i]
+                && DVec3::from_array(pi.normal)
+                    .cross(DVec3::from_array(pj.normal))
+                    .length()
+                    <= angle.sin()
+                && points.iter().all(|p| pj.distance(*p).abs() <= tol)
+                // Overlapping it: its centre or a corner strictly inside.
+                && points.iter().chain([&mean]).any(|p| {
+                    let uv = pj.project(*p);
+                    super::closed_contains(&surfaces[j].contours, uv, -1.)
+                        && !surfaces[j].contours.iter().any(|ring| {
+                            (0..ring.len()).any(|k| {
+                                let a = glam::DVec2::from_array(ring[k]);
+                                let d = glam::DVec2::from_array(ring[(k + 1) % ring.len()]) - a;
+                                let q = glam::DVec2::from_array(uv);
+                                let t = ((q - a).dot(d) / d.length_squared().max(f64::MIN_POSITIVE))
+                                    .clamp(0., 1.);
+                                q.distance(a + d * t) <= slack
+                            })
+                        })
+                })
+        });
+        if let Some(j) = found {
+            if !absorbing.contains(&i) {
+                absorbed.insert(i);
+                absorbing.insert(j);
+            }
+        }
+    }
+    absorbed
+}
+
 fn ring_area(ring: &[u32], plane: &PlaneFrame, point: impl Fn(u32) -> [f64; 3]) -> f64 {
     let uv: Vec<_> = ring.iter().map(|&n| plane.project(point(n))).collect();
     (0..uv.len())
@@ -1620,12 +1695,35 @@ fn assemble_impl(
     // by the frame and gap closures; duplicated elements) adds nothing:
     // removed, the smaller one (equal ones: the later) going.
     if features.is_some() {
-        let covered = covered_surfaces(&model, &surface_stiffness, policy.precision);
+        let mut covered = covered_surfaces(&model, &surface_stiffness, policy.precision);
+        let absorbed = match features {
+            Some(features) => {
+                let tolerance: Vec<f64> = surface_stiffness
+                    .iter()
+                    .map(|&k| features.simplification(k))
+                    .collect();
+                absorbed_slivers(
+                    &model,
+                    &surface_stiffness,
+                    &tolerance,
+                    source.policy.angle,
+                    policy.precision,
+                )
+            }
+            None => BTreeSet::new(),
+        };
+        let absorbed: BTreeSet<usize> = absorbed.difference(&covered).copied().collect();
+        covered.extend(absorbed.iter().copied());
         if !covered.is_empty() {
             for &s in &covered {
                 let surface = &model.surfaces()[s];
                 removed_slivers.push(RemovedSliver {
-                    reason: "covered".into(),
+                    reason: if absorbed.contains(&s) {
+                        "absorbed"
+                    } else {
+                        "covered"
+                    }
+                    .into(),
                     patch: surface_source_patches[s],
                     stiffness: surface_stiffness[s],
                     source_elements: surface.source_elements.clone(),
@@ -1795,6 +1893,40 @@ fn assemble_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_narrow_piece_partly_on_a_wall_of_its_stiffness_is_absorbed() {
+        use super::junctions::tests::{build, Placement};
+        for place in Placement::all() {
+            // A 4 m wall and a 0.1 m element folded partly onto its edge in
+            // a plane 0.01 rad off; a 0.5 m piece is kept.
+            let wall = (
+                vec![vec![[0., 0., 0.], [4., 0., 0.], [4., 3., 0.], [0., 3., 0.]]],
+                [0., 0., 1.],
+            );
+            for (size, absorbed) in [(0.1, 1), (0.5, 0)] {
+                let tilt = 0.01;
+                let piece = (
+                    vec![vec![
+                        [3.95, 1., 0.],
+                        [3.95 + size, 1., size * tilt],
+                        [3.95 + size, 1. + size, size * tilt],
+                        [3.95, 1. + size, 0.],
+                    ]],
+                    [-tilt, 0., 1.],
+                );
+                let m = build(&place, &[wall.clone(), piece]);
+                let tolerance = [0.1 * place.scale; 2];
+                let r = absorbed_slivers(&m, &[7, 7], &tolerance, 0.02, 1e-7 * place.scale);
+                assert_eq!(r.len(), absorbed, "size {size}");
+                assert!(r.iter().all(|&s| s == 1));
+                // Another stiffness is never absorbed.
+                assert!(
+                    absorbed_slivers(&m, &[7, 8], &tolerance, 0.02, 1e-7 * place.scale).is_empty()
+                );
+            }
+        }
+    }
     fn planar_frame(mesh: &MeshData, up: DVec3) -> frame::Report {
         use super::super::recognize;
         let axes = recognize::recognize(
