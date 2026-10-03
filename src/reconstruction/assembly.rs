@@ -724,8 +724,11 @@ fn absorbed_slivers(
         by_stiffness.entry(k).or_default().push(s);
     }
     let mut absorbed = BTreeSet::new();
-    let mut absorbing = BTreeSet::new();
-    for i in 0..surfaces.len() {
+    // Smallest first: a piece absorbed into a larger piece that is itself
+    // absorbed goes with it.
+    let mut order: Vec<usize> = (0..surfaces.len()).collect();
+    order.sort_by(|&a, &b| area[a].total_cmp(&area[b]).then(a.cmp(&b)));
+    for i in order {
         let tol = tolerance.get(i).copied().unwrap_or(0.);
         let uv: Vec<glam::DVec2> = surfaces[i].contours[0]
             .iter()
@@ -766,11 +769,8 @@ fn absorbed_slivers(
                     own.intersection(&other).unsigned_area() > slack * slack
                 }
         });
-        if let Some(j) = found {
-            if !absorbing.contains(&i) {
-                absorbed.insert(i);
-                absorbing.insert(j);
-            }
+        if found.is_some() {
+            absorbed.insert(i);
         }
     }
     absorbed
