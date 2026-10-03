@@ -1916,7 +1916,15 @@ impl Obstacles {
                                     .map(|(x, y)| line_angle(*y - *x, f))
                                     .fold(std::f64::consts::FRAC_PI_2, f64::min);
                                 let new = line_angle(tri[2] - tri[0], f);
-                                near(tri[0], tri[2]) && new < WEDGE_ANGLE && new < old - 1e-3
+                                // Nor come closer to it than the old ones
+                                // without touching it: a near-coincident
+                                // line only meshes as a sliver.
+                                let gap = |x: DVec3, y: DVec3| segment_distance(x, y, pa, pb);
+                                let before = gap(tri[0], tri[1]).min(gap(tri[1], tri[2]));
+                                let after = gap(tri[0], tri[2]);
+                                near(tri[0], tri[2])
+                                    && ((new < WEDGE_ANGLE && new < old - 1e-3)
+                                        || after < before - self.slack)
                             }
                     }
                 };
@@ -2291,6 +2299,35 @@ mod tests {
             let r = generalize_contours(&mut m, &tolerance, &BTreeSet::new(), &[], &[]);
             assert_eq!(r.removed.len(), 2, "{r:?}");
             assert_eq!(r.blocked, 1);
+        }
+    }
+
+    #[test]
+    fn generalization_never_approaches_a_short_bar_beside_the_edge() {
+        // A slab edge 45 mm off a 0.7 m beam inside the slab steps away at
+        // both ends; the chord within a 0.2 m tolerance would pass 10 mm off
+        // the beam.
+        let a = vec![
+            [0., -1., 0.],
+            [3., -1., 0.],
+            [3., -0.005, 0.],
+            [1.8, 0.045, 0.],
+            [1.2, 0.045, 0.],
+            [0., -0.005, 0.],
+        ];
+        for place in Placement::all() {
+            let mut m = build(&place, &[(vec![a.clone()], [0., 0., 1.])]);
+            let ends =
+                [[1.15, 0., 0.], [1.85, 0., 0.]].map(|p| m.add_vertex(place.point(p)).unwrap());
+            let axis = Axis {
+                source_axis: 0,
+                endpoints: ends,
+                anchors: vec![],
+                spans: vec![],
+            };
+            let locked = BTreeSet::from(ends);
+            let r = generalize_contours(&mut m, &[0.2 * place.scale; 1], &locked, &[axis], &[]);
+            assert!(r.removed.is_empty(), "{r:?}");
         }
     }
 
