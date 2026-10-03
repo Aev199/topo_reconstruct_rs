@@ -125,6 +125,31 @@ State (2026-10-02, latest):
   gaps), 19 unshared point contacts and 4 unrepresented intersections in
   one knot of walls (surfaces 566-569, 595, 596).
 
+Tolerance ladder (user decisions 2026-10-03): section sizes change by
+decimetres in the target model, so the simplification tolerance of a
+surface is half its plate thickness (LIRA `GEI E nu H`), at least the 5 cm
+gap tolerance and at most 0.2 m (`--v2-simplification-cap`); a shared
+chain takes the tolerance of its thinnest surface. Free openings narrower
+than 1 m (smaller side of the minimum bounding rectangle,
+`--v2-min-opening`) are filled when no surface or bar is attached and
+nothing passes through (`topology.filled_openings`). Expansion joints are
+never closed: an in-plane gap wider than the crack width with constant
+width along twenty widths of contour stays open, unless the analysis
+model ties the two surfaces (bars, rigid links, two-node links such as
+LIRA type 55, rigid bodies of block 25): such structures are joined
+(Для testa: 2 cm slab/balcony gaps on type-55 links and 2 cm bars).
+Generalization keeps clear of bars and junction lines: no new wedge under
+20 degrees, no approach nearer than before without touching. Consoles are
+trimmed again after generalization.
+
+Ladder results (<1/<5/<20 degree trial triangles, vs 1d57ec3):
+Багратион bedding 71/259/2913 -> 40/113/334, strict passes, 4 openings
+filled; Багратион v4 10/54/1289 -> 11/56/1270, overlaps 8 -> 2, point
+contacts 29 -> 1, 138 openings filled, one 25 mm unlinked gap kept as a
+joint; Для testa 0/4/195 -> 0/4/259, strict passes, 96 openings filled,
+balconies joined; m6 0/0/204 -> 0/0/507 (min 7.1 -> 7.0); m5 0/0/25 ->
+0/0/79; m1, m2, n1-n4 unchanged.
+
 Geometry generalization (2026-10-03, `cleanup::generalize_contours`, last
 assembly step, after bar imprinting): every chain of contour/junction edges
 between fixed vertices (branch points, changes of the user-surface set,
