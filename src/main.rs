@@ -120,6 +120,20 @@ struct Args {
     #[arg(long)]
     v2_keep_gap_offsets: bool,
 
+    /// v2, геотехнический режим: верхняя граница допуска упрощения
+    /// поверхности. Допуск поверхности — половина её толщины (из жёсткости
+    /// GEI), но не меньше допуска зазоров и не больше этого значения.
+    /// В единицах модели.
+    #[arg(long, default_value_t = 0.2)]
+    v2_simplification_cap: f64,
+
+    /// v2, геотехнический режим: отверстия уже этого значения (меньшая
+    /// сторона описанного прямоугольника) заделываются, если к ним ничего
+    /// не примыкает и через них ничего не проходит. В единицах модели,
+    /// 0 — сохранить все отверстия.
+    #[arg(long, default_value_t = 1.0)]
+    v2_min_opening: f64,
+
     /// v2, для разработки: файл кэша решённого каркаса. Если файл есть и
     /// записан для того же входного файла и тех же параметров каркаса,
     /// каркас берётся из него (сборка и сетка пересчитываются), иначе
@@ -138,6 +152,8 @@ struct V2Tolerances {
     edge_collapse: f64,
     gap_closure: f64,
     gap_offsets: bool,
+    simplification_cap: f64,
+    min_opening: f64,
     /// Development cache of the solved frame (not a tolerance).
     frame_cache: Option<String>,
 }
@@ -165,6 +181,8 @@ fn run_v2_preview(
         ("--v2-crack-width", tolerances.crack_width),
         ("--v2-edge-collapse", tolerances.edge_collapse),
         ("--v2-gap-closure", tolerances.gap_closure),
+        ("--v2-simplification-cap", tolerances.simplification_cap),
+        ("--v2-min-opening", tolerances.min_opening),
     ] {
         if !value.is_finite() || value < 0. {
             return Err(format!("{name} must be a finite non-negative length").into());
@@ -331,6 +349,17 @@ fn run_v2_preview(
                 maximum_collapsed_edge: tolerances.edge_collapse,
                 maximum_gap: tolerances.gap_closure,
                 close_offset_gaps: tolerances.gap_offsets,
+                surface_thickness: V2LiraParser::parse_sections(input)?
+                    .into_iter()
+                    .filter_map(|(id, section)| match section {
+                        topo_reconstruct_rs::parsers::Section::Plate { thickness } => {
+                            Some((id, thickness))
+                        }
+                        _ => None,
+                    })
+                    .collect(),
+                maximum_simplification: tolerances.simplification_cap,
+                minimum_opening_width: tolerances.min_opening,
                 ..Default::default()
             },
         )?
@@ -396,6 +425,8 @@ fn main() {
         edge_collapse: args.v2_edge_collapse,
         gap_closure: args.v2_gap_closure,
         gap_offsets: !args.v2_keep_gap_offsets,
+        simplification_cap: args.v2_simplification_cap,
+        min_opening: args.v2_min_opening,
         frame_cache: args.v2_frame_cache.clone(),
     };
     let mut config = ReconstructionConfig::default();

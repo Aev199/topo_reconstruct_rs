@@ -436,7 +436,8 @@ def check(data, baseline=None):
     removed = [r["vertex"] for r in generalized.get("removed", [])]
     assert len(removed) == len(set(removed))
     for r in generalized.get("removed", []):
-        assert 0. <= r["deviation"] <= generalized["tolerance"] + epsilon
+        assert 0. <= r["deviation"] <= r["tolerance"] + epsilon
+        assert r["tolerance"] <= generalized["tolerance"] + epsilon
         assert r["vertex"] not in used
         if r["source_node"] is not None:
             assert r["source_node"] == source_nodes[r["vertex"]]

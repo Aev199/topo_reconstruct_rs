@@ -10,6 +10,13 @@ use std::path::Path;
 
 pub struct LiraParser;
 
+/// Габариты сечения из блока жёсткостей ЛИРА, в метрах.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Section {
+    Plate { thickness: f64 },
+    Bar { width: f64, height: f64 },
+}
+
 impl LiraParser {
     /// Потоковый параллельный парсинг текстового файла ЛИРА (.txt)
     pub fn parse<P: AsRef<Path>>(filepath: P) -> io::Result<MeshData> {
@@ -142,6 +149,53 @@ impl LiraParser {
             .collect()
     }
 
+    /// Толщины пластин и габариты сечений стержней (блок 3/), в метрах:
+    /// `GEI E nu H` — пластина толщиной H (м), `S0 E b h` — прямоугольное
+    /// сечение b x h (см). Прочие жёсткости пропускаются.
+    pub fn parse_sections<P: AsRef<Path>>(filepath: P) -> io::Result<HashMap<u32, Section>> {
+        let file = File::open(filepath)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self::sections_bytes(&mmap))
+    }
+
+    fn sections_bytes(content: &[u8]) -> HashMap<u32, Section> {
+        let Some(block) = Self::extract_block(content, b"3") else {
+            return HashMap::new();
+        };
+        block
+            .split(|&b| b == b'/')
+            .filter_map(|row| {
+                let mut words = Self::split_ascii_whitespace_bytes(row);
+                let id = std::str::from_utf8(words.next()?)
+                    .ok()?
+                    .parse::<u32>()
+                    .ok()?;
+                let kind = words.next()?;
+                let mut number = || {
+                    words
+                        .next()
+                        .and_then(|w| fast_parse_f64::<f64, _>(w).ok())
+                        .filter(|v| v.is_finite() && *v > 0.)
+                };
+                let section = match kind {
+                    b"GEI" => {
+                        let (_, _, h) = (number()?, number(), number()?);
+                        Section::Plate { thickness: h }
+                    }
+                    b"S0" => {
+                        let (_, b, h) = (number()?, number()?, number()?);
+                        Section::Bar {
+                            width: b / 100.,
+                            height: h / 100.,
+                        }
+                    }
+                    _ => return None,
+                };
+                (id != 0).then_some((id, section))
+            })
+            .collect()
+    }
+
     /// Быстрый поиск содержимого блока `( <id>/ ... )` без аллокаций строк
     fn extract_block<'a>(content: &'a [u8], block_id: &[u8]) -> Option<&'a [u8]> {
         let mut i = 0;
@@ -247,6 +301,22 @@ mod tests {
         assert!(!mesh.elements[1].is_shell());
         assert!(!mesh.elements[1].is_bar());
         assert!(mesh.elements[2].is_shell());
+    }
+    #[test]
+    fn plate_thickness_and_bar_sections_are_read_in_metres() {
+        let sections = LiraParser::sections_bytes(
+            b"( 3/ 1 GEI 2.34e+006 0.2 0.3 RO 2.5 / 2 S0 3e+006 40 90/ 0 RO 0.9/ \
+              0 Mu 0.2/ 3 1000 200000 200000 200000 0 0 / )",
+        );
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[&1], Section::Plate { thickness: 0.3 });
+        assert_eq!(
+            sections[&2],
+            Section::Bar {
+                width: 0.4,
+                height: 0.9
+            }
+        );
     }
     #[test]
     fn malformed_tokens_and_references_fail_instead_of_shifting_geometry() {

@@ -1518,9 +1518,16 @@ fn assemble_impl(
     let generalized_contours = match features {
         Some(features) if features.maximum_gap > 0. => {
             let (_, locked, _) = protected(&model, &axis_assembly);
+            let tolerance: Vec<f64> = (0..model.surfaces.len())
+                .map(|s| {
+                    surface_stiffness
+                        .get(s)
+                        .map_or(features.maximum_gap, |&k| features.simplification(k))
+                })
+                .collect();
             cleanup::generalize_contours(
                 &mut model,
-                features.maximum_gap,
+                &tolerance,
                 &locked,
                 &axis_assembly.axes,
                 &vertex_source_nodes,

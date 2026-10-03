@@ -40,6 +40,28 @@ pub struct FeaturePolicy {
     /// gaps within one plane (default true). Structures parallel to each
     /// other (slabs at different levels) are never brought together.
     pub close_offset_gaps: bool,
+    /// Plate thickness per stiffness (model units), where the input gives
+    /// one: the simplification tolerance of a surface is half of it.
+    pub surface_thickness: BTreeMap<u32, f64>,
+    /// Largest simplification tolerance of any surface (model units,
+    /// default: the gap tolerance; the geotechnical CLI uses 0.2 m). The
+    /// tolerance of a surface is half its thickness within
+    /// [`maximum_gap`, this].
+    pub maximum_simplification: f64,
+    /// Openings narrower than this (smaller side of their minimum bounding
+    /// rectangle) are filled when nothing is attached to or passes through
+    /// them (model units, 0 keeps all; the geotechnical CLI uses 1 m).
+    pub minimum_opening_width: f64,
+}
+impl FeaturePolicy {
+    /// Simplification tolerance of a surface of `stiffness`.
+    pub fn simplification(&self, stiffness: u32) -> f64 {
+        let half = self
+            .surface_thickness
+            .get(&stiffness)
+            .map_or(0., |t| 0.5 * t);
+        half.min(self.maximum_simplification).max(self.maximum_gap)
+    }
 }
 impl Default for FeaturePolicy {
     fn default() -> Self {
@@ -53,6 +75,9 @@ impl Default for FeaturePolicy {
             maximum_collapsed_edge: 0.05,
             maximum_gap: 0.05,
             close_offset_gaps: true,
+            surface_thickness: BTreeMap::new(),
+            maximum_simplification: 0.05,
+            minimum_opening_width: 0.,
         }
     }
 }
@@ -302,6 +327,19 @@ pub(super) fn simplify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn simplification_is_half_the_thickness_within_bounds() {
+        let policy = FeaturePolicy {
+            surface_thickness: BTreeMap::from([(1, 0.25), (2, 0.06), (3, 1.4)]),
+            maximum_simplification: 0.2,
+            ..Default::default()
+        };
+        assert_eq!(policy.simplification(1), 0.125);
+        assert_eq!(policy.simplification(2), 0.05);
+        assert_eq!(policy.simplification(3), 0.2);
+        assert_eq!(policy.simplification(4), 0.05);
+    }
 
     fn fixture(
         width: f64,

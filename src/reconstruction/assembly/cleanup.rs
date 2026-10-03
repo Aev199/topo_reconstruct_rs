@@ -1526,7 +1526,8 @@ fn length(model: &Model, e: usize) -> f64 {
 
 #[derive(Debug, Default, Serialize)]
 pub struct GeneralizedContours {
-    /// Largest distance of a removed vertex from the generalized line.
+    /// Largest tolerance of any chain (the tolerance of a chain is the
+    /// smallest of the surfaces using it).
     pub tolerance: f64,
     /// Chains of contour and junction edges between fixed vertices.
     pub chains: usize,
@@ -1545,6 +1546,8 @@ pub struct GeneralizedVertex {
     pub source_node: Option<u32>,
     /// Distance from the generalized line of its chain.
     pub deviation: f64,
+    /// Tolerance of its chain.
+    pub tolerance: f64,
 }
 
 /// Indices of `points` kept by Douglas-Peucker within `tolerance` (the ends
@@ -1589,11 +1592,12 @@ fn douglas_peucker(points: &[DVec3], tolerance: f64) -> Vec<usize> {
 /// kinks and short edges along a straight structural edge disappear.
 pub fn generalize_contours(
     model: &mut Model,
-    tolerance: f64,
+    surface_tolerance: &[f64],
     locked: &BTreeSet<usize>,
     axes: &[Axis],
     source_nodes: &[u32],
 ) -> GeneralizedContours {
+    let tolerance = surface_tolerance.iter().copied().fold(0., f64::max);
     let mut report = GeneralizedContours {
         tolerance,
         ..Default::default()
@@ -1694,6 +1698,17 @@ pub fn generalize_contours(
             continue;
         }
         let closed = chain.first() == chain.last();
+        let tolerance = model
+            .edge_between(chain[0], chain[1])
+            .and_then(|e| users.get(&e))
+            .map_or(0., |list| {
+                list.iter()
+                    .map(|&s| surface_tolerance.get(s).copied().unwrap_or(0.))
+                    .fold(f64::MAX, f64::min)
+            });
+        if tolerance <= 0. {
+            continue;
+        }
         let points: Vec<DVec3> = chain.iter().map(|&v| point(model, v)).collect();
         let mut keep: BTreeSet<usize> = if closed {
             // A ring: split at the vertex farthest from the first one.
@@ -1741,7 +1756,7 @@ pub fn generalize_contours(
             let v = chain[i];
             // Current neighbours: the last surviving vertex and the next one.
             let (prev, next) = (chain[*survivors.last().unwrap()], chain[i + 1]);
-            if obstacles.blocks(model, prev, v, next) {
+            if obstacles.blocks(model, prev, v, next, tolerance) {
                 survivors.push(i);
                 report.blocked += 1;
                 continue;
@@ -1760,6 +1775,7 @@ pub fn generalize_contours(
                     vertex: v,
                     source_node: source_nodes.get(v).copied(),
                     deviation,
+                    tolerance,
                 });
             } else {
                 survivors.push(i);
@@ -1780,8 +1796,6 @@ const WEDGE_ANGLE: f64 = 20. * std::f64::consts::PI / 180.;
 struct Obstacles {
     cell: f64,
     slack: f64,
-    /// Distance within which a bar piece guides the generalized line.
-    reach: f64,
     bars: BTreeSet<[usize; 2]>,
     grid: std::collections::HashMap<[i64; 3], Vec<[usize; 2]>>,
     alive: BTreeSet<[usize; 2]>,
@@ -1800,7 +1814,6 @@ impl Obstacles {
     ) -> Self {
         let mut o = Obstacles {
             cell: 20. * reach,
-            reach,
             bars,
             slack: model.precision * crate::reconstruction::mesh::ENDPOINT_SLACK,
             grid: Default::default(),
@@ -1840,11 +1853,11 @@ impl Obstacles {
     }
     /// Whether replacing `p - v - q` by `p - q` sweeps over another segment
     /// or vertex (it would overlap or touch another contour or bar).
-    fn blocks(&self, model: &Model, p: usize, v: usize, q: usize) -> bool {
+    fn blocks(&self, model: &Model, p: usize, v: usize, q: usize, reach: f64) -> bool {
         let at = |x: usize| DVec3::from_array(model.vertices[x]);
         let tri = [at(p), at(v), at(q)];
-        let lo = tri[0].min(tri[1]).min(tri[2]) - self.reach;
-        let hi = tri[0].max(tri[1]).max(tri[2]) + self.reach;
+        let lo = tri[0].min(tri[1]).min(tri[2]) - reach;
+        let hi = tri[0].max(tri[1]).max(tri[2]) + reach;
         let own = [key(p, v), key(v, q), key(p, q)];
         let mut tested = BTreeSet::new();
         // Angle between two lines, 0 to 90 degrees.
@@ -1886,9 +1899,8 @@ impl Obstacles {
                                 // A bar within reach: the new edge must not
                                 // graze it more than the old ones did.
                                 let f = pb - pa;
-                                let near = |x: DVec3, y: DVec3| {
-                                    segment_distance(x, y, pa, pb) <= self.reach
-                                };
+                                let near =
+                                    |x: DVec3, y: DVec3| segment_distance(x, y, pa, pb) <= reach;
                                 let old = [(tri[0], tri[1]), (tri[1], tri[2])]
                                     .iter()
                                     .filter(|(x, y)| near(*x, *y))
@@ -2128,7 +2140,7 @@ mod tests {
                 })
                 .unwrap();
             let locked = BTreeSet::from([middle]);
-            let r = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[], &[]);
+            let r = generalize_contours(&mut m, &[0.05 * place.scale; 2], &locked, &[], &[]);
             assert_eq!(r.removed.len(), 3, "{r:?}");
             assert_eq!(r.kept, 0);
             assert!(r
@@ -2144,8 +2156,36 @@ mod tests {
             assert_eq!(shared.len(), 2);
             assert!(shared.iter().all(|&e| m.edges[e].contains(&middle)));
             // Idempotent.
-            let again = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[], &[]);
+            let again = generalize_contours(&mut m, &[0.05 * place.scale; 2], &locked, &[], &[]);
             assert!(again.removed.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_shared_chain_takes_the_tolerance_of_its_thinnest_surface() {
+        // An 80 mm zigzag on the line both slabs share: within the tolerance
+        // of two thick slabs, beyond that of a thin one.
+        let zig = [[2., 0., 0.], [2.08, 2., 0.], [2., 4., 0.]];
+        let mut a = vec![[0., 0., 0.]];
+        a.extend(zig);
+        a.push([0., 4., 0.]);
+        let mut b: Vec<[f64; 3]> = zig.iter().rev().copied().collect();
+        b.extend([[4., 0., 0.], [4., 4., 0.]]);
+        b.reverse();
+        for place in Placement::all() {
+            for (thin, removed) in [(0.15, 1), (0.05, 0)] {
+                let mut m = build(
+                    &place,
+                    &[
+                        (vec![a.clone()], [0., 0., 1.]),
+                        (vec![b.clone()], [0., 0., 1.]),
+                    ],
+                );
+                let tolerance = [0.15 * place.scale, thin * place.scale];
+                let r = generalize_contours(&mut m, &tolerance, &BTreeSet::new(), &[], &[]);
+                assert_eq!(r.removed.len(), removed, "{r:?}");
+                assert!(r.removed.iter().all(|x| x.deviation <= x.tolerance));
+            }
         }
     }
 
@@ -2169,7 +2209,8 @@ mod tests {
                     (vec![c.clone()], [0., 0., 1.]),
                 ],
             );
-            let r = generalize_contours(&mut m, 0.05 * place.scale, &BTreeSet::new(), &[], &[]);
+            let r =
+                generalize_contours(&mut m, &[0.05 * place.scale; 2], &BTreeSet::new(), &[], &[]);
             assert!(r.removed.is_empty(), "{r:?}");
             assert_eq!(r.blocked, 1);
             assert_eq!(m.surfaces[0].boundaries[0].len(), 5);
@@ -2200,7 +2241,7 @@ mod tests {
                 spans: vec![],
             };
             let locked = BTreeSet::from([end, node]);
-            let r = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[axis], &[]);
+            let r = generalize_contours(&mut m, &[0.05 * place.scale; 2], &locked, &[axis], &[]);
             // Collinear vertices go, the step stays.
             assert_eq!(r.removed.len(), 2, "{r:?}");
             assert_eq!(r.blocked, 1);
@@ -2232,7 +2273,7 @@ mod tests {
                 spans: vec![],
             };
             let locked = BTreeSet::from(ends);
-            let r = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[axis], &[]);
+            let r = generalize_contours(&mut m, &[0.05 * place.scale; 2], &locked, &[axis], &[]);
             assert_eq!(r.removed.len(), 2, "{r:?}");
             assert_eq!(r.blocked, 1);
         }

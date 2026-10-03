@@ -1,3 +1,3 @@
 pub mod lira;
 
-pub use lira::LiraParser;
+pub use lira::{LiraParser, Section};
