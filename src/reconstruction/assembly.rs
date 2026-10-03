@@ -706,8 +706,8 @@ fn covered_surfaces(model: &Model, stiffness: &[u32], precision: f64) -> BTreeSe
 
 /// Surfaces narrower than twice their simplification tolerance that
 /// overlap a larger surface of their stiffness lying in nearly the same
-/// plane (within the plane angle and the tolerance): single elements of a
-/// warped corner folded partly onto the wall. Their material is the wall's.
+/// plane (within the plane angle and the tolerance) by a common area:
+/// single elements of a warped corner folded partly onto the wall. Their material is the wall's.
 fn absorbed_slivers(
     model: &Model,
     stiffness: &[u32],
@@ -739,10 +739,6 @@ fn absorbed_slivers(
             .iter()
             .map(|&p| pi.lift(p))
             .collect();
-        let n = points.len() as f64;
-        let mean = points.iter().fold([0.; 3], |m, p| {
-            [m[0] + p[0] / n, m[1] + p[1] / n, m[2] + p[2] / n]
-        });
         let found = by_stiffness[&stiffness[i]].iter().copied().find(|&j| {
             let pj = &planes[surfaces[j].plane];
             j != i
@@ -753,21 +749,22 @@ fn absorbed_slivers(
                     .length()
                     <= angle.sin()
                 && points.iter().all(|p| pj.distance(*p).abs() <= tol)
-                // Overlapping it: its centre or a corner strictly inside.
-                && points.iter().chain([&mean]).any(|p| {
-                    let uv = pj.project(*p);
-                    super::closed_contains(&surfaces[j].contours, uv, -1.)
-                        && !surfaces[j].contours.iter().any(|ring| {
-                            (0..ring.len()).any(|k| {
-                                let a = glam::DVec2::from_array(ring[k]);
-                                let d = glam::DVec2::from_array(ring[(k + 1) % ring.len()]) - a;
-                                let q = glam::DVec2::from_array(uv);
-                                let t = ((q - a).dot(d) / d.length_squared().max(f64::MIN_POSITIVE))
-                                    .clamp(0., 1.);
-                                q.distance(a + d * t) <= slack
-                            })
-                        })
-                })
+                // Overlapping it by a common area.
+                && {
+                    use geo::{Area, BooleanOps};
+                    let polygon = |rings: Vec<Vec<[f64; 2]>>| {
+                        let ring = |r: &Vec<[f64; 2]>| {
+                            geo::LineString::from(
+                                r.iter().chain(r.first()).map(|p| (p[0], p[1])).collect::<Vec<_>>(),
+                            )
+                        };
+                        geo::Polygon::new(ring(&rings[0]), rings[1..].iter().map(ring).collect())
+                    };
+                    let own = polygon(vec![points.iter().map(|p| pj.project(*p)).collect()]);
+                    let other = polygon(surfaces[j].contours.clone());
+                    // More than a strip of the point slack along the tolerance.
+                    own.intersection(&other).unsigned_area() > slack * tol
+                }
         });
         if let Some(j) = found {
             if !absorbing.contains(&i) {
@@ -1850,6 +1847,27 @@ fn assemble_impl(
         consoles.passes += again.passes;
     }
     timer.lap("consoles_after_generalization");
+    // Junctions changed by the later stages (a removed or absorbed piece,
+    // a straightened contour now crossing a wall) are represented again.
+    if let Some(features) = features {
+        let (interior, locked, _) = protected(&model, &axis_assembly);
+        let again = junctions::insert(
+            &mut model,
+            &junctions::Context {
+                interior: &interior,
+                locked: &locked,
+                wall_end_tolerance: features.maximum_wall_end_snap,
+            },
+        );
+        junctions.junctions.extend(again.junctions);
+        junctions.generated_vertices.extend(again.generated_vertices);
+        junctions.split_edges += again.split_edges;
+        junctions.embedded_edges += again.embedded_edges;
+        junctions.snapped_vertices.extend(again.snapped_vertices);
+        junctions.crossing_splits += again.crossing_splits;
+        junctions.issues.extend(again.issues);
+    }
+    timer.lap("junctions_after_generalization");
     model.refresh_orphaned_edges();
     bars::refresh_contacts(&model, &axis_assembly.axes, &mut axis_assembly.contacts);
     Ok(Report {
