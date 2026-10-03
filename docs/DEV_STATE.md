@@ -148,7 +148,8 @@ filled; Багратион v4 10/54/1289 -> 11/56/1270, overlaps 8 -> 2, point
 contacts 29 -> 1, 138 openings filled, one 25 mm unlinked gap kept as a
 joint; Для testa 0/4/195 -> 0/4/259, strict passes, 96 openings filled,
 balconies joined; m6 0/0/204 -> 0/0/507 (min 7.1 -> 7.0); m5 0/0/25 ->
-0/0/79; m1, m2, n1-n4 unchanged.
+0/0/79; ЖК Остров 11/185/5701 -> 12/98/6970, 660 openings filled,
+PLAXIS gaps 95 -> 61, 25 overlaps unchanged; m1, m2, n1-n4 unchanged.
 
 Geometry generalization (2026-10-03, `cleanup::generalize_contours`, last
 assembly step, after bar imprinting): every chain of contour/junction edges
