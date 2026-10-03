@@ -298,14 +298,19 @@ pub(super) fn simplify(
             && candidate_width <= precision
             && candidate_area <= threshold;
         let crack = source_width <= policy.maximum_crack_width;
+        // Closed by the frame to no area at all (three collinear corners)
+        // and narrower than the minimum opening, which is filled anyway.
+        let degenerate =
+            candidate_area <= precision * precision && source_width < policy.minimum_opening_width;
         if source_valid
-            && (collapsed || crack)
-            && exterior_area > 0.
-            && filled + source_area <= policy.maximum_filled_area_ratio * exterior_area
+            && (degenerate
+                || (collapsed || crack)
+                    && exterior_area > 0.
+                    && filled + source_area <= policy.maximum_filled_area_ratio * exterior_area)
         {
             filled += source_area;
             changes.push(SimplifiedHole {
-                reason: if collapsed {
+                reason: if collapsed || degenerate {
                     "collapsed_opening"
                 } else {
                     "crack_void"
@@ -333,6 +338,37 @@ pub(super) fn simplify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hole_closed_to_no_area_narrower_than_the_minimum_opening_is_filled() {
+        // A 0.3 m source triangle whose corners the frame made collinear.
+        let mut mesh = MeshData::default();
+        let nodes = [
+            (1, [0., 0., 0.]),
+            (2, [4., 0., 0.]),
+            (3, [4., 4., 0.]),
+            (4, [0., 4., 0.]),
+            (5, [1., 1., 0.]),
+            (6, [2., 1., 0.]),
+            (7, [1.5, 1.3, 0.]),
+        ];
+        for (id, p) in nodes {
+            mesh.nodes.insert(id, DVec3::from_array(p));
+        }
+        let mut points: BTreeMap<u32, DVec3> = mesh.nodes.iter().map(|(&k, &v)| (k, v)).collect();
+        points.insert(7, DVec3::new(1.5, 1., 0.));
+        let plane = PlaneFrame::new([0., 0., 0.], [0., 0., 1.]).unwrap();
+        for (opening, filled) in [(1.0, 1), (0., 0)] {
+            let policy = FeaturePolicy {
+                minimum_opening_width: opening,
+                ..Default::default()
+            };
+            let mut loops = vec![vec![1, 2, 3, 4], vec![5, 6, 7]];
+            let changes = simplify(&mut loops, &mesh, &points, &plane, 1e-6, &policy, 0, &[1]);
+            assert_eq!(changes.len(), filled);
+            assert_eq!(loops.len(), 2 - filled);
+        }
+    }
 
     #[test]
     fn simplification_is_half_the_thickness_within_bounds() {
