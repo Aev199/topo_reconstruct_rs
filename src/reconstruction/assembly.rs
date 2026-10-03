@@ -1491,20 +1491,6 @@ fn assemble_impl(
         _ => cleanup::Report::default(),
     };
     timer.lap("short_edges");
-    let generalized_contours = match features {
-        Some(features) if features.maximum_gap > 0. => {
-            let (_, locked, _) = protected(&model, &axis_assembly);
-            cleanup::generalize_contours(
-                &mut model,
-                features.maximum_gap,
-                &locked,
-                &axis_assembly.axes,
-                &vertex_source_nodes,
-            )
-        }
-        _ => cleanup::GeneralizedContours::default(),
-    };
-    timer.lap("generalize");
     model.refresh_orphaned_edges();
     axis_assembly.imprinted = bars::imprint_surface_vertices(
         &mut model,
@@ -1528,6 +1514,22 @@ fn assemble_impl(
         junctions.generated_vertices.extend(generated);
         axis_assembly.imprinted.extend(crossings);
     }
+    // Generalize last, once every bar node and crossing is imprinted.
+    let generalized_contours = match features {
+        Some(features) if features.maximum_gap > 0. => {
+            let (_, locked, _) = protected(&model, &axis_assembly);
+            cleanup::generalize_contours(
+                &mut model,
+                features.maximum_gap,
+                &locked,
+                &axis_assembly.axes,
+                &vertex_source_nodes,
+            )
+        }
+        _ => cleanup::GeneralizedContours::default(),
+    };
+    timer.lap("generalize");
+    model.refresh_orphaned_edges();
     bars::refresh_contacts(&model, &axis_assembly.axes, &mut axis_assembly.contacts);
     Ok(Report {
         policy: policy.clone(),

@@ -1667,24 +1667,28 @@ pub fn generalize_contours(
         }
     }
     report.chains = chains.len();
-    let bar_pieces = axes.iter().flat_map(|axis| {
-        let mut nodes: Vec<(f64, usize)> = axis.anchors.iter().map(|a| (a.t, a.vertex)).collect();
-        nodes.push((0., axis.endpoints[0]));
-        nodes.push((1., axis.endpoints[1]));
-        nodes.sort_by(|a, b| a.0.total_cmp(&b.0));
-        nodes.dedup_by_key(|n| n.1);
-        nodes
-            .windows(2)
-            .filter(|w| w[0].1 != w[1].1)
-            .map(|w| [w[0].1, w[1].1])
-            .collect::<Vec<_>>()
-    });
+    let bar_pieces: BTreeSet<[usize; 2]> = axes
+        .iter()
+        .flat_map(|axis| {
+            let mut nodes: Vec<(f64, usize)> =
+                axis.anchors.iter().map(|a| (a.t, a.vertex)).collect();
+            nodes.push((0., axis.endpoints[0]));
+            nodes.push((1., axis.endpoints[1]));
+            nodes.sort_by(|a, b| a.0.total_cmp(&b.0));
+            nodes.dedup_by_key(|n| n.1);
+            nodes
+                .windows(2)
+                .filter(|w| w[0].1 != w[1].1)
+                .map(|w| key(w[0].1, w[1].1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let segments: Vec<[usize; 2]> = users
         .keys()
         .map(|&e| model.edges[e])
-        .chain(bar_pieces)
+        .chain(bar_pieces.iter().copied())
         .collect();
-    let mut obstacles = Obstacles::new(model, segments.into_iter(), 20. * tolerance);
+    let mut obstacles = Obstacles::new(model, segments.into_iter(), tolerance, bar_pieces);
     for chain in chains {
         if chain.len() < 3 {
             continue;
@@ -1776,6 +1780,9 @@ const WEDGE_ANGLE: f64 = 20. * std::f64::consts::PI / 180.;
 struct Obstacles {
     cell: f64,
     slack: f64,
+    /// Distance within which a bar piece guides the generalized line.
+    reach: f64,
+    bars: BTreeSet<[usize; 2]>,
     grid: std::collections::HashMap<[i64; 3], Vec<[usize; 2]>>,
     alive: BTreeSet<[usize; 2]>,
 }
@@ -1785,9 +1792,16 @@ fn key(a: usize, b: usize) -> [usize; 2] {
 }
 
 impl Obstacles {
-    fn new(model: &Model, segments: impl Iterator<Item = [usize; 2]>, cell: f64) -> Self {
+    fn new(
+        model: &Model,
+        segments: impl Iterator<Item = [usize; 2]>,
+        reach: f64,
+        bars: BTreeSet<[usize; 2]>,
+    ) -> Self {
         let mut o = Obstacles {
-            cell,
+            cell: 20. * reach,
+            reach,
+            bars,
             slack: model.precision * crate::reconstruction::mesh::ENDPOINT_SLACK,
             grid: Default::default(),
             alive: BTreeSet::new(),
@@ -1829,16 +1843,22 @@ impl Obstacles {
     fn blocks(&self, model: &Model, p: usize, v: usize, q: usize) -> bool {
         let at = |x: usize| DVec3::from_array(model.vertices[x]);
         let tri = [at(p), at(v), at(q)];
-        let lo = tri[0].min(tri[1]).min(tri[2]);
-        let hi = tri[0].max(tri[1]).max(tri[2]);
+        let lo = tri[0].min(tri[1]).min(tri[2]) - self.reach;
+        let hi = tri[0].max(tri[1]).max(tri[2]) + self.reach;
         let own = [key(p, v), key(v, q), key(p, q)];
         let mut tested = BTreeSet::new();
+        // Angle between two lines, 0 to 90 degrees.
+        let line_angle = |d: DVec3, e: DVec3| {
+            let a = d.angle_between(e);
+            a.min(std::f64::consts::PI - a)
+        };
         for c in self.cells(lo, hi) {
             for &k in self.grid.get(&c).into_iter().flatten() {
                 if own.contains(&k) || !self.alive.contains(&k) || !tested.insert(k) {
                     continue;
                 }
                 let [a, b] = k;
+                let bar = self.bars.contains(&k);
                 let shared = [a, b].iter().position(|&x| x == p || x == q);
                 let hit = match shared {
                     // Touching at a kept end: the far end must stay clear,
@@ -1850,16 +1870,34 @@ impl Obstacles {
                         } else {
                             [tri[0], tri[1]]
                         };
-                        // Nor may it close a wedge with the new edge.
+                        // Nor may the new edge close a wedge with a bar.
                         let (x, f) = (at(end), at(far) - at(end));
                         let other = if end == p { tri[2] } else { tri[0] };
                         let angle = |d: DVec3| d.angle_between(f);
                         let (before, after) = (angle(tri[1] - x), angle(other - x));
                         point_triangle_distance(at(far), tri) <= self.slack
                             || segment_distance(at(end), at(far), side[0], side[1]) <= self.slack
-                            || (after < WEDGE_ANGLE && after < before - 1e-3)
+                            || (bar && after < WEDGE_ANGLE && after < before - 1e-3)
                     }
-                    None => segment_triangle_distance(at(a), at(b), tri) <= self.slack,
+                    None => {
+                        let (pa, pb) = (at(a), at(b));
+                        segment_triangle_distance(pa, pb, tri) <= self.slack
+                            || bar && {
+                                // A bar within reach: the new edge must not
+                                // graze it more than the old ones did.
+                                let f = pb - pa;
+                                let near = |x: DVec3, y: DVec3| {
+                                    segment_distance(x, y, pa, pb) <= self.reach
+                                };
+                                let old = [(tri[0], tri[1]), (tri[1], tri[2])]
+                                    .iter()
+                                    .filter(|(x, y)| near(*x, *y))
+                                    .map(|(x, y)| line_angle(*y - *x, f))
+                                    .fold(std::f64::consts::FRAC_PI_2, f64::min);
+                                let new = line_angle(tri[2] - tri[0], f);
+                                near(tri[0], tri[2]) && new < WEDGE_ANGLE && new < old - 1e-3
+                            }
+                    }
                 };
                 if hit {
                     return true;
@@ -2167,6 +2205,36 @@ mod tests {
             assert_eq!(r.removed.len(), 2, "{r:?}");
             assert_eq!(r.blocked, 1);
             assert_eq!(m.surfaces[0].boundaries[0].len(), 5);
+        }
+    }
+
+    #[test]
+    fn generalization_never_converges_onto_a_nearby_bar() {
+        // A slab edge 55 mm off a beam inside the slab steps to 4 mm off
+        // its end; the chord would converge onto the beam.
+        let a = vec![
+            [0., -1., 0.],
+            [2.15, -1., 0.],
+            [2.15, 0.004, 0.],
+            [1.6, 0.055, 0.],
+            [1.1, 0.055, 0.],
+            [0.6, 0.055, 0.],
+            [0., 0.055, 0.],
+        ];
+        for place in Placement::all() {
+            let mut m = build(&place, &[(vec![a.clone()], [0., 0., 1.])]);
+            let ends =
+                [[0.2, 0., 0.], [2.1, 0., 0.]].map(|p| m.add_vertex(place.point(p)).unwrap());
+            let axis = Axis {
+                source_axis: 0,
+                endpoints: ends,
+                anchors: vec![],
+                spans: vec![],
+            };
+            let locked = BTreeSet::from(ends);
+            let r = generalize_contours(&mut m, 0.05 * place.scale, &locked, &[axis], &[]);
+            assert_eq!(r.removed.len(), 2, "{r:?}");
+            assert_eq!(r.blocked, 1);
         }
     }
 

@@ -426,6 +426,20 @@ def check(data, baseline=None):
         else:
             assert 0 <= contact["start_t"] < contact["end_t"] <= 1
             assert all(abs(distance(surface, vertices[v])) <= epsilon for v in axis["endpoints"])
+    # Generalized contour vertices: removed from every surface, each within
+    # the generalization tolerance of its simplified chain.
+    generalized = topology.get("generalized_contours") or {}
+    used = {v for surface in model["surfaces"] for ring in surface["boundaries"]
+            for e in ring for v in model["edges"][e["edge"]]}
+    used |= {v for surface in model["surfaces"] for e in surface["embedded_edges"]
+             for v in model["edges"][e]}
+    removed = [r["vertex"] for r in generalized.get("removed", [])]
+    assert len(removed) == len(set(removed))
+    for r in generalized.get("removed", []):
+        assert 0. <= r["deviation"] <= generalized["tolerance"] + epsilon
+        assert r["vertex"] not in used
+        if r["source_node"] is not None:
+            assert r["source_node"] == source_nodes[r["vertex"]]
     if baseline:
         before = baseline["topology"]["preview"]
         old_axes = baseline["topology"].get("axis_assembly", {}).get("axes", [])
