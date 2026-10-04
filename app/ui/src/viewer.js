@@ -80,6 +80,7 @@ export class Viewer {
     this.size = Math.max(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2], 1e-3);
     for (const child of [...this.model.children]) {
       child.geometry.dispose();
+      child.material.dispose();
       this.model.remove(child);
     }
     const local = data.vertices.map((p) => [p[0] - this.offset.x, p[1] - this.offset.y, p[2] - this.offset.z]);
@@ -199,6 +200,7 @@ export class Viewer {
   setFindings(findings) {
     for (const child of [...this.marks.children]) {
       child.geometry.dispose();
+      child.material.dispose();
       this.marks.remove(child);
     }
     for (const cls of ['review', 'plaxis', 'failure']) {
@@ -224,6 +226,7 @@ export class Viewer {
   highlight(sel) {
     for (const child of [...this.selected.children]) {
       child.geometry.dispose();
+      child.material.dispose();
       this.selected.remove(child);
     }
     if (!this.data || !sel) return this.render();

@@ -15,8 +15,13 @@ pub struct Service {
     cache_dir: PathBuf,
     profile: Profile,
     input: Option<PathBuf>,
+    /// Content hash of the input as it was read for the open session.
+    input_hash: Option<String>,
     output: Option<pipeline::Output>,
     session: Option<Session>,
+    /// The journal as last saved in (or opened from) a project: edits
+    /// differing from it are unsaved.
+    saved_journal: Vec<crate::editor::Entry>,
 }
 
 /// Display data of the current geometry.
@@ -48,8 +53,10 @@ impl Service {
             cache_dir,
             profile: Profile::plaxis(),
             input: None,
+            input_hash: None,
             output: None,
             session: None,
+            saved_journal: vec![],
         }
     }
 
@@ -110,8 +117,8 @@ impl Service {
             }
             "journal" => to_value(&self.session()?.journal().to_vec()),
             "save_project" => {
-                self.save_project(Path::new(&text("path")?))?;
-                Ok(json!({"saved": text("path")?}))
+                let changed = self.save_project(Path::new(&text("path")?))?;
+                Ok(json!({"saved": text("path")?, "input_changed_on_disk": changed}))
             }
             "open_project" => self.open_project(Path::new(&text("path")?), progress),
             "export_report" => {
@@ -139,9 +146,16 @@ impl Service {
         }))
         .map_err(|_| "the reconstruction failed (internal error)".to_string())?
         .map_err(|e| e.to_string())?;
+        // The session must be the reconstruction of exactly these bytes.
+        let after = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if content_hash(&after) != content_hash(&bytes) {
+            return Err(format!("{} changed while it was being read; open it again", path.display()));
+        }
         self.session = Some(Session::new(&result.topology, profile.audit_options()));
         self.output = Some(result);
         self.input = Some(path.to_path_buf());
+        self.input_hash = Some(content_hash(&bytes));
+        self.saved_journal.clear();
         Ok(())
     }
 
@@ -154,6 +168,9 @@ impl Service {
             "surfaces": state.model.surfaces().len(),
             "bars": state.axes.len(),
             "edits": session.journal().len(),
+            // Edits not in the last saved project (opening another model
+            // would lose them).
+            "dirty": session.journal() != self.saved_journal.as_slice(),
             "can_redo": session.can_redo(),
             "audit": {
                 "passed": audit.passed,
@@ -275,22 +292,31 @@ impl Service {
             vertices,
             surfaces,
             bars,
-            bounds: [lo, hi],
+            // An empty model (every surface deleted) gets a finite unit box.
+            bounds: if lo[0] <= hi[0] { [lo, hi] } else { [[-1.; 3], [1.; 3]] },
         })
     }
 
-    fn save_project(&self, path: &Path) -> Result<(), String> {
+    /// Save the project; the input hash is that of the file the session
+    /// was reconstructed from. Returns whether the file on disk has changed
+    /// since.
+    fn save_project(&mut self, path: &Path) -> Result<bool, String> {
         let input = self.input.as_ref().ok_or("no model is open")?;
-        let bytes = std::fs::read(input).map_err(|e| e.to_string())?;
+        let opened = self.input_hash.clone().ok_or("no model is open")?;
+        let changed = std::fs::read(input)
+            .map(|bytes| content_hash(&bytes) != opened)
+            .unwrap_or(true);
         let project = Project {
             format: 1,
             input: input.display().to_string(),
-            input_hash: content_hash(&bytes),
+            input_hash: opened,
             profile: self.profile.clone(),
             journal: self.session()?.journal().to_vec(),
         };
         let text = serde_json::to_string_pretty(&project).map_err(|e| e.to_string())?;
-        std::fs::write(path, text).map_err(|e| e.to_string())
+        std::fs::write(path, text).map_err(|e| e.to_string())?;
+        self.saved_journal = project.journal;
+        Ok(changed)
     }
 
     fn open_project(
@@ -314,6 +340,13 @@ impl Service {
         self.profile = project.profile.clone();
         self.open_model(&input, progress)?;
         let (applied, stopped) = self.session_mut()?.replay(&project.journal);
+        // A fully replayed project is saved as is; a partly replayed one
+        // differs from the file (saving it would drop the rest).
+        self.saved_journal = if stopped.is_none() {
+            self.session()?.journal().to_vec()
+        } else {
+            project.journal.clone()
+        };
         let mut summary = self.summary()?;
         summary["replayed"] = json!(applied);
         summary["replay_stopped"] = json!(stopped);

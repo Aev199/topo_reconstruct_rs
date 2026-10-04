@@ -18,7 +18,12 @@ const errors = [];
 page.on('pageerror', (e) => errors.push(String(e)));
 page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 const answers = [];
-page.on('dialog', (d) => d.accept(answers.shift() ?? ''));
+const asked = [];
+page.on('dialog', (d) => {
+  const answer = answers.shift();
+  if (d.type() === 'confirm') asked.push(d.message());
+  return answer === false ? d.dismiss() : d.accept(answer ?? '');
+});
 const check = (cond, what) => {
   if (!cond) { console.error(`FAIL: ${what}`); process.exitCode = 1; } else console.log(`ok: ${what}`);
 };
@@ -31,6 +36,8 @@ await page.waitForFunction(() => window.topoEditor.state.scene, null, { timeout:
 await page.waitForSelector('#busy', { state: 'hidden' });
 let s = await summary();
 check(s.surfaces > 0, `model opened: ${s.surfaces} surfaces, ${s.bars} bars`);
+const header = await page.textContent('#audit-summary');
+check(header.includes('Геометрия и связность') && header.includes('Профиль PLAXIS'), `two verdicts: ${header}`);
 const findings = await page.$$eval('#findings li', (li) => li.length);
 check(findings === (await page.evaluate(() => window.topoEditor.state.audit.findings.filter((f) => f.class !== 'review').length)),
   `findings listed: ${findings}`);
@@ -92,6 +99,23 @@ await page.waitForFunction(() => document.querySelector('#status').textContent.i
   || document.querySelector('#status').classList.contains('error'), null, { timeout: 30 * 60 * 1000 });
 const statusText = await page.textContent('#status');
 check(statusText.includes('повторено правок: 1'), `project reopened: ${statusText}`);
+check((await summary()).dirty === false, 'reopened project has no unsaved edits');
+const journalText = await page.textContent('#journal');
+check(journalText.includes('Удаление поверхности'), `journal in Russian: ${journalText}`);
+// An unsaved edit: opening another project asks first; "no, no" cancels.
+await page.click('#undo');
+await page.waitForFunction(() => window.topoEditor.state.summary.dirty === true);
+await page.waitForSelector('#busy', { state: 'hidden' });
+asked.length = 0;
+answers.push(false, false);
+await page.click('#open-project');
+await page.waitForFunction(() => true);
+await new Promise((r) => setTimeout(r, 500));
+s = await summary();
+check(asked.length === 2 && s.dirty === true && s.edits === 0, `unsaved edits kept after cancel (${asked.length} questions)`);
+await page.click('#redo');
+await page.waitForFunction(() => window.topoEditor.state.summary.dirty === false);
+await page.waitForSelector('#busy', { state: 'hidden' });
 const report = path.resolve(out, 'edited-report.json');
 answers.push(report);
 await page.click('#export-report');

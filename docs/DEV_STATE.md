@@ -314,6 +314,16 @@ LSQR stops (ЖК Остров: nodes up to 6 cm apart between two valid
 solutions); a final touch pass makes the assembly robust to it. Tier C
 after the change: strict audit 11/12 as before, v4 the same 10 sites.
 
+External audit of 825f963 (fixed): opening a model/project with unsaved
+edits asks save / discard / cancel (`summary.dirty` against the journal
+last saved or fully replayed); a project stores the hash of the bytes
+actually reconstructed and saving reports a changed file on disk; the
+Tier C runner takes the PLAXIS verdict from `plaxis.json.passed`; the
+Python profile lists `user_edits.accepted_joints` separately
+(`accepted_joints`, `accepted`), not as gaps; the UI shows two verdicts
+(geometry/connectivity, PLAXIS profile) and accepted joints; empty scene
+has finite bounds; Russian journal labels; materials disposed.
+
 ## Next coherent development batch
 
 - Use the editor on the Багратион v4 residuals and record what the edits

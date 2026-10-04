@@ -35,6 +35,12 @@ class ProfileTests(unittest.TestCase):
         self.assertIn('gap', r['counts'])
         data = with_bars(model([xy()]), [[(0.5, 0.5, -1), (0.5, 0.5, -0.03)]])
         self.assertEqual(profile(data)['counts'], {'gap': 1})
+        # The editor marked the column end as a joint: an accepted exception.
+        node = next(v for v, p in enumerate(data['topology']['preview']['vertices']) if p[2] == -0.03)
+        data['topology']['user_edits'] = {'accepted_joints': [[node, 0]]}
+        r = profile(data)
+        self.assertTrue(r['passed'], r['counts'])
+        self.assertEqual(r['accepted_joints'], 1)
         # 0.1 m apart: not a gap at this element size.
         self.assertTrue(profile(model([xy(), wall(y=0.5, z0=-1, z1=-0.1)]))['passed'])
 

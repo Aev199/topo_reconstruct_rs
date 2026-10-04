@@ -31,6 +31,7 @@ aside { background: var(--panel); overflow: auto; padding: 8px 10px; }
 #audit-summary { padding: 6px 8px; border-radius: 6px; background: var(--bg); margin-bottom: 6px; }
 #audit-summary.passed { color: var(--ok); }
 #audit-summary.failed { color: var(--failure); }
+#audit-summary.warning { color: var(--plaxis); }
 .filters { display: flex; gap: 10px; margin: 4px 0 6px; color: var(--muted); }
 #findings { list-style: none; margin: 0; padding: 0; }
 #findings li { padding: 4px 6px; border-radius: 4px; cursor: pointer; border-left: 3px solid transparent; }

@@ -147,6 +147,11 @@ def profile(data, element_size=0.5, edge=None, width=None, gap=None, angle=10.):
     for s in surfaces:
         for v in vertex_sets[s.index]:
             owners.setdefault(v, []).append(s)
+    # Gaps the user accepted in the editor as joints of the structure
+    # (`topology.user_edits.accepted_joints`, [vertex, surface] pairs): listed
+    # separately as accepted exceptions, not PLAXIS items.
+    accepted = {(int(v), int(s)) for v, s in topology.get("user_edits", {}).get("accepted_joints", [])}
+    accepted_items = []
     candidates = sorted(set(owners) | bar_nodes)
     points = vertices[candidates]
     for b in surfaces:
@@ -162,9 +167,13 @@ def profile(data, element_size=0.5, edge=None, width=None, gap=None, angle=10.):
                 if explained(v, d, vertex_sets[b.index]):
                     explained_count += 1
                     continue
-                items.append(dict(kind="gap", vertex=v, surface=b.index, distance=float(d),
-                                  of=[s.index for s in owners.get(v, [])],
-                                  bar_node=v in bar_nodes, point=vertices[v].tolist()))
+                item = dict(kind="gap", vertex=v, surface=b.index, distance=float(d),
+                            of=[s.index for s in owners.get(v, [])],
+                            bar_node=v in bar_nodes, point=vertices[v].tolist())
+                if (v, b.index) in accepted:
+                    accepted_items.append(dict(item, kind="accepted_joint"))
+                else:
+                    items.append(item)
 
     counts = Counter(i["kind"] for i in items)
     return dict(
@@ -173,8 +182,10 @@ def profile(data, element_size=0.5, edge=None, width=None, gap=None, angle=10.):
         thresholds=dict(edge=edge, width=width, gap=gap, angle_degrees=angle),
         counts=dict(counts),
         explained_proximities=explained_count,
+        accepted_joints=len(accepted_items),
         passed=not items,
         items=items,
+        accepted=accepted_items,
     )
 
 
@@ -192,7 +203,7 @@ def main():
     result = profile(json.loads(args.report.read_text()), args.element_size,
                      args.edge, args.width, args.gap, args.angle)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2))
-    print(json.dumps({k: v for k, v in result.items() if k != "items"}, ensure_ascii=False, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k not in ("items", "accepted")}, ensure_ascii=False, indent=2))
     if args.strict and not result["passed"]:
         raise SystemExit(1)
 

@@ -1,7 +1,7 @@
 // Editor shell: toolbar, audit findings, selection and edit actions. All
 // geometry and every check live in the Rust core; this file only shows
 // them and sends edits.
-import { call, onProgress, pickFile } from './api.js';
+import { call, onProgress, pickFile, question } from './api.js';
 import { Viewer } from './viewer.js';
 
 const $ = (id) => document.getElementById(id);
@@ -29,6 +29,30 @@ const KIND = {
   short_bar: 'Короткий стержень',
 };
 const CLASS = { failure: 'ошибка', plaxis: 'PLAXIS', review: 'обзор' };
+const OP = {
+  move_vertex: 'Сдвиг вершины',
+  merge_vertices: 'Слияние вершин',
+  delete_surface: 'Удаление поверхности',
+  join_surfaces: 'Объединение поверхностей',
+  split_edge: 'Разбиение ребра',
+  close_gap: 'Закрытие зазора',
+  mark_joint: 'Зазор принят как шов',
+};
+/// Russian text of an edit outcome reported by the core.
+function outcome(text) {
+  if (!text) return 'готово';
+  const rules = [
+    [/^moved ([0-9.]+)$/, (m) => `сдвиг ${m[1]} м`],
+    [/^merged, moved ([0-9.]+)$/, (m) => `слито, сдвиг ${m[1]} м`],
+    [/^deleted$/, () => 'удалено'],
+    [/^joined$/, () => 'объединено'],
+    [/^split at ([0-9.]+), vertex (\d+)$/, (m) => `разбито в точке ${m[1]} длины, вершина ${m[2]}`],
+    [/^marked as joint$/, () => 'принят как шов'],
+    [/^(\w+), moved ([0-9.]+)$/, (m) => `${m[1] === 'onto_edge' ? 'на ребро' : m[1] === 'onto_vertex' ? 'в вершину' : 'на поверхность'}, сдвиг ${m[2]} м`],
+  ];
+  for (const [re, f] of rules) { const m = text.match(re); if (m) return f(m); }
+  return text;
+}
 
 const state = {
   summary: null,
@@ -124,11 +148,15 @@ function visibleFindings() {
 function renderSummary() {
   const s = state.summary;
   const a = s.audit;
+  const accepted = a.counts?.accepted_joint || 0;
   const box = $('audit-summary');
-  box.className = a.passed ? 'passed' : 'failed';
-  box.innerHTML = `<b>${a.passed ? 'Аудит пройден' : 'Аудит не пройден'}</b><br>`
-    + `ошибок ${a.failures} · PLAXIS ${a.plaxis} · обзор ${a.review}<br>`
-    + `<span class="meta">${s.surfaces} поверхностей · ${s.bars} стержней · правок ${s.edits}</span>`;
+  box.className = !a.passed ? 'failed' : a.plaxis_passed ? 'passed' : 'warning';
+  // Two separate verdicts: valid connected geometry, then the PLAXIS
+  // profile of small features (accepted joints are exceptions, not items).
+  box.innerHTML = `<b>Геометрия и связность: ${a.passed ? 'без ошибок' : `ошибок ${a.failures}`}</b><br>`
+    + `<b>Профиль PLAXIS: ${!a.passed ? 'не проверяется до исправления ошибок' : a.plaxis_passed ? 'пройден' : `замечаний ${a.plaxis}`}</b><br>`
+    + `${accepted ? `принятых швов ${accepted} · ` : ''}обзор ${a.review - accepted}<br>`
+    + `<span class="meta">${s.surfaces} поверхностей · ${s.bars} стержней · правок ${s.edits}${s.dirty ? ' (не сохранены)' : ''}</span>`;
   $('save-project').disabled = false;
   $('export-report').disabled = false;
   $('undo').disabled = s.edits === 0;
@@ -154,7 +182,8 @@ function renderJournal() {
   call('journal').then((entries) => {
     for (const e of entries) {
       const li = document.createElement('li');
-      li.innerHTML = `${e.edit.op} — ${e.outcome}${e.note ? `<div class="note">${e.note}</div>` : ''}`;
+      li.textContent = `${OP[e.edit.op] || e.edit.op} — ${outcome(e.outcome)}`;
+      if (e.note) { const n = document.createElement('div'); n.className = 'note'; n.textContent = KIND[e.note] || e.note; li.appendChild(n); }
       list.appendChild(li);
     }
   });
@@ -295,11 +324,32 @@ async function edit(change, note = '') {
   });
   if (result) {
     const a = result.audit;
-    status(`${change.op}: ${result.last?.outcome || 'готово'} · ошибок ${before?.failures ?? '?'} → ${a.failures}, PLAXIS ${before?.plaxis ?? '?'} → ${a.plaxis}`);
+    status(`${OP[change.op] || change.op}: ${outcome(result.last?.outcome)} · ошибок ${before?.failures ?? '?'} → ${a.failures}, PLAXIS ${before?.plaxis ?? '?'} → ${a.plaxis}`);
   }
 }
 
+/// Whether unsaved edits may be dropped: save them, discard them or stay.
+async function mayDiscard() {
+  if (!state.summary?.dirty) return true;
+  if (await question(`Правки (${state.summary.edits}) не сохранены в проекте. Сохранить проект сейчас?`)) return saveProject();
+  return question('Отбросить несохранённые правки и продолжить?');
+}
+
+async function saveProject() {
+  const path = await pickFile('project', true);
+  if (!path) return false;
+  const saved = await busy('Сохранение проекта…', () => call('save_project', { path }));
+  if (!saved) return false;
+  state.summary = await call('summary');
+  renderSummary();
+  status(saved.input_changed_on_disk
+    ? `Проект сохранён: ${path}. Внимание: файл модели на диске изменился после открытия — проект привязан к открытой версии.`
+    : `Проект сохранён: ${path}`, saved.input_changed_on_disk);
+  return true;
+}
+
 $('open-model').onclick = async () => {
+  if (!await mayDiscard()) return;
   const path = await pickFile('model');
   if (!path) return;
   const ok = await busy('Восстановление геометрии…', async () => {
@@ -312,6 +362,7 @@ $('open-model').onclick = async () => {
 };
 
 $('open-project').onclick = async () => {
+  if (!await mayDiscard()) return;
   const path = await pickFile('project');
   if (!path) return;
   const summary = await busy('Восстановление и повтор правок…', async () => {
@@ -328,10 +379,7 @@ $('open-project').onclick = async () => {
   }
 };
 
-$('save-project').onclick = async () => {
-  const path = await pickFile('project', true);
-  if (path && await busy('Сохранение проекта…', () => call('save_project', { path }))) status(`Проект сохранён: ${path}`);
-};
+$('save-project').onclick = () => saveProject();
 
 $('export-report').onclick = async () => {
   const path = await pickFile('report', true);

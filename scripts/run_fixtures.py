@@ -84,7 +84,11 @@ def run(model, binary, out, cache, extra, legacy=False):
     for key, check in checks.items():
         proc = subprocess.run(check, capture_output=True, text=True)
         result[key] = proc.returncode == 0
-        if proc.returncode != 0 and key != "plaxis":
+        if key == "plaxis":
+            # The profile exits 0 without --strict: its verdict is `passed`.
+            path = out / f"{name}.plaxis.json"
+            result[key] = proc.returncode == 0 and path.exists() and json.loads(path.read_text()).get("passed") is True
+        elif proc.returncode != 0:
             result[f"{key}_error"] = (proc.stderr or proc.stdout).strip()[-300:]
     audit_path = out / f"{name}.audit.json"
     if audit_path.exists():
