@@ -353,6 +353,47 @@ fn joint_length(
     best
 }
 
+/// Close the gap between vertex `v` and surface `s` on request (the
+/// editor: "this gap is not a joint"), moving `v` by at most `tolerance`
+/// from where it is; bar ends and anchors follow. Returns how it closed
+/// (`settled`, `merged`, `onto_edge`, `bent_edge`) and the movement. The
+/// model and bars are unchanged on error.
+pub fn close_single(
+    model: &mut Model,
+    bars: &mut Bars<'_>,
+    v: usize,
+    s: usize,
+    tolerance: f64,
+) -> Result<(String, f64), String> {
+    if v >= model.vertices.len() || s >= model.surfaces.len() {
+        return Err("no_such_vertex_or_surface".into());
+    }
+    let members = surface_vertices(model, s);
+    let g = gap(model, v, s, &members).ok_or("no_gap")?;
+    let overlap = overlaps(model, &g) || touches(model, &g);
+    let saved = (bars.axes.clone(), bars.contacts.clone());
+    let origin = model.vertices.clone();
+    match close_one(
+        model,
+        bars,
+        v,
+        s,
+        tolerance,
+        &BTreeSet::new(),
+        &origin,
+        overlap,
+    ) {
+        Ok((trial, kind, movement, _)) => {
+            *model = trial;
+            Ok((kind, movement))
+        }
+        Err(reason) => {
+            (*bars.axes, *bars.contacts) = saved;
+            Err(reason)
+        }
+    }
+}
+
 /// Close gaps narrower than `tolerance` between surface vertices (and bar
 /// nodes) and other surfaces, and overlaps shallower than the minimum edge
 /// within a plane.

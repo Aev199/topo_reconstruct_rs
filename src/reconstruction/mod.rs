@@ -47,6 +47,13 @@ impl PlaneFrame {
             v: n.cross(u).to_array(),
         })
     }
+    pub fn origin(&self) -> [f64; 3] {
+        self.origin
+    }
+    /// Unit normal.
+    pub fn normal(&self) -> [f64; 3] {
+        self.normal
+    }
     pub fn distance(&self, point: [f64; 3]) -> f64 {
         (DVec3::from_array(point) - DVec3::from_array(self.origin))
             .dot(DVec3::from_array(self.normal))
@@ -446,6 +453,151 @@ impl Model {
         target.boundaries = boundaries;
         target.embedded_edges = embedded;
         Ok(())
+    }
+
+    /// Join surface `other` into `keep`: both in one plane (every vertex of
+    /// `other` on the plane of `keep`), sharing at least one contour edge.
+    /// Shared contour edges leave the contours; one still used by a third
+    /// surface (a wall standing on the joint) stays as an embedded edge.
+    /// Source elements are united. Returns the new index of every old
+    /// surface (`other` is removed). The model is unchanged on error.
+    pub fn join_surfaces(
+        &mut self,
+        keep: usize,
+        other: usize,
+    ) -> Result<Vec<Option<usize>>, Error> {
+        if keep == other || keep >= self.surfaces.len() || other >= self.surfaces.len() {
+            return Err(Error::InvalidRing);
+        }
+        let frame = self.planes[self.surfaces[keep].plane].clone();
+        let users_of = |m: &Model, e: usize| -> usize {
+            (0..m.surfaces.len())
+                .filter(|&s| m.surface_edges(s).any(|x| x == e))
+                .count()
+        };
+        for e in self.surface_edges(other) {
+            for v in self.edges[e] {
+                if frame.distance(self.vertices[v]).abs() > self.precision {
+                    return Err(Error::NonPlanar);
+                }
+            }
+        }
+        // Directed contour edges of both, `other` oriented like `keep`.
+        let directed = |m: &Model, s: usize| -> Vec<Vec<(usize, usize, usize)>> {
+            m.surfaces[s]
+                .boundaries
+                .iter()
+                .map(|ring| {
+                    ring.iter()
+                        .map(|u| {
+                            let [a, b] = m.edges[u.edge];
+                            if u.reversed {
+                                (b, a, u.edge)
+                            } else {
+                                (a, b, u.edge)
+                            }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let signed = |ring: &[(usize, usize, usize)]| -> f64 {
+            ring.iter()
+                .map(|&(a, b, _)| {
+                    let (p, q) = (
+                        frame.project(self.vertices[a]),
+                        frame.project(self.vertices[b]),
+                    );
+                    p[0] * q[1] - p[1] * q[0]
+                })
+                .sum::<f64>()
+        };
+        let mine = directed(self, keep);
+        let mut theirs = directed(self, other);
+        if signed(&mine[0]).signum() != signed(&theirs[0]).signum() {
+            for ring in &mut theirs {
+                for x in ring.iter_mut() {
+                    *x = (x.1, x.0, x.2);
+                }
+            }
+        }
+        let mut uses: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+        for &(a, b, e) in mine.iter().chain(theirs.iter()).flatten() {
+            uses.entry(e).or_default().push((a, b));
+        }
+        let mut shared = vec![];
+        let mut out: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
+        for (e, list) in &uses {
+            match list[..] {
+                [(a, b)] => out.entry(a).or_default().push((b, *e)),
+                [(a, b), (c, d)] if a == d && b == c => shared.push(*e),
+                // The same edge in the same direction: overlapping material.
+                _ => return Err(Error::InvalidRing),
+            }
+        }
+        if shared.is_empty() {
+            return Err(Error::InvalidRing);
+        }
+        // Relink the remaining edges into rings; a vertex with two ways out
+        // (contours pinching) is refused.
+        if out.values().any(|v| v.len() != 1) {
+            return Err(Error::InvalidRing);
+        }
+        let mut rings: Vec<Vec<usize>> = vec![];
+        let mut seen = BTreeSet::new();
+        for &start in out.keys() {
+            if seen.contains(&start) {
+                continue;
+            }
+            let mut ring = vec![];
+            let mut v = start;
+            loop {
+                if !seen.insert(v) {
+                    break;
+                }
+                ring.push(v);
+                v = out.get(&v).ok_or(Error::InvalidRing)?[0].0;
+            }
+            if v != start {
+                return Err(Error::InvalidRing);
+            }
+            rings.push(ring);
+        }
+        let area = |ring: &[usize]| {
+            (0..ring.len())
+                .map(|i| {
+                    let (p, q) = (
+                        frame.project(self.vertices[ring[i]]),
+                        frame.project(self.vertices[ring[(i + 1) % ring.len()]]),
+                    );
+                    p[0] * q[1] - p[1] * q[0]
+                })
+                .sum::<f64>()
+                .abs()
+        };
+        rings.sort_by(|a, b| area(b).total_cmp(&area(a)));
+        let mut embedded: BTreeSet<usize> = self.surfaces[keep]
+            .embedded_edges
+            .iter()
+            .chain(self.surfaces[other].embedded_edges.iter())
+            .copied()
+            .collect();
+        for &e in &shared {
+            // Used by `keep` and `other`, and by a third surface.
+            if users_of(self, e) > 2 {
+                embedded.insert(e);
+            }
+        }
+        let mut trial = self.clone();
+        let mut sources = trial.surfaces[keep].source_elements.clone();
+        sources.extend(trial.surfaces[other].source_elements.iter().copied());
+        sources.sort_unstable();
+        sources.dedup();
+        trial.rebuild_surface(keep, rings, embedded.into_iter().collect())?;
+        trial.surfaces[keep].source_elements = sources;
+        let index = trial.remove_surfaces(&BTreeSet::from([other]));
+        *self = trial;
+        Ok(index)
     }
 
     /// Remove surfaces (their edges used by no other surface become

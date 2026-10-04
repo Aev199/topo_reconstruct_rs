@@ -4,6 +4,7 @@ pub mod bars;
 pub mod cleanup;
 pub mod consoles;
 pub mod cracks;
+pub mod edit;
 mod features;
 pub mod gaps;
 mod holes;

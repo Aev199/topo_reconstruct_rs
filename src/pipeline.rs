@@ -89,6 +89,18 @@ impl Profile {
     }
 }
 
+impl Profile {
+    /// Audit thresholds of this profile: near misses and PLAXIS items at
+    /// a tenth of the element size.
+    pub fn audit_options(&self) -> crate::audit::Options {
+        crate::audit::Options {
+            near_distance: 0.05,
+            element_size: self.element_size,
+            sharp_angle: 10.,
+        }
+    }
+}
+
 impl Default for Profile {
     fn default() -> Self {
         Self::plaxis()
@@ -125,6 +137,9 @@ pub struct Output {
     pub plane_recognition: planes::Report,
     pub relaxation: Relaxation,
     pub rigid_links: RigidLinks,
+    /// The in-application audit of the assembled geometry (the Python
+    /// auditors in `scripts/` remain the independent check).
+    pub audit: crate::audit::Report,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mesh: Option<mesh::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -235,6 +250,13 @@ pub fn run(
         &reconcile::Policy::default(),
     )?;
     stage("reconciliation");
+    let audit = crate::audit::run(
+        &topology.preview,
+        &topology.axis_assembly.axes,
+        &topology.axis_assembly.contacts,
+        &profile.audit_options(),
+    );
+    stage("audit");
     let (trial_mesh, mesh_error) = if options.mesh {
         match mesh::build_partial(
             &topology,
@@ -267,6 +289,7 @@ pub fn run(
             removed: rigid_links.len(),
             elements: rigid_links,
         },
+        audit,
         mesh: trial_mesh,
         mesh_error,
     })

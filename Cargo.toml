@@ -34,4 +34,6 @@ clap = { version = "4.5", features = ["derive"] }
 opt-level = 3
 lto = true
 codegen-units = 1
-panic = "abort"
+# Unwind: the editor turns a panic of a geometry library into an error
+# message (`catch_unwind`) instead of closing.
+panic = "unwind"

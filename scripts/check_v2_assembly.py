@@ -172,6 +172,11 @@ def check(data, baseline=None):
     # Junction vertices are created at edge/plane intersections after all
     # source vertices; they have no source node and are listed explicitly.
     generated = topology.get("junctions", {}).get("generated_vertices", [])
+    # Manual edits (the editor) log the vertices they create and move and
+    # the surfaces they remove; their journal is in `edits`.
+    user = topology.get("user_edits") or {}
+    generated = list(generated) + list(user.get("generated_vertices", []))
+    user_moved = set(user.get("moved_vertices", []))
     assert sorted(generated) == list(range(len(source_nodes), len(vertices)))
     lookup = {n: i for i, n in enumerate(frame["node_ids"])}
     budget = {n: frame["policy"]["maximum_movement"] for n in source_nodes}
@@ -272,7 +277,9 @@ def check(data, baseline=None):
     base_limit = topology["policy"]["junction_movement_limit"]
     for r in limits.values():
         assert base_limit < r <= base_limit * math.sqrt(3) + epsilon
-    for n, point in zip(source_nodes, vertices):
+    for v, (n, point) in enumerate(zip(source_nodes, vertices)):
+        if v in user_moved:
+            continue
         i = lookup[n]
         assert math.dist(point, frame["reference_points"][i]) <= budget[n] + epsilon
         assert math.dist(point, frame["candidate_points"][i]) <= limits.get(n, base_limit) + epsilon
@@ -296,6 +303,15 @@ def check(data, baseline=None):
             assert a["overlap"] > 0 and 0 <= a["lost_area"] <= s["area"] + epsilon
             assert a["lost_distance"] <= cap + epsilon
     actual_shells += [e for s in slivers for e in s["source_elements"]]
+    removed_by_user = user.get("removed_surfaces", [])
+    actual_shells += [e for r in removed_by_user if r["reason"] == "deleted" for e in r["source_elements"]]
+    joined_patches = collections.defaultdict(list)
+    for r in removed_by_user:
+        # A joined surface's material is in the surface it went into (or in
+        # that one's deletion record when it was deleted later).
+        if r["reason"] == "joined" and r["into"] is not None:
+            assert 0 <= r["into"] < len(model["surfaces"])
+            joined_patches[r["into"]].append((r["patch"], r["stiffness"]))
     assert collections.Counter(expected_shells) == collections.Counter(actual_shells)
     assert len(actual_shells) == len(set(actual_shells))
     assert len(model["edges"]) == len(set(tuple(e) for e in model["edges"]))
@@ -304,8 +320,12 @@ def check(data, baseline=None):
         plane = model["planes"][surface["plane"]]
         return sum((a - b) * n for a, b, n in zip(point, plane["origin"], plane["normal"]))
 
-    for surface, patch, stiffness in zip(model["surfaces"], topology["surface_source_patches"], topology["surface_stiffness"]):
-        assert set(surface["source_elements"]) <= set(frame["surfaces"][patch]["stiffness_regions"][str(stiffness)])
+    for index, (surface, patch, stiffness) in enumerate(zip(model["surfaces"], topology["surface_source_patches"], topology["surface_stiffness"])):
+        allowed = set(frame["surfaces"][patch]["stiffness_regions"][str(stiffness)])
+        for p, k in joined_patches.get(index, []):
+            assert k == stiffness
+            allowed |= set(frame["surfaces"][p]["stiffness_regions"][str(k)])
+        assert set(surface["source_elements"]) <= allowed
         for ring, contour in zip(surface["boundaries"], surface["contours"]):
             assert len(ring) == len(contour)
             plane = model["planes"][surface["plane"]]
