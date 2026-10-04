@@ -1491,6 +1491,18 @@ fn solve_impl(
     // One report per iteration limit (a linear solve records each until
     // `keep_going` declines; the nonlinear solve has one).
     let mut reports = vec![];
+    let timing = std::env::var_os("TOPO_TIMING").is_some();
+    let started = std::time::Instant::now();
+    if timing {
+        eprintln!(
+            "[frame] solve: {} unknowns, {} equations, {} terms, limits {:?}, snap {snap}, extra {}",
+            x.len(),
+            equations.len(),
+            equations.iter().map(|e| e.terms.len()).sum::<usize>(),
+            checkpoints,
+            extra.len()
+        );
+    }
     if maximum_steps == 0 {
         let mut error = None;
         let mut next = 0;
@@ -1502,7 +1514,15 @@ fn solve_impl(
             &mut |x, residual, iterations| {
                 let limit = checkpoints[next];
                 next += 1;
-                match finish((x, residual, iterations, 0, None, limit)) {
+                let lsqr = started.elapsed().as_secs_f64();
+                let result = finish((x, residual, iterations, 0, None, limit));
+                if timing {
+                    eprintln!(
+                        "[frame]   checkpoint {limit}: {iterations} iterations, residual {residual:.2e}, lsqr {lsqr:.1}s, report {:.1}s",
+                        started.elapsed().as_secs_f64() - lsqr
+                    );
+                }
+                match result {
                     Ok(report) => {
                         let more = keep_going(&report);
                         reports.push(report);
