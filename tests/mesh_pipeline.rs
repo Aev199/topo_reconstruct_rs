@@ -331,6 +331,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         bar_tees: Default::default(),
         cracks: vec![],
         removed_slivers: vec![],
+        surface_renumbering: vec![],
         short_edge_merges: assembly::cleanup::MergeReport::default(),
         gaps: assembly::gaps::Report::default(),
         short_bars: assembly::cleanup::BarCollapseReport::default(),
@@ -1105,6 +1106,17 @@ fn surface_lying_inside_another_of_its_stiffness_is_removed() {
                 .collect();
             assert_eq!(covered.len(), 1, "scale={scale} rotated={rotated}");
             assert_eq!(covered[0].source_elements, vec![5]);
+            // Earlier reports keep the old numbering; the map says where
+            // each surface went.
+            assert_eq!(topology.surface_renumbering.len(), 2);
+            assert_eq!(
+                topology
+                    .surface_renumbering
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+                vec![&0]
+            );
             assert_eq!(topology.preview.surfaces().len(), 1);
             assert_eq!(topology.surface_stiffness.len(), 1);
             assert!(trial.topology_valid, "{:?}", trial.blockers);

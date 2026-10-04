@@ -1049,7 +1049,9 @@ pub(crate) mod tests {
     /// Surfaces given as rings of coordinates. Equal coordinates in the input
     /// description denote one explicit vertex; the placement never merges.
     pub(crate) fn build(place: &Placement, surfaces: &[Panel]) -> Model {
-        let mut model = Model::new(1e-7 * place.scale, 0.001 * place.scale).unwrap();
+        // The production precision: micro-offset cases mean what they say.
+        let mut model =
+            Model::new(super::super::PRECISION * place.scale, 0.001 * place.scale).unwrap();
         let mut ids = BTreeMap::new();
         for (rings, normal) in surfaces {
             let n = place.rotation * DVec3::from_array(*normal);
@@ -1174,16 +1176,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn wall_top_a_micrometre_below_a_slab_is_settled_and_joined() {
+    fn wall_top_micrometres_below_a_slab_is_settled_and_joined() {
         for place in Placement::all() {
-            // 0.7 um below the slab: beyond the detection tolerance, far
+            // 7 um below the slab: beyond the detection tolerance, far
             // below the minimum edge length.
-            let mut m = build(&place, &[slab(0., 4.), wall(1., 3., -2., -7e-7)]);
+            let mut m = build(&place, &[slab(0., 4.), wall(1., 3., -2., -7e-6)]);
             let r = run(&mut m);
             assert!(r.issues.is_empty(), "{:?}", r.issues);
             assert_eq!(r.snapped_vertices.len(), 2);
             for snap in &r.snapped_vertices {
-                assert!(snap.distance < 1e-6 * place.scale);
+                assert!(snap.distance < 1e-5 * place.scale);
             }
             shared_cover(&m, &place, 0, 1, [1., 2., 0.], [3., 2., 0.]);
             assert_idempotent(&mut m);
@@ -1380,14 +1382,14 @@ pub(crate) mod tests {
     #[test]
     fn micro_offset_corner_is_snapped_instead_of_a_short_edge() {
         for place in Placement::all() {
-            // The wall base ends 5 µm past the slab edge x = 4: a source
-            // misalignment. Splitting there would leave a 5 µm edge.
-            let mut m = build(&place, &[slab(0., 4.), wall(2., 4.000005, 0., 2.)]);
+            // The wall base ends 50 µm past the slab edge x = 4: a source
+            // misalignment. Splitting there would leave a 50 µm edge.
+            let mut m = build(&place, &[slab(0., 4.), wall(2., 4.00005, 0., 2.)]);
             let r = run(&mut m);
             assert!(r.issues.is_empty(), "{:?}", r.issues);
             assert_eq!(r.snapped_vertices.len(), 1);
             let snap = &r.snapped_vertices[0];
-            assert!(snap.distance <= 5.1e-6 * place.scale, "{}", snap.distance);
+            assert!(snap.distance <= 5.1e-5 * place.scale, "{}", snap.distance);
             assert!(p3(snap.to).distance(p3(place.point([4., 2., 0.]))) <= m.precision);
             assert!(r.generated_vertices.is_empty());
             for s in 0..2 {
@@ -1404,13 +1406,13 @@ pub(crate) mod tests {
     #[test]
     fn wall_ending_just_short_of_slab_edge_is_closed() {
         for place in Placement::all() {
-            // The wall base stops 5 µm before the slab edge x = 4: the
-            // embedded line would end in a parasitic 5 µm gap.
-            let mut m = build(&place, &[slab(0., 4.), wall(2., 3.999995, 0., 2.)]);
+            // The wall base stops 50 µm before the slab edge x = 4: the
+            // embedded line would end in a parasitic 50 µm gap.
+            let mut m = build(&place, &[slab(0., 4.), wall(2., 3.99995, 0., 2.)]);
             let r = run(&mut m);
             assert!(r.issues.is_empty(), "{:?}", r.issues);
             assert_eq!(r.snapped_vertices.len(), 1);
-            assert!(r.snapped_vertices[0].distance <= 5.1e-6 * place.scale);
+            assert!(r.snapped_vertices[0].distance <= 5.1e-5 * place.scale);
             // The corner now lies on the slab contour, which is split there.
             let v = r.snapped_vertices[0].vertex;
             assert!(m.surfaces[0].boundaries[0]

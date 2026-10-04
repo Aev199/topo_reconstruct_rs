@@ -18,6 +18,12 @@ pub use holes::{HoleConstraint, HoleNodeChange, HoleOutcome, HoleRecovery};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Numerical planarity of the geotechnical model (metres): 1 um. Section
+/// sizes change by decimetres; a point on four nearly concurrent planes (a
+/// curved wall corner) must not stay split by a fraction of a micrometre.
+/// Points within ten precisions are one point (`mesh::ENDPOINT_SLACK`).
+pub const PRECISION: f64 = 1e-6;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Policy {
     /// Maximum normal deviation when reconciling support planes.
@@ -108,6 +114,11 @@ pub struct Report {
     /// Property regions no wider than a crack (degenerate source slivers),
     /// left out of the geometry (geotechnical).
     pub removed_slivers: Vec<RemovedSliver>,
+    /// Surface indices of the reports of the stages before covered and
+    /// absorbed surfaces are removed (junctions, gaps, consoles, merges)
+    /// mapped to the final surface indices; `null` for a removed surface.
+    /// Empty when no surface was removed (the numbering is the final one).
+    pub surface_renumbering: Vec<Option<usize>>,
     pub issues: Vec<Issue>,
     pub maximum_closure_movement: f64,
     pub rejected_vertices: BTreeMap<u32, String>,
@@ -639,10 +650,25 @@ fn surface_area(contours: &[Vec<[f64; 2]>]) -> f64 {
     contours.first().map_or(0., area) - contours.iter().skip(1).map(area).sum::<f64>()
 }
 
+/// A `geo` polygon of plane contours (exterior first, then holes).
+fn plane_polygon(rings: &[Vec<[f64; 2]>]) -> geo::Polygon<f64> {
+    let ring = |r: &Vec<[f64; 2]>| {
+        geo::LineString::from(
+            r.iter()
+                .chain(r.first())
+                .map(|p| (p[0], p[1]))
+                .collect::<Vec<_>>(),
+        )
+    };
+    geo::Polygon::new(ring(&rings[0]), rings[1..].iter().map(ring).collect())
+}
+
 /// Surfaces lying inside another surface of the same plane (within the
-/// point slack) and stiffness: every vertex of the exterior ring and its
-/// mean point inside the other's closed material. Of two equal ones the
-/// later goes; a covering surface is never removed itself.
+/// point slack) and stiffness: every vertex of the exterior ring inside
+/// the other's closed material, and no area outside it beyond a band of
+/// the point slack along its contour (a vertex test alone lets a surface
+/// bridge a notch of a nonconvex one). Of two equal ones the later goes;
+/// a covering surface is never removed itself.
 fn covered_surfaces(model: &Model, stiffness: &[u32], precision: f64) -> BTreeSet<usize> {
     let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * precision;
     let surfaces = model.surfaces();
@@ -693,6 +719,20 @@ fn covered_surfaces(model: &Model, stiffness: &[u32], precision: f64) -> BTreeSe
                     pj.distance(*p).abs() <= slack
                         && super::closed_contains(&surfaces[j].contours, pj.project(*p), slack)
                 })
+                && {
+                    use geo::{Area, BooleanOps};
+                    let own: Vec<[f64; 2]> = points[i].iter().map(|p| pj.project(*p)).collect();
+                    let perimeter: f64 = (0..own.len())
+                        .map(|k| {
+                            let (a, b) = (own[k], own[(k + 1) % own.len()]);
+                            (a[0] - b[0]).hypot(a[1] - b[1])
+                        })
+                        .sum();
+                    plane_polygon(&[own])
+                        .difference(&plane_polygon(&surfaces[j].contours))
+                        .unsigned_area()
+                        <= slack * perimeter
+                }
         });
         if let Some(j) = found {
             if !covering.contains(&i) {
@@ -755,16 +795,8 @@ fn absorbed_slivers(
                 // Overlapping it by a common area.
                 && {
                     use geo::{Area, BooleanOps};
-                    let polygon = |rings: Vec<Vec<[f64; 2]>>| {
-                        let ring = |r: &Vec<[f64; 2]>| {
-                            geo::LineString::from(
-                                r.iter().chain(r.first()).map(|p| (p[0], p[1])).collect::<Vec<_>>(),
-                            )
-                        };
-                        geo::Polygon::new(ring(&rings[0]), rings[1..].iter().map(ring).collect())
-                    };
-                    let own = polygon(vec![points.iter().map(|p| pj.project(*p)).collect()]);
-                    let other = polygon(surfaces[j].contours.clone());
+                    let own = plane_polygon(&[points.iter().map(|p| pj.project(*p)).collect()]);
+                    let other = plane_polygon(&surfaces[j].contours);
                     // More than a point (a square of the point slack).
                     own.intersection(&other).unsigned_area() > slack * slack
                 }
@@ -864,6 +896,7 @@ fn assemble_impl(
     // not a structure.
     let elements: BTreeMap<_, _> = mesh.elements.iter().map(|e| (e.id, e)).collect();
     let mut removed_slivers = vec![];
+    let mut surface_renumbering = vec![];
     if let Some(width) = features.map(|f| f.maximum_crack_width).filter(|&w| w > 0.) {
         regions.retain(|(patch, stiffness, ids)| {
             let plane = &source.candidate_planes[*patch];
@@ -1732,6 +1765,7 @@ fn assemble_impl(
                 simplified_holes.retain(|h| h.source_elements != ids);
             }
             let index = model.remove_surfaces(&covered);
+            surface_renumbering = index.clone();
             let kept = |s: &usize| index[*s].is_some();
             surface_source_patches = (0..index.len())
                 .filter(kept)
@@ -1900,6 +1934,7 @@ fn assemble_impl(
         short_edge_merges,
         short_bars,
         removed_slivers,
+        surface_renumbering,
         gaps,
         cracks,
         issues,
@@ -1913,6 +1948,49 @@ fn assemble_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_surface_bridging_a_notch_is_not_covered() {
+        use super::junctions::tests::{build, Placement};
+        for place in Placement::all() {
+            // A U-shaped slab and a strip of its stiffness whose vertices and
+            // mean point all lie on its arms, but which bridges the notch
+            // between them: not inside, kept. The same strip on one arm is
+            // covered.
+            let u = (
+                vec![vec![
+                    [0., 0., 0.],
+                    [3., 0., 0.],
+                    [3., 3., 0.],
+                    [2., 3., 0.],
+                    [2., 1., 0.],
+                    [1., 1., 0.],
+                    [1., 3., 0.],
+                    [0., 3., 0.],
+                ]],
+                [0., 0., 1.],
+            );
+            for (right, covered) in [(2.2, 0), (0.9, 1)] {
+                let strip = (
+                    vec![vec![
+                        [0.2, 2., 0.],
+                        [0.5, 2., 0.],
+                        [0.7, 2., 0.],
+                        [right, 2., 0.],
+                        [right, 2.5, 0.],
+                        [0.7, 2.5, 0.],
+                        [0.5, 2.5, 0.],
+                        [0.2, 2.5, 0.],
+                    ]],
+                    [0., 0., 1.],
+                );
+                let m = build(&place, &[u.clone(), strip]);
+                let r = covered_surfaces(&m, &[7, 7], 1e-6 * place.scale);
+                assert_eq!(r.len(), covered, "right edge {right}");
+                assert!(r.iter().all(|&s| s == 1));
+            }
+        }
+    }
 
     #[test]
     fn a_narrow_piece_partly_on_a_wall_of_its_stiffness_is_absorbed() {

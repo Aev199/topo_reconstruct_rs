@@ -332,14 +332,18 @@ fn joint_length(
             };
             let n = ids.len();
             let mut length = 0.;
+            // Forward, then backward over the edges not walked yet: a ring
+            // wholly within the band counts once.
+            let mut left = n;
             for step in [1, n - 1] {
                 let mut i = start;
-                for _ in 1..n {
+                while left > 0 {
                     let j = (i + step) % n;
                     if !same(ids[j]) {
                         break;
                     }
                     length += at(ids[i]).distance(at(ids[j]));
+                    left -= 1;
                     i = j;
                 }
             }
@@ -551,6 +555,32 @@ mod tests {
         Bars {
             axes: Box::leak(Box::new(vec![])),
             contacts: Box::leak(Box::new(vec![])),
+        }
+    }
+
+    #[test]
+    fn a_ring_within_the_joint_band_counts_once() {
+        for place in Placement::all() {
+            // A 5 mm x 0.2 m strip 30-35 mm beside a slab: every vertex of
+            // it is in the band, its contour (0.41 m) counts once and stays
+            // under twenty widths (0.6 m).
+            let strip = (
+                vec![vec![
+                    [2.03, 1., 0.],
+                    [2.035, 1., 0.],
+                    [2.035, 1.2, 0.],
+                    [2.03, 1.2, 0.],
+                ]],
+                [0., 0., 1.],
+            );
+            let m = build(&place, &[slab(0., 2.), strip]);
+            let members = surface_vertices(&m, 0);
+            let v = (0..m.vertices.len())
+                .find(|&v| !members.contains(&v))
+                .unwrap();
+            let width = gap(&m, v, 0, &members).unwrap().outside;
+            let length = joint_length(&m, v, 0, width, &members, &BTreeSet::new());
+            assert!((length - 0.41 * place.scale).abs() < 1e-9 * place.scale.max(1.));
         }
     }
 

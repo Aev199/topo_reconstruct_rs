@@ -338,10 +338,7 @@ fn run_v2_preview(
         // is offset by at most the tolerance at its junction, and its slight
         // non-parallelism elsewhere is measured against the closure tolerance.
         junction_movement_limit: tolerances.stack_offset.max(0.05) + 0.001,
-        // Numerical planarity: 1 um. Section sizes change by decimetres;
-        // a point on four nearly concurrent planes (a curved wall corner)
-        // must not stay split by a fraction of a micrometre.
-        precision: 1e-6,
+        precision: assembly::PRECISION,
         minimum_edge: 0.001,
     };
     let topology = if preserve_details {

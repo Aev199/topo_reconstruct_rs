@@ -1533,7 +1533,8 @@ pub struct GeneralizedContours {
     pub chains: usize,
     pub removed: Vec<GeneralizedVertex>,
     /// Vertices kept although selected, because removing them would make a
-    /// contour invalid.
+    /// contour invalid or leave a removed vertex beyond the tolerance of
+    /// the final edge (a kept or blocked vertex bends the chord).
     pub kept: usize,
     /// Vertices kept because the shortcut would sweep over another contour,
     /// junction line, bar or vertex.
@@ -1756,40 +1757,69 @@ pub fn generalize_contours(
         };
         keep.insert(0);
         keep.insert(chain.len() - 1);
-        let mut survivors = vec![0];
-        for i in 1..chain.len() - 1 {
-            if keep.contains(&i) {
-                survivors.push(i);
-                continue;
-            }
-            let v = chain[i];
-            // Current neighbours: the last surviving vertex and the next one.
-            let (prev, next) = (chain[*survivors.last().unwrap()], chain[i + 1]);
-            if obstacles.blocks(model, prev, v, next, tolerance) {
-                survivors.push(i);
-                report.blocked += 1;
-                continue;
-            }
-            // Distance from the generalized segment holding it.
-            let lo = *keep.range(..i).next_back().unwrap();
-            let hi = *keep.range(i..).next().unwrap();
+        // Distance of chain point `i` from the segment between points `lo`
+        // and `hi`.
+        let deviation = |i: usize, lo: usize, hi: usize| {
             let (a, b) = (points[lo], points[hi]);
             let d = b - a;
             let t =
                 ((points[i] - a).dot(d) / d.length_squared().max(f64::MIN_POSITIVE)).clamp(0., 1.);
-            let deviation = points[i].distance(a + d * t);
+            points[i].distance(a + d * t)
+        };
+        let mut survivors = vec![0];
+        // Removed since the last survivor: they lie on the new edge
+        // `prev - next` and must stay within the tolerance of it. A kept
+        // vertex between Douglas-Peucker ends bends the chord, so the
+        // Douglas-Peucker bound alone does not hold for its neighbours.
+        let mut pending: Vec<usize> = vec![];
+        let mut removed: Vec<(usize, usize)> = vec![];
+        for i in 1..chain.len() - 1 {
+            if keep.contains(&i) {
+                survivors.push(i);
+                pending.clear();
+                continue;
+            }
+            let v = chain[i];
+            // Current neighbours: the last surviving vertex and the next one.
+            let last = *survivors.last().unwrap();
+            let (prev, next) = (chain[last], chain[i + 1]);
+            if pending
+                .iter()
+                .chain([&i])
+                .any(|&j| deviation(j, last, i + 1) > tolerance)
+            {
+                survivors.push(i);
+                pending.clear();
+                report.kept += 1;
+                continue;
+            }
+            if obstacles.blocks(model, prev, v, next, tolerance) {
+                survivors.push(i);
+                pending.clear();
+                report.blocked += 1;
+                continue;
+            }
             if model.remove_vertex(v, f64::MAX).is_ok() {
                 obstacles.replace(model, [prev, v], [v, next], [prev, next]);
+                pending.push(i);
+                removed.push((i, report.removed.len()));
                 report.removed.push(GeneralizedVertex {
                     vertex: v,
                     source_node: source_nodes.get(v).copied(),
-                    deviation,
+                    deviation: 0.,
                     tolerance,
                 });
             } else {
                 survivors.push(i);
+                pending.clear();
                 report.kept += 1;
             }
+        }
+        // Deviation from the final generalized edge holding each vertex.
+        survivors.push(chain.len() - 1);
+        for (i, r) in removed {
+            let at = survivors.partition_point(|&s| s < i);
+            report.removed[r].deviation = deviation(i, survivors[at - 1], survivors[at]);
         }
     }
     report
@@ -2203,6 +2233,54 @@ mod tests {
                 assert_eq!(r.removed.len(), removed, "{r:?}");
                 assert!(r.removed.iter().all(|x| x.deviation <= x.tolerance));
             }
+        }
+    }
+
+    #[test]
+    fn a_blocked_vertex_never_leaves_its_neighbours_beyond_the_tolerance() {
+        // The edge y = 0 of a slab (material above) has a 40 mm bump out at
+        // x = 1 and a 45 mm notch in at x = 2 holding the corner of a
+        // separate slab, all within 50 mm of the chord: the notch stays, so
+        // the bump, 62.5 mm off the edge to the notch, must stay too.
+        let a = vec![
+            [0., 0., 0.],
+            [1., -0.04, 0.],
+            [2., 0.045, 0.],
+            [3., 0., 0.],
+            [4., 0., 0.],
+            [4., 3., 0.],
+            [0., 3., 0.],
+        ];
+        let c = vec![[1.5, -1., 0.], [2.5, -1., 0.], [2., 0.02, 0.]];
+        for place in Placement::all() {
+            let mut m = build(
+                &place,
+                &[
+                    (vec![a.clone()], [0., 0., 1.]),
+                    (vec![c.clone()], [0., 0., 1.]),
+                ],
+            );
+            let tolerance = 0.05 * place.scale;
+            let r = generalize_contours(&mut m, &[tolerance; 2], &BTreeSet::new(), &[], &[]);
+            // The bump and the notch stay, the collinear vertex goes.
+            assert_eq!(r.kept + r.blocked, 2, "{r:?}");
+            assert_eq!(r.removed.len(), 1, "{r:?}");
+            // Every removed vertex lies within the tolerance of the final
+            // contour, and the report says how far.
+            let ring = &m.surfaces[0].boundaries[0];
+            for x in &r.removed {
+                let p = DVec3::from_array(m.vertices[x.vertex]);
+                let nearest = ring
+                    .iter()
+                    .map(|u| {
+                        let [s, t] = m.edges[u.edge].map(|v| DVec3::from_array(m.vertices[v]));
+                        p.distance(closest_on_segment(p, s, t))
+                    })
+                    .fold(f64::MAX, f64::min);
+                assert!(nearest <= tolerance, "{nearest}");
+                assert!((x.deviation - nearest).abs() <= 1e-9 * place.scale.max(1.));
+            }
+            assert_eq!(ring.len(), 6);
         }
     }
 
