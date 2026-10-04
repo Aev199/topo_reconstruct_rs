@@ -149,7 +149,10 @@ impl Service {
         // The session must be the reconstruction of exactly these bytes.
         let after = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if content_hash(&after) != content_hash(&bytes) {
-            return Err(format!("{} changed while it was being read; open it again", path.display()));
+            return Err(format!(
+                "{} changed while it was being read; open it again",
+                path.display()
+            ));
         }
         self.session = Some(Session::new(&result.topology, profile.audit_options()));
         self.output = Some(result);
@@ -293,7 +296,11 @@ impl Service {
             surfaces,
             bars,
             // An empty model (every surface deleted) gets a finite unit box.
-            bounds: if lo[0] <= hi[0] { [lo, hi] } else { [[-1.; 3], [1.; 3]] },
+            bounds: if lo[0] <= hi[0] {
+                [lo, hi]
+            } else {
+                [[-1.; 3], [1.; 3]]
+            },
         })
     }
 

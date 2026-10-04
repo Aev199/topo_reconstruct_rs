@@ -816,7 +816,7 @@ pub fn collapse_short_bars(
 /// together): `drop` merges into `keep` within `limit`, a bar left without
 /// length is removed. Nothing changes on failure.
 #[allow(clippy::too_many_arguments)]
-fn collapse_piece(
+pub(super) fn collapse_piece(
     model: &mut Model,
     bars: &mut Bars<'_>,
     drop: usize,

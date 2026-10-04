@@ -177,6 +177,10 @@ def check(data, baseline=None):
     user = topology.get("user_edits") or {}
     generated = list(generated) + list(user.get("generated_vertices", []))
     user_moved = set(user.get("moved_vertices", []))
+    # Bars whose nodes an edit changed (a shared node, a collapsed piece):
+    # still straight through their nodes, no longer one to one with the
+    # source bar.
+    user_bars = set(user.get("edited_bars", []))
     assert sorted(generated) == list(range(len(source_nodes), len(vertices)))
     lookup = {n: i for i, n in enumerate(frame["node_ids"])}
     budget = {n: frame["policy"]["maximum_movement"] for n in source_nodes}
@@ -427,6 +431,13 @@ def check(data, baseline=None):
         assert len(axis["endpoints"]) == 2
         a, b = (vertices[v] for v in axis["endpoints"])
         assert math.dist(a, b) > epsilon
+        if axis["source_axis"] in user_bars:
+            for anchor in axis["anchors"]:
+                assert 0 <= anchor["t"] <= 1
+                interpolated = [x + (y - x) * anchor["t"] for x, y in zip(a, b)]
+                assert math.dist(interpolated, vertices[anchor["vertex"]]) <= 10 * epsilon
+            assert all(0 <= s["start_t"] < s["end_t"] <= 1 for s in axis["spans"])
+            continue
         assert [identity(n) for n in (source_nodes[v] for v in axis["endpoints"])] == [
             identity(frame["node_ids"][i]) for i in original["endpoints"]]
         parameters = {}

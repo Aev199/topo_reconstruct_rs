@@ -324,6 +324,24 @@ Python profile lists `user_edits.accepted_joints` separately
 (geometry/connectivity, PLAXIS profile) and accepted joints; empty scene
 has finite bounds; Russian journal labels; materials disposed.
 
+Editor sufficiency (2026-10-04, checked on Багратион v4 with
+`examples/edit_probe.rs`, which applies journal edits to a real model and
+prints the audit change): all 4 failures close in 4 clicks — the two
+coplanar overlaps (a stiffer zone whose contour skips a vertex of the
+slab hole, or detours 2 cm) and the point contact by `merge_vertices`, the
+bar intersection (bar bent 9 um at a shared node) by `connect_bars`; the
+edited report passes the assembly checker and the strict audit except the
+6 grazing `bar_in_surface_without_contact` items (open question). New
+edits: `connect_bars` (shared node; a node slides along its bars, a bar
+end is drawn onto the other bar, never bent), `connect_bar_to_surfaces`,
+`connect_surfaces` (junction of a pair as shared edges), `delete_bar`,
+`merge_vertices` of consecutive bar nodes collapses the piece (provenance
+in `user_edits.removed_bars`), `move_vertex` slides an interior bar node
+along its bars; edited bars are listed in `user_edits.edited_bars`. Not
+yet closable in the editor: gaps between near-parallel planes (3.7 cm
+wall foot / slab bottom on v4: needs a "move surface to plane" edit),
+short edges where a merge would create another short edge.
+
 ## Next coherent development batch
 
 - Use the editor on the Багратион v4 residuals and record what the edits

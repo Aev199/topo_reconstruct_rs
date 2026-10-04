@@ -1002,6 +1002,41 @@ pub fn insert(model: &mut Model, context: &Context<'_>) -> Report {
     report
 }
 
+/// Insert the junction of two given surfaces (the editor's "connect"):
+/// their intersection line, T-junction or common boundary becomes shared
+/// edges, then embedded edges touching other edges are resolved.
+pub fn insert_pair(model: &mut Model, context: &Context<'_>, a: usize, b: usize) -> Report {
+    let tol = model.precision * DETECTION_FACTOR;
+    let mut report = Report {
+        detection_tolerance: tol,
+        candidate_pairs: 1,
+        ..Default::default()
+    };
+    if let Some((line, segments)) = angled(model, a, b, tol) {
+        for (start, end) in segments {
+            let seg = Segment {
+                surfaces: [a, b],
+                line: &line,
+                start,
+                end,
+            };
+            process(model, seg, context, tol, &mut report);
+        }
+    } else {
+        for (line, start, end) in coplanar(model, a, b, tol) {
+            let seg = Segment {
+                surfaces: [a, b],
+                line: &line,
+                start,
+                end,
+            };
+            process(model, seg, context, tol, &mut report);
+        }
+    }
+    resolve_crossings(model, context, tol, &mut report);
+    report
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

@@ -43,6 +43,24 @@ pub enum Edit {
         vertex: usize,
         surface: usize,
     },
+    DeleteBar {
+        bar: usize,
+    },
+    /// Two crossing bars share a node (within `tolerance` of the crossing).
+    ConnectBars {
+        a: usize,
+        b: usize,
+        tolerance: f64,
+    },
+    /// A bar shares a node with every surface it passes through.
+    ConnectBarToSurfaces {
+        bar: usize,
+    },
+    /// Two surfaces get a shared edge along their junction.
+    ConnectSurfaces {
+        a: usize,
+        b: usize,
+    },
 }
 
 /// What an edit was made on, checked again when the journal is replayed
@@ -55,6 +73,9 @@ pub struct Check {
     pub surfaces: Vec<Vec<u32>>,
     /// End positions of the edge it names.
     pub edge: Vec<[f64; 3]>,
+    /// End positions of the bars it names.
+    #[serde(default)]
+    pub bars: Vec<[f64; 3]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -144,16 +165,32 @@ impl Session {
                 .get(s)
                 .map(|x| x.source_elements.clone())
         };
+        let bar = |b: usize| -> Vec<[f64; 3]> {
+            state
+                .axes
+                .get(b)
+                .map(|a| a.endpoints.iter().filter_map(|&v| vertex(v)).collect())
+                .unwrap_or_default()
+        };
         let mut check = Check::default();
         match *edit {
+            Edit::DeleteBar { bar: b } | Edit::ConnectBarToSurfaces { bar: b } => {
+                check.bars = bar(b)
+            }
+            Edit::ConnectBars { a, b, .. } => {
+                check.bars = bar(a);
+                check.bars.extend(bar(b));
+            }
             Edit::MoveVertex { vertex: v, .. } => check.vertices.extend(vertex(v)),
             Edit::MergeVertices { drop, keep } => check
                 .vertices
                 .extend([vertex(drop), vertex(keep)].into_iter().flatten()),
             Edit::DeleteSurface { surface: s } => check.surfaces.extend(surface(s)),
-            Edit::JoinSurfaces { keep, other } => check
-                .surfaces
-                .extend([surface(keep), surface(other)].into_iter().flatten()),
+            Edit::ConnectSurfaces { a: keep, b: other } | Edit::JoinSurfaces { keep, other } => {
+                check
+                    .surfaces
+                    .extend([surface(keep), surface(other)].into_iter().flatten())
+            }
             Edit::SplitEdge { edge, .. } => {
                 if let Some(e) = state.model.edges().get(edge) {
                     check.edge = e.iter().filter_map(|&v| vertex(v)).collect();
@@ -182,7 +219,10 @@ impl Session {
                     (0..3).map(|k| (p[k] - q[k]).powi(2)).sum::<f64>().sqrt() <= CHECK_TOLERANCE
                 })
         };
-        close(&a.vertices, &b.vertices) && close(&a.edge, &b.edge) && a.surfaces == b.surfaces
+        close(&a.vertices, &b.vertices)
+            && close(&a.edge, &b.edge)
+            && close(&a.bars, &b.bars)
+            && a.surfaces == b.surfaces
     }
 
     fn execute(state: &mut State, edit: &Edit) -> Result<String, String> {
@@ -198,6 +238,10 @@ impl Session {
                 tolerance,
             } => state.close_gap(vertex, surface, tolerance),
             Edit::MarkJoint { vertex, surface } => state.mark_joint(vertex, surface),
+            Edit::DeleteBar { bar } => state.delete_bar(bar),
+            Edit::ConnectBars { a, b, tolerance } => state.connect_bars(a, b, tolerance),
+            Edit::ConnectBarToSurfaces { bar } => state.connect_bar_to_surfaces(bar),
+            Edit::ConnectSurfaces { a, b } => state.connect_surfaces(a, b),
         }
     }
 
@@ -282,10 +326,36 @@ impl Session {
         let moved: Vec<usize> = (0..base.len().min(current.len()))
             .filter(|&v| base[v] != current[v])
             .collect();
+        // Bars whose nodes the edits changed (by source axis): their nodes
+        // and spans no longer follow the source bar one to one.
+        let nodes = |a: &crate::reconstruction::assembly::bars::Axis| {
+            (
+                a.endpoints,
+                a.anchors
+                    .iter()
+                    .map(|n| (n.vertex, n.t.to_bits()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let base_axes: std::collections::BTreeMap<usize, _> = self
+            .base
+            .axes
+            .iter()
+            .map(|a| (a.source_axis, nodes(a)))
+            .collect();
+        let edited_bars: Vec<usize> = self
+            .state
+            .axes
+            .iter()
+            .filter(|a| base_axes.get(&a.source_axis) != Some(&nodes(a)))
+            .map(|a| a.source_axis)
+            .collect();
         topology["user_edits"] = serde_json::json!({
+            "edited_bars": edited_bars,
             "moved_vertices": moved,
             "generated_vertices": (base.len()..current.len()).collect::<Vec<_>>(),
             "removed_surfaces": self.state.removed,
+            "removed_bars": self.state.removed_bars,
             "accepted_joints": self.state.joints,
         });
         output["edits"] = serde_json::to_value(&self.journal)?;
@@ -361,6 +431,7 @@ mod tests {
             stiffness: vec![1, 1],
             patches: vec![0, 1],
             removed: vec![],
+            removed_bars: vec![],
             joints: Default::default(),
         }
     }
