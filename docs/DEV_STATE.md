@@ -342,6 +342,26 @@ yet closable in the editor: gaps between near-parallel planes (3.7 cm
 wall foot / slab bottom on v4: needs a "move surface to plane" edit),
 short edges where a merge would create another short edge.
 
+PLAXIS 3D export (2026-10-04, user decision: directly through the Python
+API, no MIDAS yet): `plaxis::exchange` writes `topo-plaxis-1` (plates on
+planar hole-free polygons, beams per stiffness run of a bar, elastic
+materials from LIRA block 3: GEI E/nu/H/RO, S0 b x h cm with RO per length;
+forces x9.80665 t -> kN, configurable; stiffness types without a material
+are listed). Holed surfaces: cuts along v (or u, the better variant) from
+the lowest/highest points of each hole's extreme columns to the first
+contour, cuts within 5 mm of a vertex go to it when clear, cuts between
+pieces sharing only the cut are removed; area check falls back to CDT
+triangles. Багратион v4: 4041 plates -> 5623 polygons (226 holed), all
+valid and planar, areas exact, 9 short edges / 7 sharp corners added by
+cuts; 6464 beams; 3 stiffness types without material. Loader
+`scripts/plaxis_export.py` (plxscripting: gotostructures, platemat/beammat
++ setproperties with fallback property sets 2022+/older, surface + plate,
+line + beam, `.Material`), recorder tests; the editor runs it with the
+PLAXIS Python (`run_plaxis`). Bentley documentation hosts are blocked by the
+network policy: command names come from PLAXIS command logs quoted in
+search results and plxscripting 1.0.4 from PyPI. Not verified against a
+real PLAXIS 3D 2022 yet (Windows + licence needed).
+
 ## Next coherent development batch
 
 - Use the editor on the Багратион v4 residuals and record what the edits

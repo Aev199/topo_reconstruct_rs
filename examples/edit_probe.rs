@@ -2,7 +2,7 @@
 //! changes (development: checks that the editor's operations close the
 //! defects left by the automatic reconstruction).
 //!
-//! Usage: edit_probe MODEL.txt [--frame-cache PATH] [--write REPORT.json] [EDIT_JSON ...]
+//! Usage: edit_probe MODEL.txt [--frame-cache PATH] [--write REPORT.json] [--plaxis EXCHANGE.json] [EDIT_JSON ...]
 //! Each edit is the JSON of `editor::Edit` (`{"op": "merge_vertices", ...}`);
 //! `{"op": "show", "surfaces": [..], "bars": [..], "vertices": [..]}`
 //! prints the named objects instead.
@@ -111,9 +111,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
     let mut cache = None;
     let mut write = None;
+    let mut plaxis = None;
     let mut edits = vec![];
     while let Some(a) = args.next() {
-        if a == "--write" {
+        if a == "--plaxis" {
+            plaxis = args.next().map(PathBuf::from);
+        } else if a == "--write" {
             write = args.next().map(PathBuf::from);
         } else if a == "--frame-cache" {
             cache = args.next().map(PathBuf::from);
@@ -185,6 +188,41 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             Err(e) => println!("{text}: REFUSED {e}"),
         }
+    }
+    if let Some(path) = plaxis {
+        let materials = topo_reconstruct_rs::parsers::lira::LiraParser::parse_materials(&input)?;
+        let started = std::time::Instant::now();
+        let exchange = topo_reconstruct_rs::plaxis::exchange(
+            session.state(),
+            &materials,
+            topo_reconstruct_rs::plaxis::TONNE_TO_KN,
+            profile.edge_collapse,
+            &input.display().to_string(),
+        );
+        println!(
+            "plaxis: {} plates, {} polygons, {} cut, {} beams, missing {:?}, {:?}",
+            exchange.plates.len(),
+            exchange
+                .plates
+                .iter()
+                .map(|p| p.polygons.len())
+                .sum::<usize>(),
+            exchange.cut_surfaces,
+            exchange.beams.len(),
+            exchange.missing_materials,
+            started.elapsed()
+        );
+        std::fs::write(&path, serde_json::to_vec(&exchange)?)?;
+        // Contours of the holed surfaces, for checks of the cutting.
+        let model = &session.state().model;
+        let holed: std::collections::BTreeMap<usize, _> = (0..model.surfaces().len())
+            .filter(|&s| model.surfaces()[s].contours.len() > 1)
+            .map(|s| (s, model.surfaces()[s].contours.clone()))
+            .collect();
+        std::fs::write(
+            path.with_extension("contours.json"),
+            serde_json::to_vec(&holed)?,
+        )?;
     }
     if let Some(path) = write {
         let mut value = serde_json::to_value(&output)?;

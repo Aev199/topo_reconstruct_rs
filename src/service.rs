@@ -121,6 +121,14 @@ impl Service {
                 Ok(json!({"saved": text("path")?, "input_changed_on_disk": changed}))
             }
             "open_project" => self.open_project(Path::new(&text("path")?), progress),
+            "export_plaxis" => {
+                let factor = args
+                    .get("force_factor")
+                    .and_then(Value::as_f64)
+                    .unwrap_or(crate::plaxis::TONNE_TO_KN);
+                self.export_plaxis(Path::new(&text("path")?), factor)
+            }
+            "run_plaxis" => self.run_plaxis(&args),
             "export_report" => {
                 self.export_report(Path::new(&text("path")?))?;
                 Ok(json!({"saved": text("path")?}))
@@ -359,6 +367,110 @@ impl Service {
         summary["replay_stopped"] = json!(stopped);
         summary["input_changed"] = json!(changed);
         Ok(summary)
+    }
+
+    /// Write the PLAXIS exchange file and, beside it, the loader script.
+    fn export_plaxis(&self, path: &Path, force_factor: f64) -> Result<Value, String> {
+        let input = self.input.as_ref().ok_or("no model is open")?;
+        let session = self.session()?;
+        let materials = crate::parsers::lira::LiraParser::parse_materials(input)
+            .map_err(|e| format!("{}: {e}", input.display()))?;
+        let exchange = crate::plaxis::exchange(
+            session.state(),
+            &materials,
+            force_factor,
+            self.profile.edge_collapse,
+            &input.display().to_string(),
+        );
+        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        serde_json::to_writer(std::io::BufWriter::new(file), &exchange)
+            .map_err(|e| e.to_string())?;
+        let script = path.with_file_name("plaxis_export.py");
+        std::fs::write(&script, crate::plaxis::LOADER).map_err(|e| e.to_string())?;
+        Ok(json!({
+            "saved": path.display().to_string(),
+            "script": script.display().to_string(),
+            "plates": exchange.plates.len(),
+            "polygons": exchange.plates.iter().map(|p| p.polygons.len()).sum::<usize>(),
+            "cut_surfaces": exchange.cut_surfaces,
+            "triangulated_surfaces": exchange.triangulated_surfaces,
+            "beams": exchange.beams.len(),
+            "plate_materials": exchange.plate_materials.len(),
+            "beam_materials": exchange.beam_materials.len(),
+            "missing_materials": exchange.missing_materials,
+            "audit_passed": session.audit().passed,
+        }))
+    }
+
+    /// Run the loader with a Python that has plxscripting (the PLAXIS
+    /// distribution): it builds the model in the open PLAXIS Input.
+    fn run_plaxis(&self, args: &Value) -> Result<Value, String> {
+        let get = |key: &str| args.get(key).and_then(Value::as_str);
+        let exchange = PathBuf::from(get("path").ok_or("missing argument `path`")?);
+        let script = exchange.with_file_name("plaxis_export.py");
+        if !script.exists() {
+            std::fs::write(&script, crate::plaxis::LOADER).map_err(|e| e.to_string())?;
+        }
+        let python = get("python")
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .or_else(crate::plaxis::find_python)
+            .ok_or("no Python with plxscripting found: give its path")?;
+        let mut command = std::process::Command::new(&python);
+        command
+            .arg(&script)
+            .arg(&exchange)
+            .args(["--host", get("host").unwrap_or("localhost")])
+            .args([
+                "--port",
+                &args
+                    .get("port")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(10000)
+                    .to_string(),
+            ])
+            .args(["--password", get("password").unwrap_or("")]);
+        #[cfg(windows)]
+        {
+            // No console window from the desktop application.
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        if args.get("new").and_then(Value::as_bool).unwrap_or(false) {
+            command.arg("--new");
+        }
+        if args
+            .get("shift_to_origin")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            command.arg("--shift-to-origin");
+        }
+        let output = command
+            .output()
+            .map_err(|e| format!("{}: {e}", python.display()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !output.status.success() {
+            let tail: String = stderr
+                .lines()
+                .rev()
+                .take(8)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(format!("plaxis_loader_failed: {tail}"));
+        }
+        // The report is the JSON object printed last.
+        let report = stdout
+            .rfind("\n{")
+            .map(|i| &stdout[i + 1..])
+            .or_else(|| stdout.starts_with('{').then_some(stdout.as_str()))
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+            .unwrap_or(json!({"output": stdout}));
+        Ok(json!({"python": python.display().to_string(), "report": report}))
     }
 
     fn export_report(&self, path: &Path) -> Result<(), String> {

@@ -99,6 +99,8 @@ function explain(message) {
     ['node_off_bar', 'Отклонено: узел ушёл бы со своего стержня.'],
     ['no_crossing_to_share', 'Нечего связывать: свободных пересечений не найдено.'],
     ['already_connected', 'Уже связано общим ребром.'],
+    ['plaxis_loader_failed', 'Загрузчик PLAXIS завершился с ошибкой — проверьте, что PLAXIS Input открыт, сервер скриптов включён, порт и пароль верны.'],
+    ['no Python with plxscripting', 'Не найден Python с plxscripting — укажите путь к python.exe из поставки PLAXIS.'],
     ['no_junction', 'Поверхности не пересекаются и не примыкают.'],
     ['bar_would_collapse', 'Отклонено: стержень выродился бы.'],
     ['bar_node_on_collapsed_edge', 'Отклонено: узел стержня на схлопываемом ребре — слейте в обратном направлении.'],
@@ -181,6 +183,7 @@ function renderSummary() {
     + `<span class="meta">${s.surfaces} поверхностей · ${s.bars} стержней · правок ${s.edits}${s.dirty ? ' (не сохранены)' : ''}</span>`;
   $('save-project').disabled = false;
   $('export-report').disabled = false;
+  $('export-plaxis').disabled = false;
   $('undo').disabled = s.edits === 0;
   $('redo').disabled = !s.can_redo;
 }
@@ -472,6 +475,60 @@ $('save-project').onclick = () => saveProject();
 $('export-report').onclick = async () => {
   const path = await pickFile('report', true);
   if (path && await busy('Сохранение результата…', () => call('export_report', { path }))) status(`Результат сохранён: ${path}`);
+};
+
+/// PLAXIS settings of the dialog, remembered per viewer.
+const PLAXIS_FIELDS = ['plx-port', 'plx-python', 'plx-factor', 'plx-new', 'plx-shift'];
+function loadPlaxisSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('plaxis') || '{}');
+    for (const id of PLAXIS_FIELDS) {
+      if (id in saved) $(id)[$(id).type === 'checkbox' ? 'checked' : 'value'] = saved[id];
+    }
+  } catch { /* storage unavailable */ }
+}
+function savePlaxisSettings() {
+  try {
+    localStorage.setItem('plaxis', JSON.stringify(Object.fromEntries(
+      PLAXIS_FIELDS.map((id) => [id, $(id).type === 'checkbox' ? $(id).checked : $(id).value]))));
+  } catch { /* storage unavailable */ }
+}
+
+$('export-plaxis').onclick = async () => {
+  const a = state.summary?.audit;
+  if (a && !a.passed && !await question(`Аудит геометрии не пройден (ошибок ${a.failures}). Экспортировать всё равно?`)) return;
+  loadPlaxisSettings();
+  const dialog = $('plaxis-dialog');
+  dialog.returnValue = '';
+  dialog.showModal();
+  const choice = await new Promise((resolve) => dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true }));
+  if (choice !== 'file' && choice !== 'run') return;
+  savePlaxisSettings();
+  const path = await pickFile('plaxis', true);
+  if (!path) return;
+  const exported = await busy('Подготовка файла обмена PLAXIS…', () => call('export_plaxis', {
+    path, force_factor: Number($('plx-factor').value) || 9.80665,
+  }));
+  if (!exported) return;
+  const missing = exported.missing_materials.length ? `; без материала жёсткости: ${exported.missing_materials.join(', ')}` : '';
+  const text = `плит ${exported.plates} (полигонов ${exported.polygons}, с отверстиями разрезано ${exported.cut_surfaces}), `
+    + `балок ${exported.beams}, материалов ${exported.plate_materials}+${exported.beam_materials}${missing}`;
+  if (choice === 'file') {
+    status(`Файл обмена сохранён: ${path} (${text}). Загрузчик: ${exported.script}`);
+    return;
+  }
+  const result = await busy('Построение модели в PLAXIS…', () => call('run_plaxis', {
+    path,
+    port: Number($('plx-port').value) || 10000,
+    password: $('plx-password').value,
+    python: $('plx-python').value.trim(),
+    new: $('plx-new').checked,
+    shift_to_origin: $('plx-shift').checked,
+  }));
+  if (result) {
+    const r = result.report;
+    status(`PLAXIS: создано плит ${r.plates ?? '?'}, балок ${r.beams ?? '?'}, материалов ${r.plate_materials ?? '?'}+${r.beam_materials ?? '?'} за ${r.seconds ?? '?'} с (${text})`);
+  }
 };
 
 $('undo').onclick = () => busy('Отмена…', async () => { await call('undo'); await refresh(); status('Правка отменена'); });

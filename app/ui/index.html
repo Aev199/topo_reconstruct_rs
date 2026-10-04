@@ -14,6 +14,7 @@
     <button id="open-project">Открыть проект</button>
     <button id="save-project" disabled>Сохранить проект</button>
     <button id="export-report" disabled title="Отредактированная геометрия с журналом и аудитом (JSON)">Сохранить результат</button>
+    <button id="export-plaxis" disabled title="Плиты и балки с материалами для PLAXIS 3D (через Python API)">Экспорт в PLAXIS…</button>
     <span class="sep"></span>
     <button id="undo" disabled title="Ctrl+Z">Отменить</button>
     <button id="redo" disabled title="Ctrl+Y">Повторить</button>
@@ -48,6 +49,25 @@
     </aside>
   </main>
   <footer id="status">Готово</footer>
+  <dialog id="plaxis-dialog">
+    <form method="dialog">
+      <h3>Построить модель в PLAXIS 3D</h3>
+      <p class="hint">PLAXIS Input открыт, удалённый сервер скриптов включён
+        (Expert → Configure remote scripting server). Модель строится в текущем
+        проекте командами Python API.</p>
+      <label>Порт <input id="plx-port" type="number" value="10000"></label>
+      <label>Пароль <input id="plx-password" type="password"></label>
+      <label>Python с plxscripting <input id="plx-python" placeholder="авто: Python из поставки PLAXIS"></label>
+      <label>Единица силы ЛИРА → кН <input id="plx-factor" type="number" step="any" value="9.80665"></label>
+      <label><input id="plx-new" type="checkbox"> начать новый проект</label>
+      <label><input id="plx-shift" type="checkbox"> сдвинуть модель к началу координат</label>
+      <div class="row">
+        <button value="file">Только файл обмена</button>
+        <button value="run" class="primary">Построить в PLAXIS</button>
+        <button value="cancel">Отмена</button>
+      </div>
+    </form>
+  </dialog>
   <div id="busy" hidden><div class="box"><div id="busy-text">Работаю…</div></div></div>
   <script type="module" src="./src/main.js"></script>
 </body>

@@ -17,7 +17,95 @@ pub enum Section {
     Bar { width: f64, height: f64 },
 }
 
+/// Material of a stiffness type of the LIRA stiffness block (3/), in model
+/// units (no units block is read: by default t and m, E in t/m2).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Material {
+    /// GEI: shell of thickness `thickness` (m); `density` is per volume.
+    Plate {
+        e: f64,
+        nu: f64,
+        thickness: f64,
+        density: Option<f64>,
+    },
+    /// S0: rectangular bar `width` x `height` (m, given in cm); `density`
+    /// (RO) is per length.
+    Bar {
+        e: f64,
+        nu: Option<f64>,
+        width: f64,
+        height: f64,
+        density: Option<f64>,
+    },
+}
+
 impl LiraParser {
+    /// Materials of the stiffness block: a row `id ...` with its
+    /// continuation rows `0 KEY values` (RO, Mu, S0).
+    pub fn parse_materials<P: AsRef<Path>>(filepath: P) -> io::Result<HashMap<u32, Material>> {
+        let file = File::open(filepath)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self::materials_bytes(&mmap))
+    }
+
+    fn materials_bytes(content: &[u8]) -> HashMap<u32, Material> {
+        let Some(block) = Self::extract_block(content, b"3") else {
+            return HashMap::new();
+        };
+        // Words of each stiffness type, continuation rows appended.
+        let mut types: Vec<(u32, Vec<String>)> = vec![];
+        for row in block.split(|&b| b == b'/') {
+            let mut words = Self::split_ascii_whitespace_bytes(row)
+                .filter_map(|w| std::str::from_utf8(w).ok().map(str::to_string));
+            let Some(Ok(id)) = words.next().map(|w| w.parse::<u32>()) else {
+                continue;
+            };
+            if id == 0 {
+                if let Some(last) = types.last_mut() {
+                    last.1.extend(words);
+                }
+            } else {
+                types.push((id, words.collect()));
+            }
+        }
+        let number = |w: Option<&String>| {
+            w.and_then(|w| fast_parse_f64::<f64, _>(w.as_bytes()).ok())
+                .filter(|v| v.is_finite())
+        };
+        let after = |words: &[String], key: &str, k: usize| {
+            words
+                .iter()
+                .position(|w| w.eq_ignore_ascii_case(key))
+                .and_then(|i| number(words.get(i + k)))
+        };
+        types
+            .into_iter()
+            .filter_map(|(id, words)| {
+                let density = after(&words, "RO", 1);
+                let material = if let Some(i) = words.iter().position(|w| w == "GEI") {
+                    Material::Plate {
+                        e: number(words.get(i + 1)).filter(|v| *v > 0.)?,
+                        nu: number(words.get(i + 2))?,
+                        thickness: number(words.get(i + 3)).filter(|v| *v > 0.)?,
+                        density,
+                    }
+                } else if words.iter().any(|w| w == "S0") {
+                    Material::Bar {
+                        e: after(&words, "S0", 1).filter(|v| *v > 0.)?,
+                        width: after(&words, "S0", 2).filter(|v| *v > 0.)? / 100.,
+                        height: after(&words, "S0", 3).filter(|v| *v > 0.)? / 100.,
+                        nu: after(&words, "Mu", 1),
+                        density,
+                    }
+                } else {
+                    return None;
+                };
+                Some((id, material))
+            })
+            .collect()
+    }
+
     /// Потоковый параллельный парсинг текстового файла ЛИРА (.txt)
     pub fn parse<P: AsRef<Path>>(filepath: P) -> io::Result<MeshData> {
         let file = File::open(filepath)?;
@@ -310,6 +398,46 @@ impl LiraParser {
         })
     }
 }
+#[cfg(test)]
+mod material_tests {
+    use super::*;
+
+    #[test]
+    fn plates_and_bars_with_continuation_rows() {
+        let text = b"( 3/\n1 1.2e+006 38400 15000 22572.8 0 0 /\n 0 RO 1/\n 0 S0 3e+006 50 80/\n 0 Mu 0.2/\n7 GEI 3e+006 0.2 0.2 RO 2.5 /\n 0 WLKE 1 WLKG 1 /\n2 S0 0.305915 20 20/\n 0 RO 0.0101972/\n)";
+        let m = LiraParser::materials_bytes(text);
+        assert_eq!(
+            m[&1],
+            Material::Bar {
+                e: 3e6,
+                nu: Some(0.2),
+                width: 0.5,
+                height: 0.8,
+                density: Some(1.)
+            }
+        );
+        assert_eq!(
+            m[&7],
+            Material::Plate {
+                e: 3e6,
+                nu: 0.2,
+                thickness: 0.2,
+                density: Some(2.5)
+            }
+        );
+        assert_eq!(
+            m[&2],
+            Material::Bar {
+                e: 0.305915,
+                nu: None,
+                width: 0.2,
+                height: 0.2,
+                density: Some(0.0101972)
+            }
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

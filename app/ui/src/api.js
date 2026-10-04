@@ -30,6 +30,7 @@ const FILTERS = {
   model: [{ name: 'Модель ЛИРА', extensions: ['txt'] }],
   project: [{ name: 'Проект', extensions: ['topo.json', 'json'] }],
   report: [{ name: 'Результат JSON', extensions: ['json'] }],
+  plaxis: [{ name: 'Файл обмена PLAXIS', extensions: ['plaxis.json', 'json'] }],
 };
 
 /// A file path chosen by the user (a dialog on the desktop, a prompt in a
@@ -40,7 +41,7 @@ export async function pickFile(kind, saving = false) {
     const path = saving ? await save(options) : await open({ ...options, multiple: false });
     return path || null;
   }
-  const label = { model: 'Путь к модели ЛИРА', project: 'Путь к проекту', report: 'Путь для результата' }[kind];
+  const label = { model: 'Путь к модели ЛИРА', project: 'Путь к проекту', report: 'Путь для результата', plaxis: 'Путь для файла обмена PLAXIS' }[kind];
   return window.prompt(label) || null;
 }
 
