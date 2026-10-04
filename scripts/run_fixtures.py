@@ -44,12 +44,16 @@ def angles(mesh):
     return counts, smallest
 
 
-def run(model, binary, out, cache, extra):
+def run(model, binary, out, cache, extra, legacy=False):
     name = model.stem
     report = out / f"{name}.json"
     started = time.time()
-    cmd = [str(binary), str(model), "--v2-mesh-preview-json", str(report),
-           "--v2-frame-cache", str(cache / f"{name}.frame.json"), *extra]
+    if legacy:
+        cmd = [str(binary), str(model), "--v2-mesh-preview-json", str(report),
+               "--v2-frame-cache", str(cache / f"{name}.frame.json"), *extra]
+    else:
+        cmd = [str(binary), str(model), "-o", str(report), "--mesh",
+               "--frame-cache", str(cache / f"{name}.frame.json"), *extra]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     result = {"model": name, "seconds": round(time.time() - started, 1)}
     if proc.returncode != 0:
@@ -104,6 +108,8 @@ def main():
     parser.add_argument("--jobs", type=int, default=2)
     parser.add_argument("--cache", type=Path, help="frame cache directory (default OUT)")
     parser.add_argument("--only", nargs="*")
+    parser.add_argument("--legacy-cli", action="store_true",
+                        help="binary built before 2026-10-04 (--v2-mesh-preview-json)")
     parser.add_argument("--extra", nargs=argparse.REMAINDER, default=[],
                         help="further arguments for the binary")
     args = parser.parse_args()
@@ -114,7 +120,7 @@ def main():
     if args.only:
         models = [m for m in models if any(o in m.stem for o in args.only)]
     with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        results = list(pool.map(lambda m: run(m, args.binary, args.out, cache, args.extra), models))
+        results = list(pool.map(lambda m: run(m, args.binary, args.out, cache, args.extra, args.legacy_cli), models))
     (args.out / "summary.json").write_text(json.dumps(results, ensure_ascii=False, indent=2))
     for r in results:
         print(json.dumps(r, ensure_ascii=False))

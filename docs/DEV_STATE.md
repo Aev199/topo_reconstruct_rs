@@ -48,7 +48,7 @@ aligns stacked walls to the axis of the wall below within 50 mm
 (`assembly::stacking`; тест 5: 8 walls, 25 mm), closes wall ends and removes
 redundant collinear vertices at short edges within 50 mm
 (`assembly::cleanup`), audit still passing. Tolerances are CLI options:
-`--v2-stack-offset`, `--v2-wall-end-snap`, `--v2-console-width`.
+`--stack-offset`, `--wall-end-snap`, `--console-width`.
 Duplicated vertices and wall ends next to contour corners are merged,
 carrying bar axes along (`assembly::cleanup`, `Model::merge_vertices`).
 
@@ -147,10 +147,10 @@ by rule) — candidates for the manual editor.
 Tolerance ladder (user decisions 2026-10-03): section sizes change by
 decimetres in the target model, so the simplification tolerance of a
 surface is half its plate thickness (LIRA `GEI E nu H`), at least the 5 cm
-gap tolerance and at most 0.2 m (`--v2-simplification-cap`); a shared
+gap tolerance and at most 0.2 m (`--simplification-cap`); a shared
 chain takes the tolerance of its thinnest surface. Free openings narrower
 than 1 m (smaller side of the minimum bounding rectangle,
-`--v2-min-opening`) are filled when no surface or bar is attached and
+`--min-opening`) are filled when no surface or bar is attached and
 nothing passes through (`topology.filled_openings`). Expansion joints are
 never closed: an in-plane gap wider than the crack width with constant
 width along twenty widths of contour stays open, unless the analysis
@@ -214,7 +214,7 @@ beam node merges into it; an edge split never pinches a contour; a vertex
 touching another surface's contour edge splits it.
 
 Speed: frame retries continue one LSQR run (ЖК Остров frame 34 -> 11 min),
-`--v2-frame-cache PATH` reuses a solved frame (development), trial mesh
+`--frame-cache PATH` reuses a solved frame (development), trial mesh
 contacts indexed by surface (Багратион v4 mesh 9 min -> under 1 min),
 `TOPO_DIAG=1` prints mesh failure details.
 

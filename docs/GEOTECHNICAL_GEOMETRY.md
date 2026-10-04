@@ -6,6 +6,12 @@ is secondary. Source element IDs remain provenance; they are not a requirement f
 one-to-one reproduction of nodes or triangles. Material regions, structural
 connections, meaningful openings and load paths must survive simplification.
 
+CLI note (2026-10-04): the geotechnical pipeline is the only mode
+(`pipeline::run`, PLAXIS profile by default). `--v2-preserve-details` and the
+legacy V1 pipeline are removed; `--v2-<name>` options are now `--<name>`, and
+`--v2-mesh-preview-json PATH` is `-o PATH --mesh`. Dated sections below keep
+the option names of their time.
+
 ## Implemented: collapsed opening repair
 
 The v2 CLI now uses `assembly::assemble_geotechnical` by default. The existing
