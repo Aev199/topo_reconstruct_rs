@@ -1720,6 +1720,11 @@ pub fn generalize_contours(
         if tolerance <= 0. {
             continue;
         }
+        let chain_users: Vec<usize> = model
+            .edge_between(chain[0], chain[1])
+            .and_then(|e| users.get(&e))
+            .cloned()
+            .unwrap_or_default();
         let points: Vec<DVec3> = chain.iter().map(|&v| point(model, v)).collect();
         let mut keep: BTreeSet<usize> = if closed {
             // A ring: split at the vertex farthest from the first one.
@@ -1794,7 +1799,7 @@ pub fn generalize_contours(
                 report.kept += 1;
                 continue;
             }
-            if obstacles.blocks(model, prev, v, next, tolerance) {
+            if obstacles.blocks(model, prev, v, next, tolerance, &chain_users) {
                 survivors.push(i);
                 pending.clear();
                 report.blocked += 1;
@@ -1893,7 +1898,15 @@ impl Obstacles {
     }
     /// Whether replacing `p - v - q` by `p - q` sweeps over another segment
     /// or vertex (it would overlap or touch another contour or bar).
-    fn blocks(&self, model: &Model, p: usize, v: usize, q: usize, reach: f64) -> bool {
+    fn blocks(
+        &self,
+        model: &Model,
+        p: usize,
+        v: usize,
+        q: usize,
+        reach: f64,
+        surfaces: &[usize],
+    ) -> bool {
         let at = |x: usize| DVec3::from_array(model.vertices[x]);
         let tri = [at(p), at(v), at(q)];
         let lo = tri[0].min(tri[1]).min(tri[2]) - reach;
@@ -1943,8 +1956,31 @@ impl Obstacles {
                         let gap = |x: DVec3, y: DVec3| segment_distance(x, y, pa, pb);
                         let before = gap(tri[0], tri[1]).min(gap(tri[1], tri[2]));
                         let after = gap(tri[0], tri[2]);
+                        // A segment inside the material of a surface of the
+                        // chain (where surfaces already overlap) is no
+                        // neighbour to keep clear of: nearing it shrinks the
+                        // overlap.
+                        let inside = || {
+                            let mid = closest_on_segment((tri[0] + tri[2]) / 2., pa, pb);
+                            surfaces.iter().any(|&s| {
+                                let surface = &model.surfaces[s];
+                                let plane = &model.planes[surface.plane];
+                                let uv = plane.project(mid.to_array());
+                                // Strictly inside: within the closed material
+                                // but not on its boundary.
+                                plane.distance(mid.to_array()).abs() <= self.slack
+                                    && crate::reconstruction::closed_contains(
+                                        &surface.contours,
+                                        uv,
+                                        0.,
+                                    )
+                                    && boundary_distance(&surface.contours, uv) > self.slack
+                            })
+                        };
                         segment_triangle_distance(pa, pb, tri) <= self.slack
-                            || near(tri[0], tri[2]) && after < before - self.slack
+                            || near(tri[0], tri[2])
+                                && after < before - self.slack
+                                && (bar || !inside())
                             || bar && near(tri[0], tri[2]) && {
                                 // A bar within reach: the new edge must not
                                 // graze it more than the old ones did.
@@ -1965,6 +2001,24 @@ impl Obstacles {
         }
         false
     }
+}
+
+/// Distance of a plane point from plane contours.
+fn boundary_distance(contours: &[Vec<[f64; 2]>], p: [f64; 2]) -> f64 {
+    contours
+        .iter()
+        .flat_map(|r| (0..r.len()).map(move |i| (r[i], r[(i + 1) % r.len()])))
+        .map(|(a, b)| {
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let l2 = dx * dx + dy * dy;
+            let t = if l2 > 0. {
+                (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / l2).clamp(0., 1.)
+            } else {
+                0.
+            };
+            (p[0] - a[0] - t * dx).hypot(p[1] - a[1] - t * dy)
+        })
+        .fold(f64::MAX, f64::min)
 }
 
 fn closest_on_segment(p: DVec3, a: DVec3, b: DVec3) -> DVec3 {
@@ -2313,6 +2367,38 @@ mod tests {
                 let r = generalize_contours(&mut m, &tolerance, &BTreeSet::new(), &[], &[]);
                 assert_eq!(r.removed.len(), removed, "{r:?}");
             }
+        }
+    }
+
+    #[test]
+    fn generalization_may_near_an_edge_inside_its_own_material() {
+        // A 40 mm bump out of a slab edge; a surface of another stiffness
+        // overlaps the slab with its edge 3 mm inside it. Straightening the
+        // bump nears that edge but shrinks nothing outside: allowed.
+        let a = vec![
+            [0., 0., 0.],
+            [2., -0.04, 0.],
+            [4., 0., 0.],
+            [4., 3., 0.],
+            [0., 3., 0.],
+        ];
+        let c = vec![
+            [1.5, 0.003, 0.],
+            [2.5, 0.003, 0.],
+            [2.5, 1., 0.],
+            [1.5, 1., 0.],
+        ];
+        for place in Placement::all() {
+            let mut m = build(
+                &place,
+                &[
+                    (vec![a.clone()], [0., 0., 1.]),
+                    (vec![c.clone()], [0., 0., 1.]),
+                ],
+            );
+            let tolerance = [0.05 * place.scale; 2];
+            let r = generalize_contours(&mut m, &tolerance, &BTreeSet::new(), &[], &[]);
+            assert_eq!(r.removed.len(), 1, "{r:?}");
         }
     }
 
