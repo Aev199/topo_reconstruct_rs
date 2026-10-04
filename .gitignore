@@ -3,3 +3,9 @@
 /building_topology.json
 /building_topology.dxf
 __pycache__/
+
+# Editor application
+app/ui/node_modules/
+app/ui/dist/
+app/src-tauri/target/
+app/src-tauri/gen/

@@ -57,3 +57,22 @@ python3 scripts/run_fixtures.py FIXTURE_DIR target/release/topo_reconstruct_rs O
 Прежний конвейер V1 (сшивка узлов, DXF) и режим точного воспроизведения
 (`--v2-preserve-details`) удалены 2026-10-04; флаги `--v2-*` переименованы
 без префикса, `--v2-mesh-preview-json PATH` → `-o PATH --mesh`.
+
+## Редактор (Windows)
+
+`app/` — настольное приложение: ядро на Rust в том же процессе, интерфейс на
+three.js в окне WebView2 (Tauri 2). Открыть модель ЛИРА → автоматическое
+восстановление → находки аудита подсвечены в 3D → правка по клику (сдвинуть /
+слить вершину, удалить / объединить поверхность, разбить ребро, зазор — шов
+или не шов) → каждая правка транзакционна, пишется в журнал и сразу
+перепроверяется аудитом; отмена и повтор; проект хранит журнал правок;
+результат сохраняется в JSON того же формата (с журналом).
+
+```sh
+cd app/ui && npm ci && npm run build            # интерфейс
+cargo run --release --example editor_server     # браузерный режим: http://127.0.0.1:8787/
+cd app/src-tauri && npx --prefix ../ui tauri build   # установщик (Windows)
+node app/ui/tests/e2e.mjs model.txt out/        # сквозная проверка интерфейса
+```
+
+Установщик Windows собирается вручную в GitHub Actions (`build_app`).

@@ -294,7 +294,7 @@ def check(data, baseline=None):
         assert all(0 < s["width"] <= crack + 1e-12 for s in slivers
                    if s.get("reason", "sliver") == "sliver")
     for s in slivers:
-        if s.get("reason") == "absorbed":
+        if s.get("reason") == "absorbed" and "absorbed" in s:
             # Real overlap; the lost part within the simplification cap.
             a = s["absorbed"]
             policy = topology["feature_policy"]

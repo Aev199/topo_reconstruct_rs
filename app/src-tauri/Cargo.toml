@@ -1,0 +1,24 @@
+[package]
+name = "topo-editor"
+version = "0.1.0"
+edition = "2021"
+description = "Topo Editor: geotechnical geometry from LIRA models, with manual corrections"
+
+# Standalone: the root crate's tests and CI do not build the desktop shell.
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde_json = "1"
+topo_reconstruct_rs = { path = "../.." }
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+# A panic in the geometry core is turned into an error message, not a
+# closed window.
+panic = "unwind"

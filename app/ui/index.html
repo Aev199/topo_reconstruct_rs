@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Topo Editor</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="./src/style.css">
+</head>
+<body>
+  <header id="toolbar">
+    <span class="brand">Topo Editor</span>
+    <button id="open-model" title="Открыть расчётную модель ЛИРА (.txt)">Открыть модель</button>
+    <button id="open-project">Открыть проект</button>
+    <button id="save-project" disabled>Сохранить проект</button>
+    <button id="export-report" disabled title="Отредактированная геометрия с журналом и аудитом (JSON)">Сохранить результат</button>
+    <span class="sep"></span>
+    <button id="undo" disabled title="Ctrl+Z">Отменить</button>
+    <button id="redo" disabled title="Ctrl+Y">Повторить</button>
+    <span class="sep"></span>
+    <label>Выбор:
+      <select id="pick-mode">
+        <option value="surface">поверхность</option>
+        <option value="vertex">вершина</option>
+        <option value="edge">ребро</option>
+        <option value="bar">стержень</option>
+      </select>
+    </label>
+    <button id="fit" title="Показать всю модель">Вся модель</button>
+  </header>
+  <main>
+    <aside id="findings-panel">
+      <div id="audit-summary">Модель не открыта</div>
+      <div class="filters">
+        <label><input type="checkbox" id="show-failure" checked> ошибки</label>
+        <label><input type="checkbox" id="show-plaxis" checked> PLAXIS</label>
+        <label><input type="checkbox" id="show-review"> обзор</label>
+      </div>
+      <ol id="findings"></ol>
+    </aside>
+    <section id="view"></section>
+    <aside id="edit-panel">
+      <h3>Выбрано</h3>
+      <div id="selection">ничего</div>
+      <div id="actions"></div>
+      <h3>Журнал правок</h3>
+      <ol id="journal"></ol>
+    </aside>
+  </main>
+  <footer id="status">Готово</footer>
+  <div id="busy" hidden><div class="box"><div id="busy-text">Работаю…</div></div></div>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
