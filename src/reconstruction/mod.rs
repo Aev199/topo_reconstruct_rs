@@ -175,6 +175,18 @@ impl Model {
 
     /// Validated plane contours of vertex rings (exterior first).
     fn contours(&self, plane: usize, rings: &[Vec<usize>]) -> Result<Vec<Vec<[f64; 2]>>, Error> {
+        self.contours_changed(plane, rings, &vec![true; rings.len()])
+    }
+
+    /// [`Model::contours`] of a valid surface of which only the rings
+    /// flagged in `changed` were edited: unchanged rings and the relations
+    /// between them were valid and are not tested again.
+    fn contours_changed(
+        &self,
+        plane: usize,
+        rings: &[Vec<usize>],
+        changed: &[bool],
+    ) -> Result<Vec<Vec<[f64; 2]>>, Error> {
         let frame = self.planes.get(plane).ok_or(Error::InvalidPlane)?;
         if rings.is_empty() {
             return Err(Error::InvalidRing);
@@ -202,10 +214,12 @@ impl Model {
                 }
                 uv.push(a);
             }
-            validate_ring(&uv, self.precision)?;
+            if changed[contours.len()] {
+                validate_ring(&uv, self.precision)?;
+            }
             contours.push(uv);
         }
-        validate_holes(&contours)?;
+        validate_holes(&contours, changed)?;
         Ok(contours)
     }
 
@@ -384,8 +398,9 @@ impl Model {
         for &s in &surfaces {
             let surface = &self.surfaces[s];
             let mut rings = vec![];
-            let mut ring_changed = false;
+            let mut changed = vec![];
             for ring in &surface.boundaries {
+                let mut this = false;
                 let ids: Vec<usize> = ring
                     .iter()
                     .map(|e| {
@@ -398,13 +413,15 @@ impl Model {
                     })
                     .filter(|&v| {
                         let keep = v != vertex;
-                        ring_changed |= !keep;
+                        this |= !keep;
                         keep
                     })
                     .collect();
                 rings.push(ids);
+                changed.push(this);
             }
-            let contours = self.contours(surface.plane, &rings)?;
+            let ring_changed = changed.iter().any(|&c| c);
+            let contours = self.contours_changed(surface.plane, &rings, &changed)?;
             updates.push((s, rings, contours, ring_changed));
         }
         let merged = *self.edge_index.entry(key).or_insert_with(|| {
@@ -714,7 +731,7 @@ impl Model {
                     .all(|s| {
                         let c = &self.surfaces[s].contours;
                         c.iter().all(|r| validate_ring(r, self.precision).is_ok())
-                            && validate_holes(c).is_ok()
+                            && validate_holes(c, &vec![true; c.len()]).is_ok()
                     });
             if !valid {
                 *self = backup;
@@ -872,7 +889,7 @@ impl Model {
                 validate_ring(&uv, self.precision)?;
                 contours.push(uv);
             }
-            validate_holes(&contours)?;
+            validate_holes(&contours, &vec![true; contours.len()])?;
             for &e in &surface.embedded_edges {
                 let [a, b] = self.edges[e];
                 let (p, q) = (position(a), position(b));
@@ -990,7 +1007,9 @@ pub(crate) fn closed_contains(contours: &[Vec<[f64; 2]>], p: [f64; 2], eps: f64)
     inside
 }
 
-fn validate_holes(contours: &[Vec<[f64; 2]>]) -> Result<(), Error> {
+/// Holes inside the exterior, apart from it and from each other. Only
+/// pairs with a ring flagged in `changed` are tested (the others were).
+fn validate_holes(contours: &[Vec<[f64; 2]>], changed: &[bool]) -> Result<(), Error> {
     let polygon = |r: &Vec<[f64; 2]>| {
         let points: Vec<_> = r.iter().chain(r.first()).map(|p| (p[0], p[1])).collect();
         Polygon::new(LineString::from(points), vec![])
@@ -998,11 +1017,13 @@ fn validate_holes(contours: &[Vec<[f64; 2]>]) -> Result<(), Error> {
     let outer = polygon(&contours[0]);
     for i in 1..contours.len() {
         let hole = polygon(&contours[i]);
-        if !outer.contains(&hole) || outer.exterior().intersects(hole.exterior()) {
+        if (changed[0] || changed[i])
+            && (!outer.contains(&hole) || outer.exterior().intersects(hole.exterior()))
+        {
             return Err(Error::InvalidRing);
         }
-        for previous in &contours[1..i] {
-            if polygon(previous).intersects(&hole) {
+        for (j, previous) in contours.iter().enumerate().take(i).skip(1) {
+            if (changed[i] || changed[j]) && polygon(previous).intersects(&hole) {
                 return Err(Error::InvalidRing);
             }
         }
@@ -1029,15 +1050,33 @@ fn validate_ring(points: &[[f64; 2]], epsilon: f64) -> Result<(), Error> {
     if !area.is_finite() || area.abs() <= epsilon * epsilon {
         return Err(Error::InvalidRing);
     }
-    for i in 0..n {
-        for j in i + 1..n {
-            if j == i + 1 || (i == 0 && j == n - 1) {
+    // Non-adjacent edges must not meet. Sweep over x: edges whose x ranges
+    // do not overlap cannot meet, so only overlapping ones are tested with
+    // the exact predicate (the same answers as testing every pair).
+    let range = |i: usize, k: usize| {
+        let (a, b) = (points[i][k], points[(i + 1) % n][k]);
+        (a.min(b), a.max(b))
+    };
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| range(a, 0).0.total_cmp(&range(b, 0).0));
+    let mut active: Vec<usize> = vec![];
+    for &i in &order {
+        let (lo, _) = range(i, 0);
+        active.retain(|&j| range(j, 0).1 >= lo);
+        let (ylo, yhi) = range(i, 1);
+        for &j in &active {
+            let adjacent = (i + 1) % n == j || (j + 1) % n == i;
+            let (jlo, jhi) = range(j, 1);
+            if adjacent || jhi < ylo || jlo > yhi {
                 continue;
             }
             if line(i).intersects(&line(j)) {
                 return Err(Error::InvalidRing);
             }
         }
+        active.push(i);
+    }
+    for i in 0..n {
         let a = points[(i + n - 1) % n];
         let b = points[i];
         let c = points[(i + 1) % n];

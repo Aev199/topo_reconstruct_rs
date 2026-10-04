@@ -1707,7 +1707,7 @@ fn assemble_impl(
         }
         _ => BTreeSet::new(),
     };
-    let gaps = match features {
+    let mut gaps = match features {
         Some(features) if features.maximum_gap > 0. => gaps::close_keeping_joints(
             &mut model,
             &mut cleanup::Bars {
@@ -2050,6 +2050,31 @@ fn assemble_impl(
         &mut simplified_holes,
     );
     timer.lap("pieces_after_generalization");
+    // Touches left by the later stages (a vertex settled onto one surface
+    // now lying on the contour of its neighbour, micrometres from it) are
+    // shared: only contacts within the point slack, nothing moves farther.
+    if let Some(features) = features {
+        if features.maximum_gap > 0. {
+            let (_, _, fixed) = protected(&model, &axis_assembly);
+            let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * policy.precision;
+            let here = model.vertices().to_vec();
+            let touches = gaps::close(
+                &mut model,
+                &mut cleanup::Bars {
+                    axes: &mut axis_assembly.axes,
+                    contacts: &mut axis_assembly.contacts,
+                },
+                slack,
+                features.close_offset_gaps,
+                &fixed,
+                &vertex_source_nodes,
+                &here,
+                slack,
+            );
+            gaps.closed.extend(touches.closed);
+        }
+    }
+    timer.lap("touches_after_generalization");
     // Junctions changed by the later stages (a removed or absorbed piece,
     // a straightened contour now crossing a wall) are represented again.
     if let Some(features) = features {
