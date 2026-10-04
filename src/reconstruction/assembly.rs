@@ -2542,7 +2542,11 @@ mod tests {
                 .collect()
         };
         assert_eq!(groups(&base, false), groups(&transformed, true));
-        for (&n, &p) in base.vertex_source_nodes.iter().zip(&base.preview.vertices) {
+        for (&n, &p) in base
+            .vertex_source_nodes
+            .iter()
+            .zip(base.preview.vertices.iter())
+        {
             let k = transformed
                 .vertex_source_nodes
                 .iter()

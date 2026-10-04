@@ -24,7 +24,7 @@ geo = "0.29"
 spade = "2.15.1"
 
 # Сериализация в JSON
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }
 
 # CLI аргументы командной строки

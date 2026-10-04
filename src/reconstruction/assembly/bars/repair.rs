@@ -228,7 +228,7 @@ pub(super) fn repair(
                     before: locked[&n].to_array(),
                     after: q.to_array(),
                 });
-                trial.vertices[c.vertices[&n]] = q.to_array();
+                std::sync::Arc::make_mut(&mut trial.vertices)[c.vertices[&n]] = q.to_array();
                 proposed_locked.insert(n, q);
             }
         }
@@ -259,7 +259,8 @@ pub(super) fn repair(
             {
                 return false;
             }
-            trial.surfaces[s].contours = check.surfaces[0].contours.clone();
+            std::sync::Arc::make_mut(&mut trial.surfaces[s]).contours =
+                check.surfaces[0].contours.clone();
             true
         });
         let axes: BTreeSet<_> = group.iter().map(|&i| proposals[i].0).collect();
@@ -319,9 +320,9 @@ mod tests {
         }
         let mut after = before.clone();
         for v in [1, 2] {
-            after.vertices[v][0] += 0.02;
+            std::sync::Arc::make_mut(&mut after.vertices)[v][0] += 0.02;
         }
-        after.surfaces[0].contours[0] = [0, 1, 2, 3]
+        std::sync::Arc::make_mut(&mut after.surfaces[0]).contours[0] = [0, 1, 2, 3]
             .map(|v| after.planes[p].project(after.vertices[v]))
             .to_vec();
         assert!(!no_new_coplanar_overlap(

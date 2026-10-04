@@ -287,7 +287,7 @@ fn build_impl(
     }
     let model = &source.preview;
     let eps = source.policy.precision;
-    let mut vertices = model.vertices.clone();
+    let mut vertices = model.vertices.to_vec();
     let axes = &source.axis_assembly.axes;
     let contacts = &source.axis_assembly.contacts;
     let synchronized = constraints::synchronize(model, axes, contacts, &mut vertices, policy, eps)?;

@@ -472,11 +472,22 @@ pub fn close_keeping_joints(
                 .iter()
                 .flat_map(|a| a.anchors.iter().map(|x| x.vertex)),
         );
+        // Candidates sorted by x: a surface looks only at those within its
+        // box in x (then ascending, as a full scan would visit them).
+        let mut by_x: Vec<(f64, usize)> = candidates
+            .iter()
+            .map(|&v| (model.vertices[v][0], v))
+            .collect();
+        by_x.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let mut gaps = vec![];
         for s in 0..model.surfaces.len() {
             let (lo, hi) = bounds(model, s);
             let members = surface_vertices(model, s);
-            for &v in &candidates {
+            let start = by_x.partition_point(|c| c.0 < lo.x - tolerance);
+            let end = by_x.partition_point(|c| c.0 <= hi.x + tolerance);
+            let mut near: Vec<usize> = by_x[start..end].iter().map(|c| c.1).collect();
+            near.sort_unstable();
+            for &v in &near {
                 let p = DVec3::from_array(model.vertices[v]);
                 if (p + tolerance).cmplt(lo).any() || (p - tolerance).cmpgt(hi).any() {
                     continue;
@@ -730,7 +741,7 @@ mod tests {
                 "{r:?}"
             );
             assert!(m.surface_edges(0).any(|e| m.edges[e].contains(&corner)));
-            for (a, b) in before.iter().zip(&m.vertices) {
+            for (a, b) in before.iter().zip(m.vertices.iter()) {
                 assert!(DVec3::from_array(*a).distance(DVec3::from_array(*b)) < 1e-9 * place.scale);
             }
         }
@@ -815,7 +826,7 @@ mod tests {
             for c in &r.closed {
                 assert!(c.movement <= tolerance * (1. + 1e-9), "{r:?}");
             }
-            for (a, b) in before.iter().zip(&m.vertices) {
+            for (a, b) in before.iter().zip(m.vertices.iter()) {
                 assert!(
                     DVec3::from_array(*a).distance(DVec3::from_array(*b))
                         <= tolerance * (1. + 1e-9)

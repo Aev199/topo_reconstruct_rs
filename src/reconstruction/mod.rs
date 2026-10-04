@@ -12,6 +12,7 @@ use geo::{Contains, Intersects, Line, LineString, Polygon};
 use glam::DVec3;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
@@ -90,20 +91,23 @@ pub struct Surface {
     pub embedded_edges: Vec<usize>,
     pub source_elements: Vec<u32>,
 }
+/// Trial copies (every transactional operation works on one) are cheap:
+/// vertices, edges, the edge index and each surface are shared until a
+/// copy changes them (`Arc::make_mut`).
 #[derive(Debug, Clone, Serialize)]
 pub struct Model {
     precision: f64,
     minimum_edge: f64,
     planes: Vec<PlaneFrame>,
-    vertices: Vec<[f64; 3]>,
-    edges: Vec<[usize; 2]>,
-    surfaces: Vec<Surface>,
+    vertices: Arc<Vec<[f64; 3]>>,
+    edges: Arc<Vec<[usize; 2]>>,
+    surfaces: Vec<Arc<Surface>>,
     /// Edges referenced by no surface (replaced during a split, released by
     /// a trim or merge). Kept, still indexed, to preserve edge ids; refreshed
     /// by `refresh_orphaned_edges`.
     orphaned_edges: Vec<usize>,
     #[serde(skip)]
-    edge_index: BTreeMap<[usize; 2], usize>,
+    edge_index: Arc<BTreeMap<[usize; 2], usize>>,
 }
 impl Model {
     pub fn new(precision: f64, minimum_edge: f64) -> Result<Self, Error> {
@@ -118,11 +122,11 @@ impl Model {
             precision,
             minimum_edge,
             planes: vec![],
-            vertices: vec![],
-            edges: vec![],
+            vertices: vec![].into(),
+            edges: vec![].into(),
             surfaces: vec![],
             orphaned_edges: vec![],
-            edge_index: BTreeMap::new(),
+            edge_index: BTreeMap::new().into(),
         })
     }
     pub fn add_plane(&mut self, plane: PlaneFrame) -> usize {
@@ -136,10 +140,10 @@ impl Model {
             return Err(Error::InvalidVertex);
         }
         let id = self.vertices.len();
-        self.vertices.push(point);
+        Arc::make_mut(&mut self.vertices).push(point);
         Ok(id)
     }
-    pub fn surfaces(&self) -> &[Surface] {
+    pub fn surfaces(&self) -> &[Arc<Surface>] {
         &self.surfaces
     }
     pub fn edges(&self) -> &[[usize; 2]] {
@@ -163,13 +167,13 @@ impl Model {
         source_elements.sort_unstable();
         source_elements.dedup();
         let id = self.surfaces.len();
-        self.surfaces.push(Surface {
+        self.surfaces.push(Arc::new(Surface {
             plane,
             contours,
             boundaries,
             embedded_edges: vec![],
             source_elements,
-        });
+        }));
         Ok(id)
     }
 
@@ -232,11 +236,13 @@ impl Model {
                         let a = ring[i];
                         let b = ring[(i + 1) % ring.len()];
                         let key = [a.min(b), a.max(b)];
-                        let edge = *self.edge_index.entry(key).or_insert_with(|| {
-                            let id = self.edges.len();
-                            self.edges.push(key);
-                            id
-                        });
+                        let edge = *Arc::make_mut(&mut self.edge_index)
+                            .entry(key)
+                            .or_insert_with(|| {
+                                let id = self.edges.len();
+                                Arc::make_mut(&mut self.edges).push(key);
+                                id
+                            });
                         EdgeUse {
                             edge,
                             reversed: a > b,
@@ -301,10 +307,12 @@ impl Model {
             let embedded: Vec<usize> = keys
                 .difference(&ring_keys)
                 .map(|&key| {
-                    *trial.edge_index.entry(key).or_insert_with(|| {
-                        trial.edges.push(key);
-                        trial.edges.len() - 1
-                    })
+                    *Arc::make_mut(&mut trial.edge_index)
+                        .entry(key)
+                        .or_insert_with(|| {
+                            Arc::make_mut(&mut trial.edges).push(key);
+                            trial.edges.len() - 1
+                        })
                 })
                 .collect();
             trial.rebuild_surface(s, rings, embedded)?;
@@ -424,18 +432,20 @@ impl Model {
             let contours = self.contours_changed(surface.plane, &rings, &changed)?;
             updates.push((s, rings, contours, ring_changed));
         }
-        let merged = *self.edge_index.entry(key).or_insert_with(|| {
-            self.edges.push(key);
-            self.edges.len() - 1
-        });
+        let merged = *Arc::make_mut(&mut self.edge_index)
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::make_mut(&mut self.edges).push(key);
+                self.edges.len() - 1
+            });
         for (s, rings, contours, ring_changed) in updates {
             if ring_changed {
                 let boundaries = self.intern(&rings);
-                let surface = &mut self.surfaces[s];
+                let surface = Arc::make_mut(&mut self.surfaces[s]);
                 surface.boundaries = boundaries;
                 surface.contours = contours;
             }
-            let surface = &mut self.surfaces[s];
+            let surface = Arc::make_mut(&mut self.surfaces[s]);
             if surface.embedded_edges.contains(&e1) {
                 surface.embedded_edges.retain(|&e| e != e1 && e != e2);
                 surface.embedded_edges.push(merged);
@@ -486,7 +496,7 @@ impl Model {
             }
         }
         let boundaries = self.intern(&rings);
-        let target = &mut self.surfaces[surface];
+        let target = Arc::make_mut(&mut self.surfaces[surface]);
         target.contours = contours;
         target.boundaries = boundaries;
         target.embedded_edges = embedded;
@@ -632,7 +642,7 @@ impl Model {
         sources.sort_unstable();
         sources.dedup();
         trial.rebuild_surface(keep, rings, embedded.into_iter().collect())?;
-        trial.surfaces[keep].source_elements = sources;
+        Arc::make_mut(&mut trial.surfaces[keep]).source_elements = sources;
         let index = trial.remove_surfaces(&BTreeSet::from([other]));
         *self = trial;
         Ok(index)
@@ -794,33 +804,33 @@ impl Model {
         // so a later edge between the same vertices reuses this id.
         let rekeyed = existing_first.is_none() || existing_second.is_none();
         if rekeyed {
-            self.edge_index.remove(&[a, b]);
+            Arc::make_mut(&mut self.edge_index).remove(&[a, b]);
         }
         let e_first = match existing_first {
             Some(id) => id,
             None => {
-                self.edges[edge] = first;
-                self.edge_index.insert(first, edge);
+                Arc::make_mut(&mut self.edges)[edge] = first;
+                Arc::make_mut(&mut self.edge_index).insert(first, edge);
                 edge
             }
         };
         let e_second = match existing_second {
             Some(id) => id,
             None if e_first != edge => {
-                self.edges[edge] = second;
-                self.edge_index.insert(second, edge);
+                Arc::make_mut(&mut self.edges)[edge] = second;
+                Arc::make_mut(&mut self.edge_index).insert(second, edge);
                 edge
             }
             None => {
-                self.edges.push(second);
-                self.edge_index.insert(second, self.edges.len() - 1);
+                Arc::make_mut(&mut self.edges).push(second);
+                Arc::make_mut(&mut self.edge_index).insert(second, self.edges.len() - 1);
                 self.edges.len() - 1
             }
         };
         for s in users {
             let plane = self.planes[self.surfaces[s].plane].clone();
             let uv = plane.project(p.to_array());
-            let surface = &mut self.surfaces[s];
+            let surface = Arc::make_mut(&mut self.surfaces[s]);
             for (ring, contour) in surface.boundaries.iter_mut().zip(&mut surface.contours) {
                 if let Some(k) = ring.iter().position(|e| e.edge == edge) {
                     let reversed = ring[k].reversed;
@@ -911,9 +921,9 @@ impl Model {
             }
             updates.push((s, contours));
         }
-        self.vertices[vertex] = target;
+        Arc::make_mut(&mut self.vertices)[vertex] = target;
         for (s, contours) in updates {
-            self.surfaces[s].contours = contours;
+            Arc::make_mut(&mut self.surfaces[s]).contours = contours;
         }
         Ok(())
     }
@@ -948,11 +958,15 @@ impl Model {
         {
             return Err(Error::InvalidRing);
         }
-        let edge = *self.edge_index.entry(key).or_insert_with(|| {
-            self.edges.push(key);
-            self.edges.len() - 1
-        });
-        self.surfaces[surface].embedded_edges.push(edge);
+        let edge = *Arc::make_mut(&mut self.edge_index)
+            .entry(key)
+            .or_insert_with(|| {
+                Arc::make_mut(&mut self.edges).push(key);
+                self.edges.len() - 1
+            });
+        Arc::make_mut(&mut self.surfaces[surface])
+            .embedded_edges
+            .push(edge);
         Ok(edge)
     }
 }
@@ -1010,25 +1024,88 @@ pub(crate) fn closed_contains(contours: &[Vec<[f64; 2]>], p: [f64; 2], eps: f64)
 /// Holes inside the exterior, apart from it and from each other. Only
 /// pairs with a ring flagged in `changed` are tested (the others were).
 fn validate_holes(contours: &[Vec<[f64; 2]>], changed: &[bool]) -> Result<(), Error> {
-    let polygon = |r: &Vec<[f64; 2]>| {
+    // A hole lies inside the exterior without touching it, and holes are
+    // apart: with no contact between two rings (exact segment predicate)
+    // one ring lies inside the other exactly when one of its vertices
+    // does. Boxes rule pairs out first.
+    let bbox = |r: &Vec<[f64; 2]>| {
+        r.iter()
+            .fold(([f64::MAX; 2], [f64::MIN; 2]), |(lo, hi), p| {
+                (
+                    [lo[0].min(p[0]), lo[1].min(p[1])],
+                    [hi[0].max(p[0]), hi[1].max(p[1])],
+                )
+            })
+    };
+    let boxes: Vec<_> = contours.iter().map(bbox).collect();
+    let ring = |r: &Vec<[f64; 2]>| {
         let points: Vec<_> = r.iter().chain(r.first()).map(|p| (p[0], p[1])).collect();
         Polygon::new(LineString::from(points), vec![])
     };
-    let outer = polygon(&contours[0]);
+    let inside = |r: usize, p: [f64; 2]| ring(&contours[r]).contains(&geo::Point::new(p[0], p[1]));
+    let disjoint = |a: usize, b: usize| {
+        let ((alo, ahi), (blo, bhi)) = (boxes[a], boxes[b]);
+        ahi[0] < blo[0] || bhi[0] < alo[0] || ahi[1] < blo[1] || bhi[1] < alo[1]
+    };
+    let within = |a: usize, b: usize| {
+        let ((alo, ahi), (blo, bhi)) = (boxes[a], boxes[b]);
+        alo[0] >= blo[0] && alo[1] >= blo[1] && ahi[0] <= bhi[0] && ahi[1] <= bhi[1]
+    };
     for i in 1..contours.len() {
-        let hole = polygon(&contours[i]);
         if (changed[0] || changed[i])
-            && (!outer.contains(&hole) || outer.exterior().intersects(hole.exterior()))
+            && (!within(i, 0)
+                || rings_meet(&contours[0], &contours[i])
+                || !inside(0, contours[i][0]))
         {
             return Err(Error::InvalidRing);
         }
-        for (j, previous) in contours.iter().enumerate().take(i).skip(1) {
-            if (changed[i] || changed[j]) && polygon(previous).intersects(&hole) {
+        for j in 1..i {
+            if (changed[i] || changed[j])
+                && !disjoint(i, j)
+                && (rings_meet(&contours[i], &contours[j])
+                    || inside(i, contours[j][0])
+                    || inside(j, contours[i][0]))
+            {
                 return Err(Error::InvalidRing);
             }
         }
     }
     Ok(())
+}
+
+/// Whether any segment of ring `a` meets (crosses or touches) any segment
+/// of ring `b`: an x sweep over both, exact segment predicate.
+fn rings_meet(a: &[[f64; 2]], b: &[[f64; 2]]) -> bool {
+    let segment = |r: &[[f64; 2]], i: usize| {
+        let (p, q) = (r[i], r[(i + 1) % r.len()]);
+        (
+            Line::new((p[0], p[1]), (q[0], q[1])),
+            p[0].min(q[0]),
+            p[0].max(q[0]),
+            p[1].min(q[1]),
+            p[1].max(q[1]),
+        )
+    };
+    let mut items: Vec<(f64, bool, usize)> = (0..a.len())
+        .map(|i| (segment(a, i).1, false, i))
+        .chain((0..b.len()).map(|i| (segment(b, i).1, true, i)))
+        .collect();
+    items.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let mut active: [Vec<usize>; 2] = [vec![], vec![]];
+    for (lo, of_b, i) in items {
+        let (own, other) = if of_b { (b, a) } else { (a, b) };
+        let (line, _, _, ylo, yhi) = segment(own, i);
+        let side = usize::from(!of_b);
+        active[side].retain(|&j| segment(other, j).2 >= lo);
+        for &j in &active[side] {
+            let (l, _, _, olo, ohi) = segment(other, j);
+            if ohi >= ylo && olo <= yhi && line.intersects(&l) {
+                return true;
+            }
+        }
+        active[usize::from(of_b)].push(i);
+    }
+    false
 }
 
 fn validate_ring(points: &[[f64; 2]], epsilon: f64) -> Result<(), Error> {
@@ -1091,6 +1168,67 @@ fn validate_ring(points: &[[f64; 2]], epsilon: f64) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hole_validation_agrees_with_the_polygon_relation() {
+        use super::{validate_holes, Contains, Intersects, LineString, Polygon};
+        // The former definition, through the general polygon relation.
+        let reference = |contours: &[Vec<[f64; 2]>]| {
+            let polygon = |r: &Vec<[f64; 2]>| {
+                let points: Vec<_> = r.iter().chain(r.first()).map(|p| (p[0], p[1])).collect();
+                Polygon::new(LineString::from(points), vec![])
+            };
+            let outer = polygon(&contours[0]);
+            for i in 1..contours.len() {
+                let hole = polygon(&contours[i]);
+                if !outer.contains(&hole) || outer.exterior().intersects(hole.exterior()) {
+                    return false;
+                }
+                for previous in &contours[1..i] {
+                    if polygon(previous).intersects(&hole) {
+                        return false;
+                    }
+                }
+            }
+            true
+        };
+        // Squares and triangles on a coarse grid: touching, overlapping,
+        // nested, outside and apart cases all occur.
+        let mut seed = 12345u64;
+        let mut next = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % n) as f64
+        };
+        let outer = vec![[0., 0.], [8., 0.], [8., 6.], [4., 8.], [0., 6.]];
+        let mut agree = (0, 0);
+        for _ in 0..5000 {
+            let mut contours = vec![outer.clone()];
+            for _ in 0..1 + next(3) as usize {
+                let (x, y, w) = (next(9) - 0.5, next(9) - 0.5, 0.5 + next(3) * 0.5);
+                contours.push(if next(2) == 0. {
+                    vec![[x, y], [x, y + w], [x + w, y + w], [x + w, y]]
+                } else {
+                    vec![[x, y], [x + w, y], [x, y + w]]
+                });
+            }
+            let all = vec![true; contours.len()];
+            let expected = reference(&contours);
+            assert_eq!(
+                validate_holes(&contours, &all).is_ok(),
+                expected,
+                "{contours:?}"
+            );
+            if expected {
+                agree.0 += 1;
+            } else {
+                agree.1 += 1;
+            }
+        }
+        // Both answers occur often.
+        assert!(agree.0 > 500 && agree.1 > 500, "{agree:?}");
+    }
+
     use super::*;
     fn square() -> (Model, usize, Vec<usize>) {
         let mut model = Model::new(1e-8, 0.03).unwrap();
