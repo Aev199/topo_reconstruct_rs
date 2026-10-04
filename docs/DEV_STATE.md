@@ -235,6 +235,31 @@ node welding: `--v2-node-weld` is removed), duplicate edge keys after splits (re
 indexed), a stacked-alignment identification that ignored other supports of
 the upper node, unbuffered report output, slow console trimming.
 
+## Review of 9203e05..8c0f264 (2026-10-04)
+
+Fixed in 762f635 (synthetic regressions; Tier C re-run pending, the
+private fixtures were not available in the review session):
+
+- generalization could leave a removed vertex up to twice its tolerance
+  from the final contour (a kept or blocked vertex bends the chord) and
+  reported the distance to the Douglas-Peucker line instead;
+- `covered` surfaces were tested by vertices only: a surface bridging a
+  notch of a nonconvex surface was deleted;
+- joint length counted a contour wholly within the band twice;
+- reports before covered/absorbed removal keep the old surface numbering
+  (`topology.surface_renumbering` maps it);
+- synthetic tests ran at 0.1 um precision, production at 1 um
+  (`assembly::PRECISION` now shared).
+
+Open for a user decision: `absorbed` deletes the whole narrow piece on
+any overlap above (10 um)^2, so noise along a shared edge qualifies and
+the non-overlapping material is lost (clip instead, or require a real
+overlap); openings are filled on width alone (a 0.9 x 20 m slot too);
+generalization keeps its approach rule for bars and junction lines only,
+so a straightened contour may come within millimetres of another
+surface's contour; the global audit tolerance is 5 x the precision read
+from the audited report (1e-7 -> 1e-6 loosened it tenfold).
+
 ## Next coherent development batch
 
 ### Goal
