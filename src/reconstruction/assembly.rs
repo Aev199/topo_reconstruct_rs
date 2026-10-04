@@ -675,7 +675,12 @@ fn plane_polygon(rings: &[Vec<[f64; 2]>]) -> geo::Polygon<f64> {
 /// the point slack along its contour (a vertex test alone lets a surface
 /// bridge a notch of a nonconvex one). Of two equal ones the later goes;
 /// a covering surface is never removed itself.
-fn covered_surfaces(model: &Model, stiffness: &[u32], precision: f64) -> BTreeSet<usize> {
+fn covered_surfaces(
+    model: &Model,
+    stiffness: &[u32],
+    precision: f64,
+    keep: &BTreeSet<usize>,
+) -> BTreeSet<usize> {
     let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * precision;
     let surfaces = model.surfaces();
     let planes = model.planes();
@@ -741,7 +746,7 @@ fn covered_surfaces(model: &Model, stiffness: &[u32], precision: f64) -> BTreeSe
                 }
         });
         if let Some(j) = found {
-            if !covering.contains(&i) {
+            if !covering.contains(&i) && !keep.contains(&i) {
                 covered.insert(i);
                 covering.insert(j);
             }
@@ -801,9 +806,9 @@ fn absorbed_slivers(
     angle: f64,
     precision: f64,
     removed: &BTreeSet<usize>,
+    keep: &BTreeSet<usize>,
 ) -> BTreeMap<usize, Absorption> {
     use geo::{Area, BooleanOps};
-    let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * precision;
     let surfaces = model.surfaces();
     let planes = model.planes();
     let area: Vec<f64> = surfaces.iter().map(|s| surface_area(&s.contours)).collect();
@@ -849,7 +854,15 @@ fn absorbed_slivers(
             plane_polygon(&surfaces[j].contours),
         );
         let overlap = own_polygon.intersection(&other).unsigned_area();
-        if overlap <= slack * perimeter {
+        // As the global audit counts an overlap: more than a band of five
+        // precisions along the shorter contour.
+        let other_perimeter: f64 = surfaces[j]
+            .contours
+            .iter()
+            .flat_map(|r| (0..r.len()).map(move |k| (r[k], r[(k + 1) % r.len()])))
+            .map(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]))
+            .sum();
+        if overlap <= 5. * precision * perimeter.min(other_perimeter) {
             return None;
         }
         let lost = own_polygon.difference(&other);
@@ -882,7 +895,7 @@ fn absorbed_slivers(
     let mut order: Vec<usize> = (0..surfaces.len()).collect();
     order.sort_by(|&a, &b| area[a].total_cmp(&area[b]).then(a.cmp(&b)));
     for i in order {
-        if removed.contains(&i) || !narrow(i) {
+        if removed.contains(&i) || keep.contains(&i) || !narrow(i) {
             continue;
         }
         let found = by_stiffness[&stiffness[i]].iter().find_map(|&j| {
@@ -1826,28 +1839,51 @@ fn assemble_impl(
     // A surface lying inside another surface of the same plane and
     // stiffness (small elements of a warped corner folded onto each other
     // by the frame and gap closures; duplicated elements) adds nothing:
-    // removed, the smaller one (equal ones: the later) going.
-    if features.is_some() {
-        let mut covered = covered_surfaces(&model, &surface_stiffness, policy.precision);
-        let absorbed = match features {
-            Some(features) => {
-                let tolerance: Vec<f64> = surface_stiffness
-                    .iter()
-                    .map(|&k| features.simplification(k))
-                    .collect();
-                absorbed_slivers(
-                    &model,
-                    &surface_stiffness,
-                    &tolerance,
-                    source.policy.angle,
-                    policy.precision,
-                    &covered,
-                )
+    // removed, the smaller one (equal ones: the later) going. Again after
+    // generalization, which moves contours by up to their tolerance.
+    let mut remove_pieces =
+        |model: &mut Model,
+         axis_assembly: &mut bars::Report,
+         surface_stiffness: &mut Vec<u32>,
+         surface_source_patches: &mut Vec<usize>,
+         removed_slivers: &mut Vec<RemovedSliver>,
+         simplified_holes: &mut Vec<SimplifiedHole>| {
+            let Some(features) = features else {
+                return;
+            };
+            // Surfaces that took the material of an earlier piece are not
+            // removed as covered (that record names no covering surface).
+            let keep: BTreeSet<usize> = removed_slivers
+                .iter()
+                .filter_map(|s| s.absorbed.map(|a| a.into))
+                .collect();
+            let mut covered = covered_surfaces(model, surface_stiffness, policy.precision, &keep);
+            let tolerance: Vec<f64> = surface_stiffness
+                .iter()
+                .map(|&k| features.simplification(k))
+                .collect();
+            let absorbed = absorbed_slivers(
+                model,
+                surface_stiffness,
+                &tolerance,
+                source.policy.angle,
+                policy.precision,
+                &covered,
+                &BTreeSet::new(),
+            );
+            covered.extend(absorbed.keys().copied());
+            if covered.is_empty() {
+                return;
             }
-            None => BTreeMap::new(),
-        };
-        covered.extend(absorbed.keys().copied());
-        if !covered.is_empty() {
+            // Pieces absorbed earlier into a surface absorbed now move on
+            // with it (a chain, as within one pass).
+            for sliver in removed_slivers.iter_mut() {
+                if let Some(a) = &mut sliver.absorbed {
+                    if let Some(next) = absorbed.get(&a.into) {
+                        a.into = next.into;
+                    }
+                }
+            }
             for &s in &covered {
                 let surface = &model.surfaces()[s];
                 removed_slivers.push(RemovedSliver {
@@ -1869,23 +1905,30 @@ fn assemble_impl(
                 simplified_holes.retain(|h| h.source_elements != ids);
             }
             let index = model.remove_surfaces(&covered);
-            surface_renumbering = index.clone();
-            for sliver in &mut removed_slivers {
+            surface_renumbering = if surface_renumbering.is_empty() {
+                index.clone()
+            } else {
+                surface_renumbering
+                    .iter()
+                    .map(|s| s.and_then(|m| index[m]))
+                    .collect()
+            };
+            for sliver in removed_slivers.iter_mut() {
                 if let Some(a) = &mut sliver.absorbed {
                     a.into = index[a.into].expect("an absorbing surface stays");
                 }
             }
             let kept = |s: &usize| index[*s].is_some();
-            surface_source_patches = (0..index.len())
+            *surface_source_patches = (0..index.len())
                 .filter(kept)
                 .map(|s| surface_source_patches[s])
                 .collect();
-            surface_stiffness = (0..index.len())
+            *surface_stiffness = (0..index.len())
                 .filter(kept)
                 .map(|s| surface_stiffness[s])
                 .collect();
-            // Surface indices held elsewhere follow; contacts with a
-            // removed surface go (contacts are refreshed at the end).
+            // Surface indices held elsewhere follow; contacts with a removed
+            // surface go (contacts are refreshed at the end).
             axis_assembly.contacts.retain_mut(|c| {
                 let (bars::Contact::Point { surface, .. }
                 | bars::Contact::Interval { surface, .. }) = c;
@@ -1906,8 +1949,15 @@ fn assemble_impl(
                     }
                     None => false,
                 });
-        }
-    }
+        };
+    remove_pieces(
+        &mut model,
+        &mut axis_assembly,
+        &mut surface_stiffness,
+        &mut surface_source_patches,
+        &mut removed_slivers,
+        &mut simplified_holes,
+    );
     // Small free openings are filled before bars are imprinted, so a column
     // through a filled opening is imprinted into the slab.
     let filled_openings = match features {
@@ -1991,6 +2041,15 @@ fn assemble_impl(
         consoles.passes += again.passes;
     }
     timer.lap("consoles_after_generalization");
+    remove_pieces(
+        &mut model,
+        &mut axis_assembly,
+        &mut surface_stiffness,
+        &mut surface_source_patches,
+        &mut removed_slivers,
+        &mut simplified_holes,
+    );
+    timer.lap("pieces_after_generalization");
     // Junctions changed by the later stages (a removed or absorbed piece,
     // a straightened contour now crossing a wall) are represented again.
     if let Some(features) = features {
@@ -2095,7 +2154,7 @@ mod tests {
                     [0., 0., 1.],
                 );
                 let m = build(&place, &[u.clone(), strip]);
-                let r = covered_surfaces(&m, &[7, 7], 1e-6 * place.scale);
+                let r = covered_surfaces(&m, &[7, 7], 1e-6 * place.scale, &BTreeSet::new());
                 assert_eq!(r.len(), covered, "right edge {right}");
                 assert!(r.iter().all(|&s| s == 1));
             }
@@ -2110,6 +2169,7 @@ mod tests {
             // off, starting at `x0` with `size` (tolerance 0.1 m):
             // - 0.1 m folded 5 cm onto the wall: absorbed, 5 cm lost;
             // - 0.5 m: not narrow, kept;
+            // - 0.1 m on the wall by 30 um: absorbed, almost all lost;
             // - 0.1 m touching the edge with 5 um of noise: no overlap, kept;
             // - 0.16 m, 1 cm on the wall: 15 cm would be lost, kept.
             let wall = (
@@ -2118,6 +2178,9 @@ mod tests {
             );
             for (x0, size, absorbed) in [
                 (3.95, 0.1, true),
+                // A 30 um strip on the wall: an overlap as the audit counts
+                // it (beyond five precisions along the shorter contour).
+                (3.99997, 0.1, true),
                 (3.95, 0.5, false),
                 (3.999995, 0.1, false),
                 (3.99, 0.16, false),
@@ -2136,9 +2199,9 @@ mod tests {
                 let tolerance = [0.1 * place.scale; 2];
                 let precision = PRECISION * place.scale;
                 let none = BTreeSet::new();
-                let r = absorbed_slivers(&m, &[7, 7], &tolerance, 0.02, precision, &none);
+                let r = absorbed_slivers(&m, &[7, 7], &tolerance, 0.02, precision, &none, &none);
                 assert_eq!(r.len(), absorbed as usize, "x0 {x0} size {size}");
-                if let Some(a) = r.get(&1) {
+                if let (Some(a), true) = (r.get(&1), x0 == 3.95) {
                     assert_eq!(a.into, 0);
                     let lost = 0.05 * place.scale;
                     assert!((a.lost_distance - lost).abs() < 1e-3 * place.scale);
@@ -2148,13 +2211,20 @@ mod tests {
                 }
                 // Another stiffness, or a removed wall, never takes it.
                 assert!(
-                    absorbed_slivers(&m, &[7, 8], &tolerance, 0.02, precision, &none).is_empty()
-                );
-                let wall_removed = BTreeSet::from([0]);
-                assert!(
-                    absorbed_slivers(&m, &[7, 7], &tolerance, 0.02, precision, &wall_removed)
+                    absorbed_slivers(&m, &[7, 8], &tolerance, 0.02, precision, &none, &none)
                         .is_empty()
                 );
+                let wall_removed = BTreeSet::from([0]);
+                assert!(absorbed_slivers(
+                    &m,
+                    &[7, 7],
+                    &tolerance,
+                    0.02,
+                    precision,
+                    &wall_removed,
+                    &none
+                )
+                .is_empty());
             }
         }
     }
