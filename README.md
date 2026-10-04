@@ -71,8 +71,12 @@ three.js в окне WebView2 (Tauri 2). Открыть модель ЛИРА �
 ```sh
 cd app/ui && npm ci && npm run build            # интерфейс
 cargo run --release --example editor_server     # браузерный режим: http://127.0.0.1:8787/
-cd app/src-tauri && npx --prefix ../ui tauri build   # установщик (Windows)
+cd app/src-tauri && npx --prefix ../ui tauri build   # portable exe (Windows)
 node app/ui/tests/e2e.mjs model.txt out/        # сквозная проверка интерфейса
 ```
 
-Установщик Windows собирается вручную в GitHub Actions (`build_app`).
+Portable-версия (один `topo-editor.exe`, без установки) собирается вручную в
+GitHub Actions (`build_app`). Кэш каркаса и данные окна хранятся в папке
+`topo-editor-data` рядом с exe (если она недоступна для записи — в профиле
+пользователя). Нужен WebView2 Runtime: он входит в Windows 11 и обновлённую
+Windows 10.

@@ -23,12 +23,38 @@ async fn call(app: tauri::AppHandle, command: String, args: serde_json::Value) -
     .map_err(|e| e.to_string())?
 }
 
+/// Portable: the frame cache and the WebView2 data live in a folder next
+/// to the executable when it is writable (else in the user's local app
+/// data), so the program runs from any folder or USB drive without setup.
+fn data_dir(app: &tauri::App) -> std::path::PathBuf {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("topo-editor-data")));
+    if let Some(dir) = beside {
+        if std::fs::create_dir_all(&dir).is_ok()
+            && std::fs::write(dir.join(".write-test"), b"").is_ok()
+        {
+            let _ = std::fs::remove_file(dir.join(".write-test"));
+            return dir;
+        }
+    }
+    app.path()
+        .app_local_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("topo-editor"))
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let cache = app.path().app_cache_dir()?;
-            app.manage(Editor(Mutex::new(Service::new(cache))));
+            let data = data_dir(app);
+            app.manage(Editor(Mutex::new(Service::new(data.join("cache")))));
+            tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::default())
+                .title("Topo Editor")
+                .inner_size(1400., 900.)
+                .min_inner_size(900., 600.)
+                .data_directory(data.join("webview"))
+                .build()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![call])
