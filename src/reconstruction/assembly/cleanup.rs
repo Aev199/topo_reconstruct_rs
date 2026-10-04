@@ -1805,7 +1805,7 @@ pub fn generalize_contours(
                 report.blocked += 1;
                 continue;
             }
-            if model.remove_vertex(v, f64::MAX).is_ok() {
+            if model.remove_vertex_among(v, f64::MAX, &chain_users).is_ok() {
                 obstacles.replace(model, [prev, v], [v, next], [prev, next]);
                 pending.push(i);
                 removed.push((i, report.removed.len()));

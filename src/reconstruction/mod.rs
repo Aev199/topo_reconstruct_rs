@@ -306,12 +306,28 @@ impl Model {
     /// edges have different users, or a resulting contour is invalid. The
     /// model is unchanged on error.
     pub fn remove_vertex(&mut self, vertex: usize, deviation: f64) -> Result<usize, Error> {
-        let incident: Vec<usize> = (0..self.edges.len())
-            .filter(|&e| {
-                self.edges[e].contains(&vertex)
-                    && (0..self.surfaces.len()).any(|s| self.surface_edges(s).any(|x| x == e))
+        let all: Vec<usize> = (0..self.surfaces.len()).collect();
+        self.remove_vertex_among(vertex, deviation, &all)
+    }
+
+    /// [`Model::remove_vertex`] when the caller knows that no surface
+    /// outside `candidates` uses the vertex (the users of a contour chain):
+    /// only those surfaces are searched.
+    pub fn remove_vertex_among(
+        &mut self,
+        vertex: usize,
+        deviation: f64,
+        candidates: &[usize],
+    ) -> Result<usize, Error> {
+        let mut incident: Vec<usize> = candidates
+            .iter()
+            .flat_map(|&s| {
+                self.surface_edges(s)
+                    .filter(|&e| self.edges[e].contains(&vertex))
             })
             .collect();
+        incident.sort_unstable();
+        incident.dedup();
         let [e1, e2] = incident[..] else {
             return Err(Error::InvalidVertex);
         };
@@ -325,9 +341,14 @@ impl Model {
         };
         let (p, q) = (other(e1), other(e2));
         let users = |e: usize| -> Vec<usize> {
-            (0..self.surfaces.len())
+            let mut list: Vec<usize> = candidates
+                .iter()
+                .copied()
                 .filter(|&s| self.surface_edges(s).any(|x| x == e))
-                .collect()
+                .collect();
+            list.sort_unstable();
+            list.dedup();
+            list
         };
         let surfaces = users(e1);
         if surfaces != users(e2) || p == q {

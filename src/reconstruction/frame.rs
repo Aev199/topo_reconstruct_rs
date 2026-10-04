@@ -563,33 +563,120 @@ fn project_checkpoints(
     tolerance: f64,
     checkpoint: &mut dyn FnMut(Vec<f64>, f64, usize) -> bool,
 ) {
+    use rayon::prelude::*;
     // LSQR operates on A and A^T directly; avoid normal equations A A^T
     // whose conditioning is squared for nearly dependent plane constraints.
-    let norm = |v: &[f64]| v.iter().fold(0.0_f64, |a, b| a.hypot(*b));
-    let scales: Vec<_> = equations
+    //
+    // Layout for speed: unknowns in no equation keep a zero correction and
+    // are left out; A is stored by rows (products per equation) and by
+    // columns (A^T products per unknown). Every sum has a fixed order and
+    // a fixed split into blocks, so results do not depend on the number of
+    // threads. Norms are scaled sums of squares over blocks (no overflow
+    // or underflow for any vector the solve produces).
+    let norm = |v: &[f64]| -> f64 {
+        let largest = v
+            .par_chunks(8192)
+            .map(|c| c.iter().fold(0.0_f64, |m, x| m.max(x.abs())))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .fold(0.0_f64, f64::max);
+        if largest == 0. || !largest.is_finite() {
+            return largest;
+        }
+        let sum: f64 = v
+            .par_chunks(8192)
+            .map(|c| c.iter().map(|x| (x / largest) * (x / largest)).sum::<f64>())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .sum();
+        largest * sum.sqrt()
+    };
+    let mut column_of = vec![usize::MAX; x.len()];
+    let mut active: Vec<usize> = vec![];
+    for e in equations {
+        for &(i, _) in &e.terms {
+            if column_of[i] == usize::MAX {
+                column_of[i] = usize::MAX - 1;
+            }
+        }
+    }
+    for (i, c) in column_of.iter_mut().enumerate() {
+        if *c != usize::MAX {
+            *c = active.len();
+            active.push(i);
+        }
+    }
+    let n = active.len();
+    let scales: Vec<f64> = equations
         .iter()
         .map(|e| e.terms.iter().map(|(_, a)| a * a).sum::<f64>().sqrt())
         .collect();
-    let multiply = |v: &[f64]| -> Vec<f64> {
-        equations
-            .iter()
-            .zip(&scales)
-            .map(|(e, s)| e.value(v) / s)
-            .collect()
-    };
-    let transpose = |v: &[f64]| -> Vec<f64> {
-        let mut result = vec![0.0; x.len()];
-        for ((e, s), v) in equations.iter().zip(&scales).zip(v) {
-            for &(i, a) in &e.terms {
-                result[i] += a * v / s;
-            }
+    let mut row_start = Vec::with_capacity(equations.len() + 1);
+    let mut row_column = vec![];
+    let mut row_value = vec![];
+    row_start.push(0);
+    for e in equations {
+        for &(i, a) in &e.terms {
+            row_column.push(column_of[i]);
+            row_value.push(a);
         }
-        result
+        row_start.push(row_column.len());
+    }
+    let mut column_start = vec![0usize; n + 1];
+    for &c in &row_column {
+        column_start[c + 1] += 1;
+    }
+    for c in 0..n {
+        column_start[c + 1] += column_start[c];
+    }
+    let mut fill = column_start.clone();
+    let mut column_row = vec![0usize; row_column.len()];
+    let mut column_value = vec![0.0; row_column.len()];
+    for r in 0..equations.len() {
+        for k in row_start[r]..row_start[r + 1] {
+            let c = row_column[k];
+            column_row[fill[c]] = r;
+            column_value[fill[c]] = row_value[k];
+            fill[c] += 1;
+        }
+    }
+    let targets: Vec<f64> = equations.iter().map(|e| e.target).collect();
+    let row_dot = |r: usize, v: &[f64]| -> f64 {
+        (row_start[r]..row_start[r + 1])
+            .map(|k| row_value[k] * v[row_column[k]])
+            .sum()
     };
-    let mut u: Vec<_> = equations
-        .iter()
-        .zip(&scales)
-        .map(|(e, s)| -e.residual(&x) / s)
+    let multiply = |v: &[f64], out: &mut [f64]| {
+        out.par_iter_mut()
+            .enumerate()
+            .with_min_len(4096)
+            .for_each(|(r, o)| *o = row_dot(r, v) / scales[r]);
+    };
+    let transpose = |v: &[f64], out: &mut [f64]| {
+        out.par_iter_mut()
+            .enumerate()
+            .with_min_len(4096)
+            .for_each(|(c, o)| {
+                let mut sum = 0.0;
+                for k in column_start[c]..column_start[c + 1] {
+                    let r = column_row[k];
+                    sum += column_value[k] * v[r] / scales[r];
+                }
+                *o = sum;
+            });
+    };
+    let max_residual = |state: &[f64]| -> f64 {
+        (0..equations.len())
+            .into_par_iter()
+            .with_min_len(4096)
+            .map(|r| (row_dot(r, state) - targets[r]).abs())
+            .reduce(|| 0.0_f64, f64::max)
+    };
+    let original: Vec<f64> = active.iter().map(|&i| x[i]).collect();
+    let mut u: Vec<f64> = (0..equations.len())
+        .into_par_iter()
+        .with_min_len(4096)
+        .map(|r| -(row_dot(r, &original) - targets[r]) / scales[r])
         .collect();
     let mut beta = norm(&u);
     if beta > 0. {
@@ -597,7 +684,8 @@ fn project_checkpoints(
             *v /= beta;
         }
     }
-    let mut v = transpose(&u);
+    let mut v = vec![0.0; n];
+    transpose(&u, &mut v);
     let mut alpha = norm(&v);
     if alpha > 0. {
         for p in &mut v {
@@ -607,19 +695,18 @@ fn project_checkpoints(
     let mut w = v.clone();
     let mut rho_bar = alpha;
     let mut phi_bar = beta;
-    let mut correction = vec![0.0; x.len()];
-    let original = x.to_vec();
-    let mut residual = equations
-        .iter()
-        .map(|e| e.residual(x).abs())
-        .fold(0.0_f64, f64::max);
+    let mut correction = vec![0.0; n];
+    let mut residual = max_residual(&original);
     let mut iterations = 0;
+    let mut av = vec![0.0; equations.len()];
+    let mut atu = vec![0.0; n];
+    let mut candidate = original.clone();
     let state = |correction: &[f64]| -> Vec<f64> {
-        original
-            .iter()
-            .zip(correction)
-            .map(|(o, d)| o + d)
-            .collect()
+        let mut full = x.to_vec();
+        for (k, &i) in active.iter().enumerate() {
+            full[i] = original[k] + correction[k];
+        }
+        full
     };
     // Checkpoints passed; the callback may stop the solve at any of them.
     let mut passed = 0;
@@ -628,25 +715,25 @@ fn project_checkpoints(
         if residual <= tolerance {
             break;
         }
-        let av = multiply(&v);
-        for (u, av) in u.iter_mut().zip(av) {
-            *u = av - alpha * (*u);
-        }
+        multiply(&v, &mut av);
+        u.par_iter_mut()
+            .zip(av.par_iter())
+            .with_min_len(4096)
+            .for_each(|(u, av)| *u = av - alpha * (*u));
         beta = norm(&u);
         if beta > 0. {
-            for p in &mut u {
-                *p /= beta;
-            }
+            u.par_iter_mut().with_min_len(4096).for_each(|p| *p /= beta);
         }
-        let atu = transpose(&u);
-        for (v, atu) in v.iter_mut().zip(atu) {
-            *v = atu - beta * (*v);
-        }
+        transpose(&u, &mut atu);
+        v.par_iter_mut()
+            .zip(atu.par_iter())
+            .with_min_len(4096)
+            .for_each(|(v, atu)| *v = atu - beta * (*v));
         alpha = norm(&v);
         if alpha > 0. {
-            for p in &mut v {
-                *p /= alpha;
-            }
+            v.par_iter_mut()
+                .with_min_len(4096)
+                .for_each(|p| *p /= alpha);
         }
         let rho = rho_bar.hypot(beta);
         if !rho.is_finite() || rho <= 1e-30 {
@@ -658,20 +745,20 @@ fn project_checkpoints(
         rho_bar = -c * alpha;
         let phi = c * phi_bar;
         phi_bar *= s;
-        for ((dx, w), v) in correction.iter_mut().zip(&mut w).zip(&v) {
-            *dx += (phi / rho) * (*w);
-            *w = *v - (theta / rho) * (*w);
-        }
-        // No mutation of x until closure borrows end; assess true residual.
-        let candidate: Vec<_> = original
-            .iter()
-            .zip(&correction)
-            .map(|(a, b)| a + b)
-            .collect();
-        residual = equations
-            .iter()
-            .map(|e| e.residual(&candidate).abs())
-            .fold(0.0_f64, f64::max);
+        correction
+            .par_iter_mut()
+            .zip(w.par_iter_mut())
+            .zip(v.par_iter())
+            .zip(candidate.par_iter_mut())
+            .zip(original.par_iter())
+            .with_min_len(4096)
+            .for_each(|((((dx, w), v), cand), o)| {
+                *dx += (phi / rho) * (*w);
+                *w = *v - (theta / rho) * (*w);
+                *cand = o + *dx;
+            });
+        // The true residual of the current state.
+        residual = max_residual(&candidate);
         iterations = step + 1;
         while passed < limits.len() && limits[passed] == iterations {
             passed += 1;
