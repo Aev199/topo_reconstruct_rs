@@ -299,9 +299,20 @@ hash, profile and journal; the saved result carries `user_edits` and
 Windows installer: manual `build_app` job (one windows-latest job, NSIS,
 artifact 7 days), first build green (run 37190104074).
 
-Багратион v4 in the editor: opening with a solved frame takes the
-assembly time (about 10 min; 33 min including the frame solve without a
-cache), scene 11 MB in 0.2 s, an edit with the full re-audit 1.3 s.
+Portable build (user decision 2026-10-04): one `topo-editor.exe`, data
+(frame cache, WebView2 profile) in `topo-editor-data` beside it; needs the
+WebView2 runtime (part of Windows 11 and updated Windows 10).
+
+Speed (2026-10-04, Багратион v4, 4 cores): frame 25 min -> about 1 min
+(LSQR over active unknowns only, CSR/CSC, parallel products, blocked
+norms instead of a sequential hypot; 2/3 of the old time went to the
+default and snapped solves that never converge before the relaxed one),
+assembly 8 -> about 3 min (vertex removal searches only the chain's
+surfaces and validates only the edited ring). Whole run without cache
+33 -> about 5 min. The frame of ill-conditioned models depends on where
+LSQR stops (ЖК Остров: nodes up to 6 cm apart between two valid
+solutions); a final touch pass makes the assembly robust to it. Tier C
+after the change: strict audit 11/12 as before, v4 the same 10 sites.
 
 ## Next coherent development batch
 
