@@ -52,6 +52,10 @@ pub struct FeaturePolicy {
     /// rectangle) are filled when nothing is attached to or passes through
     /// them (model units, 0 keeps all; the geotechnical CLI uses 1 m).
     pub minimum_opening_width: f64,
+    /// Openings longer than this (larger side of their minimum bounding
+    /// rectangle) are kept whatever their width: a long slot is a
+    /// structural feature (model units, default 3 m).
+    pub maximum_opening_length: f64,
     /// Source node pairs tied by the analysis model (bars, rigid links,
     /// elastic links, rigid bodies): surfaces tied this way are joined,
     /// a gap between them is never an expansion joint.
@@ -83,6 +87,7 @@ impl Default for FeaturePolicy {
             surface_thickness: BTreeMap::new(),
             maximum_simplification: 0.05,
             minimum_opening_width: 0.,
+            maximum_opening_length: 3.,
             connections: vec![],
         }
     }

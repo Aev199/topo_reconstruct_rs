@@ -387,10 +387,15 @@ def audit_properties(data, surface_count):
     return result
 
 
-def audit(data, near_distance=0.05):
+# Coarsest numerical precision the audit accepts (model units, 1 um): the
+# audited report cannot loosen the audit by declaring a coarser precision.
+MAXIMUM_PRECISION = 1e-6
+
+
+def audit(data, near_distance=0.05, maximum_precision=MAXIMUM_PRECISION):
     topology = data["topology"]
     model = topology["preview"]
-    eps = float(topology["policy"]["precision"]) * 5
+    eps = min(float(topology["policy"]["precision"]), maximum_precision) * 5
     if not np.isfinite(near_distance) or near_distance < eps:
         raise ValueError("near distance must be finite and at least audit precision")
     vertices = np.asarray(model["vertices"], dtype=float)
@@ -531,10 +536,13 @@ def main():
     parser.add_argument("report", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--near-distance", type=float, default=0.05)
+    parser.add_argument("--maximum-precision", type=float, default=MAXIMUM_PRECISION,
+                        help="coarsest precision accepted from the report (model units)")
     parser.add_argument("--strict", action="store_true",
                         help="exit 1 on detected defects (passing does not certify solver readiness)")
     args = parser.parse_args()
-    result = audit(json.loads(args.report.read_text()), args.near_distance)
+    result = audit(json.loads(args.report.read_text()), args.near_distance,
+                   args.maximum_precision)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2))
     hidden = ("issues", "contacts", "near_faces", "point_and_bar_issues", "review_items")
     print(json.dumps({k:v for k,v in result.items() if k not in hidden},ensure_ascii=False,indent=2))

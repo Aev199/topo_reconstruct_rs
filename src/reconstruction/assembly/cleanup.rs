@@ -1537,7 +1537,8 @@ pub struct GeneralizedContours {
     /// the final edge (a kept or blocked vertex bends the chord).
     pub kept: usize,
     /// Vertices kept because the shortcut would sweep over another contour,
-    /// junction line, bar or vertex.
+    /// junction line, bar or vertex, or come nearer to one without touching
+    /// it.
     pub blocked: usize,
 }
 
@@ -1933,28 +1934,27 @@ impl Obstacles {
                     }
                     None => {
                         let (pa, pb) = (at(a), at(b));
+                        let f = pb - pa;
+                        let near = |x: DVec3, y: DVec3| segment_distance(x, y, pa, pb) <= reach;
+                        // Never come closer to another edge or bar than the
+                        // old edges without touching it: a near-coincident
+                        // boundary only meshes as a sliver (and is a gap for
+                        // PLAXIS).
+                        let gap = |x: DVec3, y: DVec3| segment_distance(x, y, pa, pb);
+                        let before = gap(tri[0], tri[1]).min(gap(tri[1], tri[2]));
+                        let after = gap(tri[0], tri[2]);
                         segment_triangle_distance(pa, pb, tri) <= self.slack
-                            || bar && {
+                            || near(tri[0], tri[2]) && after < before - self.slack
+                            || bar && near(tri[0], tri[2]) && {
                                 // A bar within reach: the new edge must not
                                 // graze it more than the old ones did.
-                                let f = pb - pa;
-                                let near =
-                                    |x: DVec3, y: DVec3| segment_distance(x, y, pa, pb) <= reach;
                                 let old = [(tri[0], tri[1]), (tri[1], tri[2])]
                                     .iter()
                                     .filter(|(x, y)| near(*x, *y))
                                     .map(|(x, y)| line_angle(*y - *x, f))
                                     .fold(std::f64::consts::FRAC_PI_2, f64::min);
                                 let new = line_angle(tri[2] - tri[0], f);
-                                // Nor come closer to it than the old ones
-                                // without touching it: a near-coincident
-                                // line only meshes as a sliver.
-                                let gap = |x: DVec3, y: DVec3| segment_distance(x, y, pa, pb);
-                                let before = gap(tri[0], tri[1]).min(gap(tri[1], tri[2]));
-                                let after = gap(tri[0], tri[2]);
-                                near(tri[0], tri[2])
-                                    && ((new < WEDGE_ANGLE && new < old - 1e-3)
-                                        || after < before - self.slack)
+                                new < WEDGE_ANGLE && new < old - 1e-3
                             }
                     }
                 };
@@ -2281,6 +2281,38 @@ mod tests {
                 assert!((x.deviation - nearest).abs() <= 1e-9 * place.scale.max(1.));
             }
             assert_eq!(ring.len(), 6);
+        }
+    }
+
+    #[test]
+    fn generalization_never_approaches_a_neighbouring_contour() {
+        // A 40 mm dent in a slab edge faces the edge of a separate slab
+        // 3 mm below the straight line: straightening would leave a 3 mm
+        // strip between them. Without the neighbour it goes.
+        let a = vec![
+            [0., 0., 0.],
+            [2., 0.04, 0.],
+            [4., 0., 0.],
+            [4., 3., 0.],
+            [0., 3., 0.],
+        ];
+        let c = vec![
+            [1.5, -1., 0.],
+            [2.5, -1., 0.],
+            [2.5, -0.003, 0.],
+            [1.5, -0.003, 0.],
+        ];
+        for place in Placement::all() {
+            for (with_neighbour, removed) in [(true, 0), (false, 1)] {
+                let mut surfaces = vec![(vec![a.clone()], [0., 0., 1.])];
+                if with_neighbour {
+                    surfaces.push((vec![c.clone()], [0., 0., 1.]));
+                }
+                let mut m = build(&place, &surfaces);
+                let tolerance = [0.05 * place.scale; 2];
+                let r = generalize_contours(&mut m, &tolerance, &BTreeSet::new(), &[], &[]);
+                assert_eq!(r.removed.len(), removed, "{r:?}");
+            }
         }
     }
 

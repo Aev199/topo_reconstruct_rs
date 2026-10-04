@@ -42,6 +42,14 @@ def wall(y=0, z0=0, z1=1):
 
 
 class GlobalAuditTests(unittest.TestCase):
+    def test_report_precision_cannot_loosen_the_audit(self):
+        data = model([xy(), wall(y=.5)])
+        data['topology']['policy']['precision'] = 1e-3
+        r = audit(data)
+        self.assertAlmostEqual(r['precision'], 5e-6)
+        self.assertFalse(r['global_surface_checks_passed'])
+        self.assertAlmostEqual(audit(data, maximum_precision=1e-3)['precision'], 5e-3)
+
     def test_shared_boundary(self):
         r = audit(model([xy(), wall()]))
         self.assertTrue(r['global_surface_checks_passed'])

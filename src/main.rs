@@ -134,6 +134,12 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     v2_min_opening: f64,
 
+    /// v2, геотехнический режим: отверстия длиннее этого значения (большая
+    /// сторона описанного прямоугольника) не заделываются при любой ширине:
+    /// длинная щель — конструктивная особенность. В единицах модели.
+    #[arg(long, default_value_t = 3.0)]
+    v2_max_opening_length: f64,
+
     /// v2, для разработки: файл кэша решённого каркаса. Если файл есть и
     /// записан для того же входного файла и тех же параметров каркаса,
     /// каркас берётся из него (сборка и сетка пересчитываются), иначе
@@ -154,6 +160,7 @@ struct V2Tolerances {
     gap_offsets: bool,
     simplification_cap: f64,
     min_opening: f64,
+    max_opening_length: f64,
     /// Development cache of the solved frame (not a tolerance).
     frame_cache: Option<String>,
 }
@@ -183,6 +190,7 @@ fn run_v2_preview(
         ("--v2-gap-closure", tolerances.gap_closure),
         ("--v2-simplification-cap", tolerances.simplification_cap),
         ("--v2-min-opening", tolerances.min_opening),
+        ("--v2-max-opening-length", tolerances.max_opening_length),
     ] {
         if !value.is_finite() || value < 0. {
             return Err(format!("{name} must be a finite non-negative length").into());
@@ -367,6 +375,7 @@ fn run_v2_preview(
                     .collect(),
                 maximum_simplification: tolerances.simplification_cap,
                 minimum_opening_width: tolerances.min_opening,
+                maximum_opening_length: tolerances.max_opening_length,
                 connections,
                 ..Default::default()
             },
@@ -435,6 +444,7 @@ fn main() {
         gap_offsets: !args.v2_keep_gap_offsets,
         simplification_cap: args.v2_simplification_cap,
         min_opening: args.v2_min_opening,
+        max_opening_length: args.v2_max_opening_length,
         frame_cache: args.v2_frame_cache.clone(),
     };
     let mut config = ReconstructionConfig::default();

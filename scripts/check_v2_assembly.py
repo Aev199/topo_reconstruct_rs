@@ -164,7 +164,8 @@ def collapse_limit(topology, c):
 def check(data, baseline=None):
     frame, topology = data["frame"], data["topology"]
     model, bars = topology["preview"], topology["axis_assembly"]
-    epsilon = topology["policy"]["precision"]
+    # The report cannot loosen the checker beyond 1 um (as the global audit).
+    epsilon = min(topology["policy"]["precision"], 1e-6)
     vertices = model["vertices"]
     source_nodes = topology["vertex_source_nodes"]
     assert len(source_nodes) == len(set(source_nodes))
@@ -285,6 +286,15 @@ def check(data, baseline=None):
         crack = topology["feature_policy"]["maximum_crack_width"]
         assert all(0 < s["width"] <= crack + 1e-12 for s in slivers
                    if s.get("reason", "sliver") == "sliver")
+    for s in slivers:
+        if s.get("reason") == "absorbed":
+            # Real overlap; the lost part within the simplification cap.
+            a = s["absorbed"]
+            policy = topology["feature_policy"]
+            cap = max(policy["maximum_simplification"], policy["maximum_gap"])
+            assert 0 <= a["into"] < len(model["surfaces"])
+            assert a["overlap"] > 0 and 0 <= a["lost_area"] <= s["area"] + epsilon
+            assert a["lost_distance"] <= cap + epsilon
     actual_shells += [e for s in slivers for e in s["source_elements"]]
     assert collections.Counter(expected_shells) == collections.Counter(actual_shells)
     assert len(actual_shells) == len(set(actual_shells))
@@ -447,6 +457,8 @@ def check(data, baseline=None):
     openings = topology.get("filled_openings") or {}
     for f in openings.get("filled", []):
         assert 0. < f["width"] < openings["minimum_width"]
+        if "maximum_length" in openings:
+            assert f["width"] <= f["length"] <= openings["maximum_length"] + epsilon
         assert f["area"] > 0.
     if baseline:
         before = baseline["topology"]["preview"]

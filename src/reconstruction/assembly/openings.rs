@@ -17,6 +17,8 @@ pub struct FilledOpening {
     pub surface: usize,
     /// Smaller side of the minimum bounding rectangle.
     pub width: f64,
+    /// Larger side of the minimum bounding rectangle.
+    pub length: f64,
     pub area: f64,
     /// Source nodes of the dropped contour.
     pub source_nodes: Vec<u32>,
@@ -26,13 +28,16 @@ pub struct FilledOpening {
 pub struct KeptOpening {
     pub surface: usize,
     pub width: f64,
-    /// `attached_surface`, `attached_bar`, `occupied` or `invalid_<error>`.
+    pub length: f64,
+    /// `long`, `attached_surface`, `attached_bar`, `occupied` or
+    /// `invalid_<error>`.
     pub reason: String,
 }
 
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
     pub minimum_width: f64,
+    pub maximum_length: f64,
     pub filled: Vec<FilledOpening>,
     pub kept: Vec<KeptOpening>,
 }
@@ -40,11 +45,17 @@ pub struct Report {
 /// Smaller side of the minimum-area bounding rectangle of `points`
 /// (rotating calipers over the convex hull).
 pub fn minimum_width(points: &[DVec2]) -> f64 {
+    rectangle_sides(points)[0]
+}
+
+/// Smaller and larger side of the minimum-area bounding rectangle of
+/// `points` (rotating calipers over the convex hull).
+pub fn rectangle_sides(points: &[DVec2]) -> [f64; 2] {
     let mut pts: Vec<DVec2> = points.to_vec();
     pts.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
     pts.dedup();
     if pts.len() < 3 {
-        return 0.;
+        return [0., 0.];
     }
     let cross = |o: DVec2, a: DVec2, b: DVec2| (a - o).perp_dot(b - o);
     let mut hull: Vec<DVec2> = vec![];
@@ -65,7 +76,7 @@ pub fn minimum_width(points: &[DVec2]) -> f64 {
         }
         hull.pop();
     }
-    let mut best = f64::MAX;
+    let mut best = [f64::MAX; 2];
     let mut best_area = f64::MAX;
     for i in 0..hull.len() {
         let (a, b) = (hull[i], hull[(i + 1) % hull.len()]);
@@ -84,7 +95,7 @@ pub fn minimum_width(points: &[DVec2]) -> f64 {
         let area = (hi - lo) * far;
         if area < best_area {
             best_area = area;
-            best = (hi - lo).min(far);
+            best = [(hi - lo).min(far), (hi - lo).max(far)];
         }
     }
     best
@@ -117,18 +128,21 @@ fn area(polygon: &[DVec2]) -> f64 {
         / 2.
 }
 
-/// Fill openings narrower than `minimum_width` that nothing is attached to
-/// or passes through. `locked` vertices (bar anchors, contacts) hold an
-/// opening.
+/// Fill openings narrower than `minimum_width` and no longer than
+/// `maximum_length` (a long slot is a structural feature, not a door or a
+/// duct) that nothing is attached to or passes through. `locked` vertices
+/// (bar anchors, contacts) hold an opening.
 pub fn fill(
     model: &mut Model,
     minimum_width_limit: f64,
+    maximum_length: f64,
     locked: &BTreeSet<usize>,
     axes: &[Axis],
     source_nodes: &[u32],
 ) -> Report {
     let mut report = Report {
         minimum_width: minimum_width_limit,
+        maximum_length,
         ..Default::default()
     };
     if minimum_width_limit <= 0. {
@@ -188,15 +202,20 @@ pub fn fill(
                 .iter()
                 .map(|&p| DVec2::from_array(p))
                 .collect();
-            let width = minimum_width(&polygon);
+            let [width, length] = rectangle_sides(&polygon);
             if width >= minimum_width_limit {
                 continue;
             }
             let kept = |reason: &str| KeptOpening {
                 surface: s,
                 width,
+                length,
                 reason: reason.into(),
             };
+            if length > maximum_length {
+                report.kept.push(kept("long"));
+                continue;
+            }
             if ring.iter().any(|v| bar_vertices.contains(v)) {
                 report.kept.push(kept("attached_bar"));
                 continue;
@@ -282,6 +301,7 @@ pub fn fill(
                 Ok(()) => report.filled.push(FilledOpening {
                     surface: s,
                     width,
+                    length,
                     area: filled_area,
                     source_nodes: ring
                         .iter()
@@ -330,18 +350,45 @@ mod tests {
             // A 0.9 m x 2 m opening is filled, a 1.2 m x 1.2 m one kept.
             for (w, filled) in [(0.9, 1), (1.2, 0)] {
                 let mut m = build(&place, &[slab_with_hole(2., 1., w, 2.)]);
-                let r = fill(&mut m, 1.0 * place.scale, &BTreeSet::new(), &[], &[]);
+                let r = fill(
+                    &mut m,
+                    1.0 * place.scale,
+                    3.0 * place.scale,
+                    &BTreeSet::new(),
+                    &[],
+                    &[],
+                );
                 assert_eq!(r.filled.len(), filled, "{r:?}");
                 assert_eq!(m.surfaces[0].boundaries.len(), 2 - filled);
                 // The 1.2 m opening is wide enough: not even reported.
                 assert!(r.kept.is_empty());
             }
+            // A 0.5 m x 3.5 m slot is longer than the limit: kept.
+            let mut m = build(&place, &[slab_with_hole(2., 0.25, 0.5, 3.5)]);
+            let r = fill(
+                &mut m,
+                1.0 * place.scale,
+                3.0 * place.scale,
+                &BTreeSet::new(),
+                &[],
+                &[],
+            );
+            assert!(r.filled.is_empty());
+            assert_eq!(r.kept[0].reason, "long");
+            assert!((r.kept[0].length - 3.5 * place.scale).abs() < 1e-9 * place.scale.max(1.));
             // A wall passing through the opening holds it.
             let mut m = build(
                 &place,
                 &[slab_with_hole(2., 1., 0.9, 2.), wall(2.2, 2.6, -1., 1.)],
             );
-            let r = fill(&mut m, 1.0 * place.scale, &BTreeSet::new(), &[], &[]);
+            let r = fill(
+                &mut m,
+                1.0 * place.scale,
+                3.0 * place.scale,
+                &BTreeSet::new(),
+                &[],
+                &[],
+            );
             assert!(r.filled.is_empty());
             assert_eq!(r.kept[0].reason, "occupied");
         }
