@@ -1,7 +1,7 @@
 # Development state
 
 Updated: 2026-10-04
-Repository baseline reviewed through the surface-junction batch (see git log).
+Repository baseline: geotechnical mode only, editor application (see git log).
 
 This file is intentionally short. It is the entry point for the next development
 session; detailed rationale belongs in `docs/GEOTECHNICAL_GEOMETRY.md` and
@@ -237,55 +237,87 @@ the upper node, unbuffered report output, slow console trimming.
 
 ## Review of 9203e05..8c0f264 (2026-10-04)
 
-Fixed in 762f635 (synthetic regressions; Tier C re-run pending, the
-private fixtures were not available in the review session):
+Fixed in 762f635: generalization could leave a removed vertex up to
+twice its tolerance from the final contour (and reported the distance to
+the Douglas-Peucker line); `covered` was tested by vertices only (a
+surface bridging a notch of a nonconvex one was deleted); joint length
+counted a contour wholly within the band twice; reports before the
+removal of covered/absorbed surfaces keep the old surface numbering
+(`topology.surface_renumbering`); synthetic tests ran at 0.1 um while
+production uses 1 um (`assembly::PRECISION`). Tier C: no metric change.
 
-- generalization could leave a removed vertex up to twice its tolerance
-  from the final contour (a kept or blocked vertex bends the chord) and
-  reported the distance to the Douglas-Peucker line instead;
-- `covered` surfaces were tested by vertices only: a surface bridging a
-  notch of a nonconvex surface was deleted;
-- joint length counted a contour wholly within the band twice;
-- reports before covered/absorbed removal keep the old surface numbering
-  (`topology.surface_renumbering` maps it);
-- synthetic tests ran at 0.1 um precision, production at 1 um
-  (`assembly::PRECISION` now shared).
+User decisions 2026-10-04 (18d3ec5, 63efb20, 0f63556):
 
-Open for a user decision: `absorbed` deletes the whole narrow piece on
-any overlap above (10 um)^2, so noise along a shared edge qualifies and
-the non-overlapping material is lost (clip instead, or require a real
-overlap); openings are filled on width alone (a 0.9 x 20 m slot too);
-generalization keeps its approach rule for bars and junction lines only,
-so a straightened contour may come within millimetres of another
-surface's contour; the global audit tolerance is 5 x the precision read
-from the audited report (1e-7 -> 1e-6 loosened it tenfold).
+- `absorbed` only on an overlap the global audit would count (more than
+  five precisions along the shorter contour), with the lost part within
+  the piece's simplification tolerance of the absorbing surface; looked
+  for again after generalization; chains allowed. Records give the
+  absorbing surface, overlap, lost area and distance.
+- Generalization never nears an edge or bar without touching it, except
+  an edge strictly inside the material of the chain's own surface (an
+  existing overlap, which nearing shrinks).
+- The audits cap the precision taken from the report at 1 um.
+- Openings longer than 3 m are kept (`--max-opening-length`).
+- Geotechnical mode only: V1 and `--v2-preserve-details` removed;
+  `pipeline::run` with `Profile::plaxis()`; CLI `model.txt -o out.json
+  [--mesh] [--frame-cache PATH]`.
+
+Tier C (0f63556 vs 8c0f264; <1/<5/<20 degree trial triangles, failing
+audit items, PLAXIS items):
+
+| Model | before | after |
+|---|---|---|
+| Багратион v4 | 11/58/1263, 10, 59 | 11/55/1257, 10 (same sites), 57 |
+| ЖК Остров | 8/53/6830, 0, 86 | 6/50/7017, 0, 93 (gaps 50 -> 57, 27 long openings kept) |
+| Багратион bedding | 40/112/333, 0, 63 | 33/103/335, 0, 63 |
+| скала1, скала seismic | 0/0/13, 0, 1 | 0/0/11, 0, 1 |
+| тест 5, тест 6, Для testa, скала2, test slab, АЖТ x2 | | unchanged |
+
+Strict audit and assembly checker pass on 11 of 12, as before.
+
+The in-application audit (`audit`, Rust) agrees with the Python
+auditors class by class on all 12 fixtures, except 6
+`bar_in_surface_without_contact` items on Багратион v4: bars leaving a
+slab at 0.13 degrees, where the Python audit's 5 um buffer stretches the
+in-surface part 2.2 mm beyond the contact interval; the Rust audit clips
+exactly and does not count them. Open for a user decision: treat them as
+a grazing artefact of the Python audit (then v4 has 4 real residual
+items) or keep them.
+
+## Editor (2026-10-04)
+
+Windows application (user decision): Rust core in process, three.js UI
+in WebView2 (Tauri 2, `app/`). `service::Service::dispatch` is the single
+command layer (the Tauri command `call` and `examples/editor_server.rs`
+for a browser). Edits (`assembly::edit`, `editor::Session`): move/merge a
+vertex, delete/join surfaces (one plane and stiffness), split an edge,
+gap as joint / close it; transactional, journaled with a replay check,
+re-audited at once; undo replays the journal; a project stores input,
+hash, profile and journal; the saved result carries `user_edits` and
+`edits`, accepted by the assembly checker. UI checks:
+`app/ui/tests/e2e.mjs`, `gap.mjs` (Playwright through the bridge).
+Windows installer: manual `build_app` job (one windows-latest job, NSIS,
+artifact 7 days), first build green (run 37190104074).
+
+Багратион v4 in the editor: opening with a solved frame takes the
+assembly time (about 10 min; 33 min including the frame solve without a
+cache), scene 11 MB in 0.2 s, an edit with the full re-audit 1.3 s.
 
 ## Next coherent development batch
 
-### Goal
-
-A simple graphical editor for the residual defects the automation leaves
-(user decision 2026-10-04): view the reconstructed geometry with audit
-findings highlighted, fix a site by hand (merge/move a vertex, delete or
-join a surface, split an edge, mark a gap as a joint or not), re-validate
-with the same Model operations and audits, and save the edited geometry
-for the exporter.
-
-### Required approach
-
-- Agree scope and platform with the user first (browser page on the
-  assembly JSON vs. desktop), mobile-friendly viewing.
-- Edits go through the transactional `Model` operations so topology stays
-  valid; every edit is logged with provenance like automatic rules.
-- Re-run the assembly checker and global audit on the edited model.
+- Use the editor on the Багратион v4 residuals and record what the edits
+  need (missing operations, picking on large models).
+- Exporter (MIDAS/PLAXIS exchange format) — postponed by the user.
+- Progress and cancellation for long reconstructions in the UI; frame
+  cache next to the project.
 
 ### Also pending
 
-- Exporter (MIDAS/PLAXIS exchange format) and import verification.
 - Load transfer (loads are not in the reconstruction input).
 - Rigid-body/coupled-displacement docs other than LIRA block 25 (the
   "объединение перемещений" block is not identified yet).
-- `panic = "abort"` in release makes the Spade `catch_unwind` ineffective.
+- The LIRA units block (33/) is not read: lengths and plate thickness are
+  taken in metres.
 
 ## Explicitly not complete yet
 
@@ -320,7 +352,9 @@ queue time and developer attention remain finite.
 
 Current `.github/workflows/build.yml` runs `cargo test --locked` on pushes and
 PRs to `main`/`master`; Windows/Linux release binaries are built only by a
-manual dispatch with `build_release`. Feature branches do not trigger CI.
+manual dispatch with `build_release`, the Windows editor installer by a
+manual dispatch with `build_app` (one job). Feature branches do not
+trigger CI.
 During geometry iteration:
 
 - use `[skip ci]` when a cross-platform release build adds no information;
