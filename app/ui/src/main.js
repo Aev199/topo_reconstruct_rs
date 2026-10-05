@@ -568,16 +568,16 @@ async function fillLoadCases() {
     syncLoadMode();
     return;
   }
-  $('plx-cases-hint').textContent = 'Собственный вес не передаётся: PLAXIS учитывает его сам. Снимите «учесть» у ненужных загружений, задайте коэффициенты сочетания.';
+  $('plx-cases-hint').textContent = 'Собственный вес (PLAXIS учитывает его сам), стадии монтажа и динамика по умолчанию не передаются. Снимите «учесть» у ненужных загружений, задайте коэффициенты сочетания.';
   for (const c of cases) {
     const row = body.insertRow();
     row.dataset.case = c.case;
-    const off = c.self_weight || c.dynamic;
+    const off = c.self_weight || c.dynamic || c.stage;
     row.classList.toggle('self-weight', off);
     row.innerHTML = `<td><input type="checkbox" class="use" ${off ? '' : 'checked'}></td><td>${c.case}</td>`
       + `<td></td><td>${c.rows}</td><td><input type="number" class="factor" step="any" value="1"></td>`;
     row.cells[2].textContent = c.name || '—';
-    if (off) row.cells[2].title = c.self_weight ? 'Похоже на собственный вес — по умолчанию не передаётся' : 'Динамическое загружение — по умолчанию не передаётся';
+    if (off) row.cells[2].title = c.self_weight ? 'Похоже на собственный вес — по умолчанию не передаётся' : c.stage ? 'Стадия монтажа — по умолчанию не передаётся' : 'Динамическое загружение — по умолчанию не передаётся';
   }
   syncLoadMode();
 }
@@ -585,13 +585,17 @@ function syncLoadMode() {
   const on = $('plx-loads').checked;
   $('plx-loads-box').hidden = !on;
   const combination = $('plx-mode').value === 'combination';
-  $('plx-cases').hidden = !combination;
+  $('plx-cases').hidden = false;
+  for (const cell of $('plx-cases').querySelectorAll('.factor, th:last-child, td:last-child')) cell.style.display = combination ? '' : 'none';
   $('plx-simplify').hidden = !combination;
 }
 $('plx-loads').onchange = syncLoadMode;
 $('plx-mode').onchange = syncLoadMode;
 
 /// The combination chosen in the dialog, or null (cases keep their contours).
+function chosenCases() {
+  return [...$('plx-cases').tBodies[0].rows].filter((r) => r.querySelector('.use').checked).map((r) => Number(r.dataset.case));
+}
 function chosenCombination() {
   if ($('plx-mode').value !== 'combination') return null;
   const cases = [...$('plx-cases').tBodies[0].rows]
@@ -623,6 +627,7 @@ $('export-plaxis').onclick = async () => {
     path, force_factor: Number($('plx-factor').value) || 9.80665, stiffness: $('plx-stiffness').value,
     loads: $('plx-loads').checked,
     combination: $('plx-loads').checked ? chosenCombination() : null,
+    include_cases: $('plx-loads').checked && $('plx-mode').value === 'cases' ? chosenCases() : null,
   }));
   if (!exported) return;
   const missing = exported.missing_materials.length ? `; без материала жёсткости: ${exported.missing_materials.join(', ')}` : '';

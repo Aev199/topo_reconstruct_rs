@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let set = topo_reconstruct_rs::parsers::loads::parse(&bytes);
     // --combine: every case with factor 1 except the self-weight, simplified.
     let combination = combine.then(|| loads::Combination {
-        factors: set.cases.iter().filter(|(_, n)| !loads::is_self_weight(n)).map(|(c, _)| (*c, 1.)).collect(),
+        factors: set.cases.iter().filter(|(_, n)| !loads::is_self_weight(n) && !loads::is_stage(n) && !loads::is_dynamic(n)).map(|(c, _)| (*c, 1.)).collect(),
         simplify: Some(loads::Simplify::default()),
     });
     let (list, report) = loads::transfer(
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &output.topology.vertex_source_nodes,
         &mesh,
         &set,
-        loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination },
+        loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination, cases: None },
     );
     let mut exported: BTreeMap<u32, DVec3> = BTreeMap::new();
     let mut by_kind: BTreeMap<(u32, &str), DVec3> = BTreeMap::new();

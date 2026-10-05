@@ -135,7 +135,11 @@ impl Service {
                 };
                 let with_loads = args.get("loads").and_then(Value::as_bool).unwrap_or(true);
                 let combination = combination_from(args.get("combination"))?;
-                self.export_plaxis(Path::new(&text("path")?), factor, stiffness, with_loads, combination)
+                // The cases to read in the mode "by case" (`include_cases`).
+                let cases = args.get("include_cases").and_then(Value::as_array).map(|a| {
+                    a.iter().filter_map(Value::as_u64).map(|c| c as u32).collect()
+                });
+                self.export_plaxis(Path::new(&text("path")?), factor, stiffness, with_loads, combination, cases)
             }
             "load_cases" => self.load_cases(),
             "run_plaxis" => self.run_plaxis(&args),
@@ -388,6 +392,7 @@ impl Service {
         stiffness: crate::plaxis::StiffnessMode,
         with_loads: bool,
         combination: Option<crate::loads::Combination>,
+        cases: Option<std::collections::BTreeSet<u32>>,
     ) -> Result<Value, String> {
         let input = self.input.as_ref().ok_or("no model is open")?;
         let session = self.session()?;
@@ -406,7 +411,7 @@ impl Service {
         );
         let mut exchange = exchange;
         if with_loads {
-            self.add_loads(&mut exchange, force_factor, combination)?;
+            self.add_loads(&mut exchange, force_factor, combination, cases)?;
         }
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         serde_json::to_writer(std::io::BufWriter::new(file), &exchange)
@@ -443,6 +448,7 @@ impl Service {
         exchange: &mut crate::plaxis::Exchange,
         force_factor: f64,
         combination: Option<crate::loads::Combination>,
+        cases: Option<std::collections::BTreeSet<u32>>,
     ) -> Result<(), String> {
         let bytes = self.input_bytes()?;
         let mesh = crate::parsers::lira::LiraParser::mesh_from(&bytes).map_err(|e| e.to_string())?;
@@ -458,6 +464,7 @@ impl Service {
                 snap: self.profile.edge_collapse,
                 max_groups: 40,
                 combination: combination.clone(),
+                cases,
             },
         );
         exchange.load_cases = if combination.is_some() {
@@ -496,7 +503,7 @@ impl Service {
             .iter()
             .map(|(&case, &count)| {
                 let name = names.get(&case).map(|s| s.to_string()).unwrap_or_default();
-                json!({"case": case, "name": name, "rows": count, "self_weight": crate::loads::is_self_weight(&name), "dynamic": crate::loads::is_dynamic(&name)})
+                json!({"case": case, "name": name, "rows": count, "self_weight": crate::loads::is_self_weight(&name), "dynamic": crate::loads::is_dynamic(&name), "stage": crate::loads::is_stage(&name)})
             })
             .collect();
         Ok(json!({"cases": cases}))

@@ -110,6 +110,14 @@ pub fn is_dynamic(name: &str) -> bool {
     n.contains("сейсм") || n.contains("динам") || n.contains("seism")
 }
 
+/// Whether a load case is a construction stage ("СТАДИЯ 3", "СТАДИЯ №3",
+/// "Stage 3"): stages are modelled as load cases in LIRA but are not part of
+/// the PLAXIS or MIDAS load sets.
+pub fn is_stage(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    n.starts_with("стади") || n.starts_with("stage")
+}
+
 /// The case number of the load combination (`Settings::combination`).
 pub const COMBINATION: u32 = 0;
 
@@ -151,6 +159,9 @@ pub struct Settings {
     pub max_groups: usize,
     /// One combined case instead of the cases of the source.
     pub combination: Option<Combination>,
+    /// Only these cases of the source are read (stages, the self-weight and
+    /// dynamic cases are left out); `None`: all of them.
+    pub cases: Option<std::collections::BTreeSet<u32>>,
 }
 
 struct Context<'a> {
@@ -372,6 +383,9 @@ impl Context<'_> {
         let mut shell_geometry: HashMap<u32, Option<(Vec<DVec3>, [DVec3; 3], f64)>> = HashMap::new();
 
         for row in &self.set.rows {
+            if self.settings.cases.as_ref().is_some_and(|c| !c.contains(&row.case)) {
+                continue;
+            }
             let params = self.set.parameters(row.parameters);
             let code = row.code;
             // Node loads: the target is a node.
@@ -1454,6 +1468,17 @@ mod tests {
         for name in ["СВЕТ", "СНЕГ_1.4|0.5", "ПОЛЫ НОРМ", "СТАДИЯ 1", "ПОКРЫТИЕ_1.3", ""] {
             assert!(!is_self_weight(name), "{name}");
         }
+    }
+
+    #[test]
+    fn stage_and_dynamic_cases_are_recognized_by_name() {
+        for name in ["СТАДИЯ 1", "СТАДИЯ №10", "СТАДИЯ 10 <ФИНАЛЬНАЯ СТАДИЯ>", "Stage 2"] {
+            assert!(is_stage(name), "{name}");
+        }
+        for name in ["ПОЛЫ", "СНЕГ", "ПОЛЕЗНАЯ НАГРУЗКА_ K=1_2"] {
+            assert!(!is_stage(name), "{name}");
+        }
+        assert!(is_dynamic("СЕЙСМИКА ПО Х") && !is_dynamic("ВЕТЕР"));
     }
 
     #[test]

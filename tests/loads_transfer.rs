@@ -69,7 +69,7 @@ fn run_with(text: &str, tag: &str, combination: Option<loads::Combination>) -> (
         &output.topology.vertex_source_nodes,
         &mesh,
         &set,
-        loads::Settings { force_factor: 10., snap: profile.edge_collapse, max_groups: 40, combination },
+        loads::Settings { force_factor: 10., snap: profile.edge_collapse, max_groups: 40, combination, cases: None },
     );
     let _ = std::fs::remove_file(path);
     result
