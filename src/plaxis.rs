@@ -954,7 +954,7 @@ mod tests {
         use crate::reconstruction::recognize::SourceSpan;
         let place = &Placement::all()[0];
         let mut model = build(place, &[slab(0., 4.)]);
-        let mut axis = |m: &mut crate::reconstruction::Model, a: [f64; 3], b: [f64; 3]| {
+        let axis = |m: &mut crate::reconstruction::Model, a: [f64; 3], b: [f64; 3]| {
             let (va, vb) = (m.add_vertex(a).unwrap(), m.add_vertex(b).unwrap());
             Axis {
                 source_axis: 0,

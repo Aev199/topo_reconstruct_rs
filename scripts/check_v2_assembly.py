@@ -290,7 +290,12 @@ def check(data, baseline=None):
 
     expected_shells = [e for s in frame["surfaces"] for e in s["source_elements"]]
     actual_shells = [e for s in model["surfaces"] for e in s["source_elements"]]
-    actual_shells += [e for issue in topology["issues"] for e in issue["source_elements"]]
+    # A region the assembly could not build is missing geometry, however
+    # clean the rest is (a whole slab dropped): never counted as accounted.
+    unbuilt = [(i["patch"], len(i["source_elements"]), i["reason"]) for i in topology["issues"]]
+    assert not unbuilt, f"surfaces not built (patch, elements, reason): {unbuilt}"
+    assert not bars.get("issues"), f"bars not built: {[(i['source_axis'], i['reason']) for i in bars['issues']]}"
+    assert topology.get("all_surface_patches_built", True)
     # Regions no wider than a crack are left out with their elements.
     slivers = topology.get("removed_slivers", [])
     if slivers:

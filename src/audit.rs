@@ -494,6 +494,61 @@ impl Surface {
 }
 
 /// Audit the model with its bar axes and bar-surface contact records.
+impl Report {
+    /// Add findings made elsewhere; counts and verdicts follow.
+    pub fn include(&mut self, findings: impl IntoIterator<Item = Finding>) {
+        self.findings.extend(findings);
+        self.counts.clear();
+        for f in &self.findings {
+            *self.counts.entry(f.kind.clone()).or_default() += 1;
+        }
+        self.passed = !self.findings.iter().any(|f| f.class == Class::Failure);
+        self.plaxis_passed = self.passed && !self.findings.iter().any(|f| f.class == Class::Plaxis);
+    }
+}
+
+/// Source regions and bars the assembly could not build: failures, never
+/// hidden by a geometry that is valid without them (a slab dropped whole
+/// leaves the rest of the model clean).
+pub fn unbuilt(report: &crate::reconstruction::assembly::Report) -> Vec<Finding> {
+    let model = &report.preview;
+    let at = |nodes: &mut dyn Iterator<Item = u32>| -> Option<DVec3> {
+        let wanted: BTreeSet<u32> = nodes.collect();
+        report
+            .vertex_source_nodes
+            .iter()
+            .position(|n| wanted.contains(n))
+            .map(|v| p3(model.vertices()[v]))
+    };
+    let mut out = vec![];
+    for issue in &report.issues {
+        let mut f = Finding::new("surface_not_built", Class::Failure);
+        f.points = vec![
+            at(&mut issue.boundary_source_nodes.iter().flatten().copied())
+                .unwrap_or(DVec3::ZERO)
+                .to_array(),
+        ];
+        f.value = issue.source_elements.len() as f64;
+        f.detail = format!(
+            "source patch {} ({} elements): {}",
+            issue.patch,
+            issue.source_elements.len(),
+            issue.reason
+        );
+        out.push(f);
+    }
+    for issue in &report.axis_assembly.issues {
+        let mut f = Finding::new("bar_not_built", Class::Failure);
+        f.points = vec![at(&mut issue.source_nodes.iter().copied())
+            .unwrap_or(DVec3::ZERO)
+            .to_array()];
+        f.value = issue.source_elements.len() as f64;
+        f.detail = format!("source axis {}: {}", issue.source_axis, issue.reason);
+        out.push(f);
+    }
+    out
+}
+
 pub fn run(model: &Model, axes: &[Axis], contacts: &[Contact], options: &Options) -> Report {
     let eps = 5. * model.precision().min(MAXIMUM_PRECISION);
     let near = options.near_distance.max(eps);

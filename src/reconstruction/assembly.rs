@@ -2056,6 +2056,31 @@ fn assemble_impl(
     if let Some(features) = features {
         if features.maximum_gap > 0. {
             let (_, _, fixed) = protected(&model, &axis_assembly);
+            // Gaps left or made by the later stages (generalized contours,
+            // junctions, wall ends) are closed by the same rule once more.
+            {
+                let again = gaps::close_keeping_joints(
+                    &mut model,
+                    &mut cleanup::Bars {
+                        axes: &mut axis_assembly.axes,
+                        contacts: &mut axis_assembly.contacts,
+                    },
+                    features.maximum_gap,
+                    features.close_offset_gaps,
+                    features.maximum_crack_width,
+                    &connected,
+                    &fixed,
+                    &vertex_source_nodes,
+                    &vertex_source_nodes
+                        .iter()
+                        .map(|n| source.candidate_points[lookup[n]])
+                        .collect::<Vec<_>>(),
+                    policy.junction_movement_limit,
+                );
+                gaps.closed.extend(again.closed);
+                gaps.rejected.extend(again.rejected);
+            }
+            let (_, _, fixed) = protected(&model, &axis_assembly);
             let slack = crate::reconstruction::mesh::ENDPOINT_SLACK * policy.precision;
             let here = model.vertices().to_vec();
             let touches = gaps::close(

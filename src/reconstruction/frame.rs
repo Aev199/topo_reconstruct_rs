@@ -1197,10 +1197,20 @@ fn solve_impl(
         } else {
             planes.policy.distance.max(policy.panel_tolerance)
         };
-        let normal = if snapped == old
-            || points
+        // Or if snapping worsens the fit by at most the plane distance: a
+        // merged family already off its own fitted plane by 25 mm (accepted
+        // within the panel tolerance) snaps to the vertical at 26 mm. Left
+        // tilted by 1e-4, it meets two vertical walls at one point instead
+        // of their common edge, and the frame cannot close.
+        let deviation = |n: DVec3| {
+            points
                 .iter()
-                .all(|p| snapped.dot(*p - mean).abs() <= allowed)
+                .map(|p| n.dot(*p - mean).abs())
+                .fold(0., f64::max)
+        };
+        let normal = if snapped == old
+            || deviation(snapped) <= allowed
+            || deviation(snapped) <= deviation(old) + planes.policy.distance
         {
             snapped
         } else {
@@ -2697,6 +2707,57 @@ mod tests {
             for plane in &r.candidate_planes {
                 assert!(plane.normal[2].abs() > 1e-4, "{:?}", plane.normal);
             }
+        }
+    }
+
+    #[test]
+    fn merged_wall_panel_snaps_when_snapping_barely_worsens_its_fit() {
+        // A kinked wall merged into one panel (its nodes up to ~2 cm off the
+        // fitted plane) leaning 0.6 mm over 6 m meets two vertical walls at
+        // its end edge. Snapped vertical it fits barely worse; left tilted
+        // it would meet the two walls at one point instead of their common
+        // edge and the frame could not close.
+        let rotation = glam::DQuat::from_axis_angle(DVec3::Z, 0.7);
+        for rotated in [false, true] {
+            let t = |p: DVec3| if rotated { rotation * p } else { p };
+            let mut m = kinked_upper_wall(|p| {
+                let lean = DVec3::Y * 0.0001 * (p.z + 3.);
+                let kink = if p.x > 0.25 {
+                    DVec3::Y * 0.02 * (p.z + 3.) / 6.
+                } else {
+                    DVec3::ZERO
+                };
+                t(p + lean + kink)
+            });
+            // Two vertical walls from the edge x = -1 (nodes 1, 4, 7).
+            for (base, dir, stiff) in [
+                (20u32, DVec3::new(0., -1., 0.), 3u32),
+                (30, DVec3::new(-0.6, 0.8, 0.), 4),
+            ] {
+                for (k, z) in [(0u32, -3.), (1, 0.), (2, 3.)] {
+                    let edge = DVec3::new(-1., 0., z) + DVec3::Y * 0.0001 * (z + 3.);
+                    m.nodes.insert(base + k, t(edge + dir));
+                }
+                for (k, (a, b)) in [(1, 4), (4, 7)].into_iter().enumerate() {
+                    let k = k as u32;
+                    m.elements.push(ElementData {
+                        id: base + k,
+                        elem_type: 44,
+                        stiff_id: stiff,
+                        nodes: vec![a, base + k, base + k + 1, b],
+                    });
+                }
+            }
+            let mut p = policy();
+            p.panel_tolerance = 0.05;
+            p.geotechnical = true;
+            let r = run(&m, &p);
+            assert!(
+                r.accepted,
+                "{:?} {:?}",
+                r.reason,
+                r.largest_constraint_failures.first()
+            );
         }
     }
 

@@ -96,6 +96,9 @@ pub struct Session {
     redo: Vec<Entry>,
     options: audit::Options,
     audit: audit::Report,
+    /// Source regions and bars the reconstruction did not build (edits
+    /// cannot rebuild them): always failures.
+    unbuilt: Vec<audit::Finding>,
 }
 
 /// Position tolerance of a replay check (model units).
@@ -111,6 +114,7 @@ impl Session {
             redo: vec![],
             options,
             audit: audit::Report::default(),
+            unbuilt: audit::unbuilt(report),
         };
         session.reaudit();
         session
@@ -138,6 +142,7 @@ impl Session {
             &self.state.contacts,
             &self.options,
         );
+        report.findings.splice(0..0, self.unbuilt.iter().cloned());
         for f in &mut report.findings {
             if f.kind == "gap" {
                 if let (Some(v), Some(&s)) = (f.vertex, f.surfaces.last()) {
@@ -152,8 +157,7 @@ impl Session {
         for f in &report.findings {
             *report.counts.entry(f.kind.clone()).or_default() += 1;
         }
-        report.plaxis_passed =
-            report.passed && !report.findings.iter().any(|f| f.class == Class::Plaxis);
+        report.include([]);
         self.audit = report;
     }
 
@@ -418,6 +422,7 @@ mod tests {
             redo: vec![],
             options: audit::Options::default(),
             audit: audit::Report::default(),
+            unbuilt: vec![],
         };
         s.reaudit();
         s

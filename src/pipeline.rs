@@ -250,12 +250,13 @@ pub fn run(
         &reconcile::Policy::default(),
     )?;
     stage("reconciliation");
-    let audit = crate::audit::run(
+    let mut audit = crate::audit::run(
         &topology.preview,
         &topology.axis_assembly.axes,
         &topology.axis_assembly.contacts,
         &profile.audit_options(),
     );
+    audit.include(crate::audit::unbuilt(&topology));
     stage("audit");
     let (trial_mesh, mesh_error) = if options.mesh {
         match mesh::build_partial(

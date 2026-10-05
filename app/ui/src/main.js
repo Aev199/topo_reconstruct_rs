@@ -28,6 +28,8 @@ const KIND = {
   bar_surface_near_miss: 'Стержень рядом с поверхностью',
   short_bar: 'Короткий стержень',
   broken_bar: 'Нарушено представление стержня',
+  surface_not_built: 'Область КЭ не построена (нет в геометрии)',
+  bar_not_built: 'Стержень не построен (нет в геометрии)',
 };
 const CLASS = { failure: 'ошибка', plaxis: 'PLAXIS', review: 'обзор' };
 const OP = {
@@ -137,6 +139,7 @@ function format(x, digits = 3) {
 }
 
 function describe(f) {
+  if (f.kind.endsWith('_not_built')) return `КЭ: ${f.value} — ${f.detail}`;
   const unit = f.kind === 'sharp_corner' ? '°' : f.kind.includes('overlap') && f.kind.startsWith('coplanar') ? ' м²' : ' м';
   const what = [];
   if ((f.kind === 'gap' || f.kind.endsWith('near_miss') || f.kind === 'accepted_joint' || f.kind === 'unshared_point_contact')
