@@ -308,6 +308,7 @@ fn subresolution_hole_is_reported_without_silent_filling() {
         },
         export_ready: false,
         all_surface_patches_built: true,
+        source_links: Default::default(),
         preview: model,
         vertex_source_nodes: (1..=7).collect(),
         surface_source_patches: vec![0],

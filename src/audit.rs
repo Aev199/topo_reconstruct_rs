@@ -12,6 +12,9 @@
 //! Findings are failures (the strict global audit), review items (near
 //! misses, never failing) and PLAXIS items (features far below the target
 //! element size).
+mod connectivity;
+pub use connectivity::{source_links, BarLink, Context, SourceLinks, SurfaceLink};
+
 use crate::reconstruction::assembly::bars::{Axis, Contact};
 use crate::reconstruction::Model;
 use glam::{DVec2, DVec3};
@@ -65,6 +68,18 @@ pub struct Finding {
     pub value: f64,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub detail: String,
+    /// Repair proposals: edits the editor applies as they are.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub fixes: Vec<Fix>,
+}
+
+/// A proposed repair: a code naming it and the edit (the editor's JSON).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct Fix {
+    pub title: String,
+    pub edit: serde_json::Value,
+    /// Distance the repair closes, model units.
+    pub distance: f64,
 }
 
 impl Finding {
@@ -79,6 +94,7 @@ impl Finding {
             points: vec![],
             value: 0.,
             detail: String::new(),
+            fixes: vec![],
         }
     }
     fn surfaces(mut self, s: impl IntoIterator<Item = usize>) -> Self {
@@ -550,6 +566,27 @@ pub fn unbuilt(report: &crate::reconstruction::assembly::Report) -> Vec<Finding>
 }
 
 pub fn run(model: &Model, axes: &[Axis], contacts: &[Contact], options: &Options) -> Report {
+    run_with(
+        model,
+        axes,
+        contacts,
+        options,
+        &Context {
+            links: None,
+            patches: &[],
+        },
+    )
+}
+
+/// `run` with what the source model connected and the source patch of every
+/// surface (lost links are compared against it).
+pub fn run_with(
+    model: &Model,
+    axes: &[Axis],
+    contacts: &[Contact],
+    options: &Options,
+    context: &Context<'_>,
+) -> Report {
     let eps = 5. * model.precision().min(MAXIMUM_PRECISION);
     let near = options.near_distance.max(eps);
     let vertices = model.vertices();
@@ -908,6 +945,16 @@ pub fn run(model: &Model, axes: &[Axis], contacts: &[Contact], options: &Options
         edges,
         vertices,
         options,
+        &mut findings,
+    );
+    connectivity::analyse(
+        &surfaces,
+        axes,
+        contacts,
+        vertices,
+        eps,
+        options,
+        context,
         &mut findings,
     );
 
@@ -1582,5 +1629,203 @@ mod tests {
         let mut outside = square;
         outside.rings[1] = vec![DVec2::new(5., 1.), DVec2::new(5., 2.), DVec2::new(6., 2.)];
         assert!(invalidity(&outside, 1e-6).is_some());
+    }
+
+    // ---- connectivity
+
+    fn bar(m: &mut Model, source_axis: usize, a: DVec3, b: DVec3) -> Axis {
+        use crate::reconstruction::assembly::bars::Anchor;
+        let va = m.add_vertex(a.to_array()).unwrap();
+        let vb = m.add_vertex(b.to_array()).unwrap();
+        Axis {
+            source_axis,
+            endpoints: [va, vb],
+            anchors: vec![
+                Anchor {
+                    source_node: 10 * source_axis as u32,
+                    vertex: va,
+                    t: 0.,
+                },
+                Anchor {
+                    source_node: 10 * source_axis as u32 + 1,
+                    vertex: vb,
+                    t: 1.,
+                },
+            ],
+            spans: vec![],
+        }
+    }
+
+    fn link(a: usize, b: usize) -> BarLink {
+        BarLink {
+            a,
+            b,
+            node: 7,
+            at: [0.; 3],
+        }
+    }
+
+    #[test]
+    fn floating_free_and_lost_connections_are_found_with_repairs() {
+        for (scale, shift) in [(1., [0.; 3]), (10., [100., -50., 3.]), (0.1, [-2., 7., 1.])] {
+            let place = |p: [f64; 3]| DVec3::from_array([0, 1, 2].map(|k| p[k] * scale + shift[k]));
+            let mut m = model(&[(&XY, [0., 0., 1.])], scale, shift);
+            // Bar 0 stands on the slab corner; bar 1 on the opposite one,
+            // with a free upper end 0.2 from bar 2's span; bar 2 floats
+            // away from everything; bar 3 and 4 were joined in the source
+            // 0.3 apart; bar 5 is attached to the slab at one end.
+            let corner = |m: &Model, p: DVec3| {
+                (0..m.vertices().len())
+                    .find(|&v| p3(m.vertices()[v]).distance(p) < 1e-9 * scale)
+                    .unwrap()
+            };
+            let mut b0 = bar(&mut m, 0, place([0., 0., 1.]), place([0., 0., 0.]));
+            b0.endpoints[1] = corner(&m, place([0., 0., 0.]));
+            b0.anchors[1].vertex = b0.endpoints[1];
+            let mut b1 = bar(&mut m, 1, place([1., 1., 1.]), place([1., 1., 0.]));
+            b1.endpoints[1] = corner(&m, place([1., 1., 0.]));
+            b1.anchors[1].vertex = b1.endpoints[1];
+            let b2 = bar(&mut m, 2, place([5., 5., 1.]), place([5., 5., 2.]));
+            let axes = vec![b0, b1, b2];
+            let r = run(&m, &axes, &[], &Options::default());
+            let group = r
+                .findings
+                .iter()
+                .find(|f| f.kind == "floating_group")
+                .unwrap();
+            assert_eq!(group.class, Class::Plaxis);
+            assert_eq!(group.bars, vec![2]);
+            assert!(group
+                .fixes
+                .iter()
+                .any(|f| f.title == "delete_group" && f.edit["op"] == "delete_bars"));
+            // Free upper ends of bars 0 and 1 are review items; bar 2's two
+            // ends belong to the floating group and are free too.
+            let free: Vec<_> = r
+                .findings
+                .iter()
+                .filter(|f| f.kind == "free_bar_end")
+                .collect();
+            assert!(free.iter().all(|f| f.class == Class::Review));
+            assert!(free.len() >= 3, "{}", free.len());
+        }
+    }
+
+    #[test]
+    fn lost_links_of_the_source_model_are_failures_or_plaxis_items() {
+        for (scale, shift) in [(1., [0.; 3]), (10., [100., -50., 3.]), (0.1, [-2., 7., 1.])] {
+            let place = |p: [f64; 3]| DVec3::from_array([0, 1, 2].map(|k| p[k] * scale + shift[k]));
+            for attached in [false, true] {
+                let mut m = model(&[(&XY, [0., 0., 1.])], scale, shift);
+                // Two bars joined in the source (frame axes 3 and 4 shared a
+                // node), 0.3 apart in the result.
+                let (x, y) = if attached { (0.2, 0.5) } else { (3., 3.) };
+                let b3 = bar(&mut m, 3, place([x, y, 0.]), place([x, y, 1.]));
+                let b4 = bar(&mut m, 4, place([x + 0.3, y, 1.]), place([x + 0.3, y, 2.]));
+                let axes = vec![b3, b4];
+                // On the slab the first bar's foot is a point contact.
+                let contacts = if attached {
+                    vec![
+                        Contact::Point {
+                            axis: 0,
+                            surface: 0,
+                            vertex: axes[0].endpoints[0],
+                            t: 0.,
+                            location: crate::reconstruction::assembly::bars::Location::Interior,
+                        },
+                        Contact::Point {
+                            axis: 1,
+                            surface: 0,
+                            vertex: axes[1].endpoints[0],
+                            t: 0.,
+                            location: crate::reconstruction::assembly::bars::Location::Interior,
+                        },
+                    ]
+                } else {
+                    vec![]
+                };
+                let links = SourceLinks {
+                    bar_bar: vec![link(3, 4)],
+                    bar_surface: vec![],
+                };
+                let r = run_with(
+                    &m,
+                    &axes,
+                    &contacts,
+                    &Options::default(),
+                    &Context {
+                        links: Some(&links),
+                        patches: &[0],
+                    },
+                );
+                let lost = r
+                    .findings
+                    .iter()
+                    .find(|f| f.kind == "lost_bar_link")
+                    .unwrap();
+                assert_eq!(
+                    lost.class,
+                    if attached {
+                        Class::Plaxis
+                    } else {
+                        Class::Failure
+                    }
+                );
+                // Closest ends: the 0.3 horizontal gap at z = 1 (bar 3's top
+                // and bar 4's foot are 1 m apart; the bars' closest points
+                // are 0.3 apart).
+                assert!(
+                    (lost.value - 0.3 * scale).abs() < 1e-9 * scale,
+                    "{}",
+                    lost.value
+                );
+                assert!(lost.fixes.iter().any(|f| f.edit["op"] == "connect_bars"));
+                assert_eq!(lost.bars, vec![0, 1]);
+                // Without links nothing is lost.
+                let r = run(&m, &axes, &contacts, &Options::default());
+                assert!(!r.findings.iter().any(|f| f.kind.starts_with("lost_")));
+            }
+        }
+    }
+
+    #[test]
+    fn a_bar_attached_to_a_shell_in_the_source_but_not_now() {
+        for (scale, shift) in [(1., [0.; 3]), (10., [100., -50., 3.])] {
+            let place = |p: [f64; 3]| DVec3::from_array([0, 1, 2].map(|k| p[k] * scale + shift[k]));
+            let mut m = model(&[(&XY, [0., 0., 1.])], scale, shift);
+            // A column ending 0.1 above the slab (source node 30 was on the shell).
+            let b = bar(&mut m, 5, place([0.5, 0.5, 2.]), place([0.5, 0.5, 0.1]));
+            let axes = vec![b];
+            let links = SourceLinks {
+                bar_bar: vec![],
+                bar_surface: vec![SurfaceLink {
+                    axis: 5,
+                    patch: 9,
+                    node: 51,
+                    at: [0.; 3],
+                }],
+            };
+            let mut axes = axes;
+            axes[0].anchors[1].source_node = 51;
+            let r = run_with(
+                &m,
+                &axes,
+                &[],
+                &Options::default(),
+                &Context {
+                    links: Some(&links),
+                    patches: &[9],
+                },
+            );
+            let lost = r
+                .findings
+                .iter()
+                .find(|f| f.kind == "lost_surface_link")
+                .unwrap();
+            assert_eq!(lost.class, Class::Failure);
+            assert!((lost.value - 0.1 * scale).abs() < 1e-9 * scale);
+            assert_eq!(lost.fixes[0].title, "move_end_onto_surface");
+            assert_eq!(lost.fixes[0].edit["op"], "move_vertex");
+        }
     }
 }

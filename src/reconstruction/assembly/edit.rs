@@ -311,6 +311,21 @@ impl State {
         Ok(format!("bar piece collapsed, length {length:.4}"))
     }
 
+    /// Delete several bars (a floating group) as one edit.
+    pub fn delete_bars(&mut self, bars: &[usize]) -> Result<String, String> {
+        let mut list = bars.to_vec();
+        list.sort_unstable_by(|a, b| b.cmp(a));
+        list.dedup();
+        for &b in &list {
+            self.check_bar(b)?;
+        }
+        // Highest index first: each deletion renumbers only the bars after it.
+        for &b in &list {
+            self.delete_bar(b)?;
+        }
+        Ok(format!("{} bars deleted", list.len()))
+    }
+
     /// Delete a bar; its source elements are kept as provenance.
     pub fn delete_bar(&mut self, b: usize) -> Result<String, String> {
         let axis = self.check_bar(b)?.clone();
@@ -350,7 +365,11 @@ impl State {
             return Err("same_bar".into());
         }
         let ([p0, p1], [q0, q1]) = (self.ends(a), self.ends(b));
-        let (s, t) = closest_parameters(p0, p1, q0, q1).ok_or("parallel_bars")?;
+        let Some((s, t)) = closest_parameters(p0, p1, q0, q1) else {
+            // Parallel bars never cross: an end of one is seated on the
+            // side of the other.
+            return self.seat_end(a, b, tolerance);
+        };
         let (pa, pb) = (p0.lerp(p1, s), q0.lerp(q1, t));
         let distance = pa.distance(pb);
         if distance > tolerance {
@@ -459,6 +478,60 @@ impl State {
         self.axes = axes;
         self.refresh();
         Ok(format!("bars share vertex {v}"))
+    }
+
+    /// An end of one of two (parallel) bars within `tolerance` of the other
+    /// one's span moves onto it and becomes a node of both.
+    fn seat_end(&mut self, a: usize, b: usize, tolerance: f64) -> Result<String, String> {
+        let minimum = self.model.minimum_edge();
+        let mut best: Option<(f64, usize, usize, usize, DVec3)> = None;
+        for (k, o) in [(a, b), (b, a)] {
+            let [o0, o1] = self.ends(o);
+            let d = o1 - o0;
+            for end in 0..2 {
+                let v = self.axes[k].endpoints[end];
+                let p = DVec3::from_array(self.model.vertices()[v]);
+                let t = (p - o0).dot(d) / d.length_squared();
+                let foot = o0 + d * t;
+                let distance = p.distance(foot);
+                let clear = self.axes[o].anchors.iter().all(|n| {
+                    DVec3::from_array(self.model.vertices()[n.vertex]).distance(foot) >= minimum
+                });
+                if t > 0.
+                    && t < 1.
+                    && clear
+                    && distance <= tolerance
+                    && best.as_ref().is_none_or(|x| distance < x.0)
+                {
+                    best = Some((distance, k, o, v, foot));
+                }
+            }
+        }
+        let Some((distance, k, o, v, foot)) = best else {
+            return Err("parallel_bars".into());
+        };
+        let mut trial = self.model.clone();
+        let mut axes = self.axes.clone();
+        cleanup::move_with_axes(&mut trial, &axes, v, foot, f64::MAX)?;
+        let [o0, o1] = axes[o]
+            .endpoints
+            .map(|e| DVec3::from_array(trial.vertices()[e]));
+        let t = (foot - o0).dot(o1 - o0) / (o1 - o0).length_squared();
+        let source_node = axes[k]
+            .anchors
+            .iter()
+            .find(|n| n.vertex == v)
+            .map_or(bars::NO_SOURCE_NODE, |n| n.source_node);
+        axes[o].anchors.push(Anchor {
+            source_node,
+            vertex: v,
+            t,
+        });
+        axes[o].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+        self.model = trial;
+        self.axes = axes;
+        self.refresh();
+        Ok(format!("bars share vertex {v}, moved {distance:.4}"))
     }
 
     /// A bar passing through surfaces shares a node with each of them where
@@ -1141,6 +1214,36 @@ mod tests {
                 "{:?}",
                 s.contacts
             );
+        }
+    }
+
+    #[test]
+    fn the_end_of_a_bar_is_seated_on_a_parallel_bar_and_groups_are_deleted() {
+        for place in Placement::all() {
+            let mut m = build(&place, &[slab(0., 2.)]);
+            let a = bar(&mut m, &place, 0, [0., 3., 0.], [0., 3., 4.]);
+            // Bar 1 stands beside bar 0, its lower end 0.2 off bar 0's span.
+            let b = bar(&mut m, &place, 1, [0.2, 3., 3.], [0.2, 3., 6.]);
+            let c = bar(&mut m, &place, 2, [8., 8., 0.], [8., 8., 1.]);
+            let d = bar(&mut m, &place, 3, [8., 9., 0.], [8., 9., 1.]);
+            let mut s = state(m, 1);
+            s.axes = vec![a, b, c, d];
+            let tol = 0.25 * place.scale;
+            assert!(s.connect_bars(0, 1, 0.1 * place.scale).is_err());
+            s.connect_bars(0, 1, tol).unwrap();
+            // One bar's end went onto the other bar: a node of both.
+            let shared: Vec<usize> = s.axes[0]
+                .anchors
+                .iter()
+                .map(|n| n.vertex)
+                .filter(|v| s.axes[1].anchors.iter().any(|n| n.vertex == *v))
+                .collect();
+            assert_eq!(shared.len(), 1);
+            assert!(bars::axis_defects(&s.model, &s.axes).is_empty());
+            // A floating group goes at once, in one journal entry.
+            s.delete_bars(&[3, 2]).unwrap();
+            assert_eq!(s.axes.len(), 2);
+            assert_eq!(s.removed_bars.len(), 2);
         }
     }
 }

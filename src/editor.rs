@@ -47,6 +47,10 @@ pub enum Edit {
     DeleteBar {
         bar: usize,
     },
+    /// Several bars at once (one journal entry): a floating group.
+    DeleteBars {
+        bars: Vec<usize>,
+    },
     /// Two crossing bars share a node (within `tolerance` of the crossing).
     ConnectBars {
         a: usize,
@@ -99,6 +103,8 @@ pub struct Session {
     /// Source regions and bars the reconstruction did not build (edits
     /// cannot rebuild them): always failures.
     unbuilt: Vec<audit::Finding>,
+    /// What the source model connected.
+    links: audit::SourceLinks,
 }
 
 /// Position tolerance of a replay check (model units).
@@ -115,6 +121,7 @@ impl Session {
             options,
             audit: audit::Report::default(),
             unbuilt: audit::unbuilt(report),
+            links: report.source_links.clone(),
         };
         session.reaudit();
         session
@@ -136,11 +143,15 @@ impl Session {
     }
 
     fn reaudit(&mut self) {
-        let mut report = audit::run(
+        let mut report = audit::run_with(
             &self.state.model,
             &self.state.axes,
             &self.state.contacts,
             &self.options,
+            &audit::Context {
+                links: Some(&self.links),
+                patches: &self.state.patches,
+            },
         );
         report.findings.splice(0..0, self.unbuilt.iter().cloned());
         for f in &mut report.findings {
@@ -181,6 +192,9 @@ impl Session {
         match *edit {
             Edit::DeleteBar { bar: b } | Edit::ConnectBarToSurfaces { bar: b } => {
                 check.bars = bar(b)
+            }
+            Edit::DeleteBars { ref bars } => {
+                check.bars = bars.iter().flat_map(|&b| bar(b)).collect()
             }
             Edit::ConnectBars { a, b, .. } => {
                 check.bars = bar(a);
@@ -244,6 +258,7 @@ impl Session {
             } => state.close_gap(vertex, surface, tolerance),
             Edit::MarkJoint { vertex, surface } => state.mark_joint(vertex, surface),
             Edit::DeleteBar { bar } => state.delete_bar(bar),
+            Edit::DeleteBars { ref bars } => state.delete_bars(bars),
             Edit::ConnectBars { a, b, tolerance } => state.connect_bars(a, b, tolerance),
             Edit::ConnectBarToSurfaces { bar } => state.connect_bar_to_surfaces(bar),
             Edit::ConnectSurfaces { a, b } => state.connect_surfaces(a, b),
@@ -423,6 +438,7 @@ mod tests {
             options: audit::Options::default(),
             audit: audit::Report::default(),
             unbuilt: vec![],
+            links: Default::default(),
         };
         s.reaudit();
         s

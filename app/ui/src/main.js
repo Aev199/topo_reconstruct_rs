@@ -28,6 +28,10 @@ const KIND = {
   bar_surface_near_miss: 'Стержень рядом с поверхностью',
   short_bar: 'Короткий стержень',
   broken_bar: 'Нарушено представление стержня',
+  floating_group: 'Группа висит в воздухе: нет связи с основной конструкцией',
+  free_bar_end: 'Свободный конец стержня',
+  lost_bar_link: 'Потеряна связь стержней: в исходной модели они были в одном узле',
+  lost_surface_link: 'Потеряна связь стержня с пластиной: в исходной модели узел был общим',
   surface_not_built: 'Область КЭ не построена (нет в геометрии)',
   bar_not_built: 'Стержень не построен (нет в геометрии)',
 };
@@ -41,6 +45,7 @@ const OP = {
   close_gap: 'Закрытие зазора',
   mark_joint: 'Зазор принят как шов',
   delete_bar: 'Удаление стержня',
+  delete_bars: 'Удаление группы стержней',
   connect_bars: 'Общий узел стержней',
   connect_bar_to_surfaces: 'Узлы стержня с поверхностями',
   connect_surfaces: 'Общее ребро поверхностей',
@@ -59,6 +64,8 @@ function outcome(text) {
     [/^marked as joint$/, () => 'принят как шов'],
     [/^bar piece collapsed, length ([0-9.]+)$/, (m) => `участок стержня ${m[1]} м схлопнут`],
     [/^bar deleted$/, () => 'стержень удалён'],
+    [/^(\d+) bars deleted$/, (m) => `удалено стержней: ${m[1]}`],
+    [/^bars share vertex (\d+), moved ([0-9.]+)$/, (m) => `общий узел ${m[1]}, конец сдвинут на ${m[2]} м`],
     [/^shared node (\d+), moved ([0-9.]+)$/, (m) => `общий узел ${m[1]}, сдвиг ${m[2]} м`],
     [/^bars share vertex (\d+)$/, (m) => `общий узел ${m[1]}`],
     [/^bar shares (\d+) node\(s\) with surfaces$/, (m) => `узлов с поверхностями: ${m[1]}`],
@@ -139,6 +146,15 @@ function format(x, digits = 3) {
 }
 
 function describe(f) {
+  if (f.kind === 'floating_group') {
+    const [, b, c] = f.detail.match(/bars (\d+), surfaces (\d+)/) || [];
+    return `стержней ${b}, поверхностей ${c}`;
+  }
+  if (f.kind === 'free_bar_end') {
+    return `ст. ${f.bars[0]} · верш. ${f.vertex}${f.value ? ` · ближайшее на ${format(f.value, 3)} м` : ' · рядом ничего нет'}`;
+  }
+  if (f.kind === 'lost_bar_link') return `ст. ${f.bars.join(' и ')} · разрыв ${format(f.value, 3)} м · ${f.detail.replace('source node', 'узел ЛИРА')}`;
+  if (f.kind === 'lost_surface_link') return `ст. ${f.bars[0]} → пов. ${f.surfaces[0]} · разрыв ${format(f.value, 3)} м · ${f.detail.replace('source node', 'узел ЛИРА').replace('patch', 'область')}`;
   if (f.kind.endsWith('_not_built')) return `КЭ: ${f.value} — ${f.detail}`;
   const unit = f.kind === 'sharp_corner' ? '°' : f.kind.includes('overlap') && f.kind.startsWith('coplanar') ? ' м²' : ' м';
   const what = [];
@@ -357,10 +373,27 @@ function renderActions() {
         box.appendChild(button(`Схлопнуть: оставить вершину ${b}`, () => edit({ op: 'merge_vertices', drop: a, keep: b })));
       }
     }
+    for (const fix of f.fixes || []) {
+      const d = fix.distance ? ` (${format(fix.distance, 3)} м)` : '';
+      const label = {
+        connect_bars: `Связать стержни ${fix.edit.a} и ${fix.edit.b}${d}`,
+        merge_end_into_vertex: `Слить конец (верш. ${fix.edit.drop}) с вершиной ${fix.edit.keep}${d}`,
+        move_end_onto_surface: `Посадить конец (верш. ${fix.edit.vertex}) на поверхность${d}`,
+        connect_bar_to_surfaces: 'Узлы стержня с поверхностями',
+        delete_group: `Удалить всю группу (${f.bars.length} ст.)`,
+      }[fix.title] || fix.title;
+      const danger = fix.title === 'delete_group';
+      box.appendChild(button(label, () => edit(fix.edit, f.kind), danger ? 'danger' : f === sel.finding && fix === f.fixes[0] ? 'primary' : ''));
+    }
+    if (f.kind === 'free_bar_end' || f.kind === 'floating_group') {
+      hint(box, f.kind === 'floating_group'
+        ? 'Подсвечена вся группа. Если это отдельная конструкция — оставьте как есть.'
+        : 'Свободный конец бывает законным (низ сваи, консоль). Вариант исправления не применяется сам — проверьте место в 3D.');
+    }
     if (f.vertex !== undefined) {
       box.appendChild(button('Выбрать вершину', () => select({ kind: 'vertex', vertex: f.vertex })));
     }
-    for (const b of f.bars) {
+    for (const b of f.bars.slice(0, 6)) {
       box.appendChild(button(`Выбрать стержень ${b}`, () => select({ kind: 'bar', bar: b })));
     }
     for (const s of f.surfaces) {

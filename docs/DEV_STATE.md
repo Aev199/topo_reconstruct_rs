@@ -402,6 +402,21 @@ largest first triangle. Simulating PLAXIS's check on 9 fixtures: 0
 degenerate starts, deviation from the first-points plane at most 0.7 um
 (тест 5 had 56 of 127 polygons with a collinear start before).
 
+Connectivity diagnostics (2026-10-05, `audit/connectivity.rs`, Rust audit
+only): `floating_group` (a connected group of bars/surfaces apart from the
+main structure; PLAXIS class for bars only, review otherwise), `free_bar_end`
+(review; legitimate for pile tips and cantilevers), `lost_bar_link` and
+`lost_surface_link` (the source model shared a node between two bars or a
+bar and a shell patch, the result has no shared vertex/contact: failure when
+the two sit in different connected groups, PLAXIS item otherwise).
+Source links come from the frame (`assembly::Report.source_links`).
+Findings carry repair proposals (`fixes`, editor JSON): connect bars,
+merge a bar end into a vertex, move a bar end onto a surface, connect a
+bar to surfaces, delete a floating group (`delete_bars`, one journal entry).
+New editing behaviour: `connect_bars` seats an end on a parallel bar.
+Tier C: no lost links on the 13 fixtures (the floating groups of
+«Для testa» — 1, 40 and 40 bars — are separate in the source too).
+
 Real PLAXIS round 2 (user, 2026-10-05): тест 5 imports and meshes. скала3
 (new private fixture, 13 now): a floor slab (z 7.33, 2956 elements) and 6
 more regions (4797 elements) were missing while every audit was green.

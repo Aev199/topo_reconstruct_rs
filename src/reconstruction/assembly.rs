@@ -75,6 +75,9 @@ pub struct Report {
     /// intersections still require reconciliation. This is not an export gate.
     pub export_ready: bool,
     pub all_surface_patches_built: bool,
+    /// What the source model connected (bars through a node, a bar node on
+    /// a shell), for the audit's comparison with the result.
+    pub source_links: crate::audit::SourceLinks,
     pub preview: Model,
     pub vertex_source_nodes: Vec<u32>,
     pub surface_source_patches: Vec<usize>,
@@ -2129,6 +2132,7 @@ fn assemble_impl(
         policy: policy.clone(),
         export_ready: false,
         all_surface_patches_built: issues.is_empty(),
+        source_links: crate::audit::source_links(source),
         preview: model,
         vertex_source_nodes,
         surface_source_patches,

@@ -250,11 +250,15 @@ pub fn run(
         &reconcile::Policy::default(),
     )?;
     stage("reconciliation");
-    let mut audit = crate::audit::run(
+    let mut audit = crate::audit::run_with(
         &topology.preview,
         &topology.axis_assembly.axes,
         &topology.axis_assembly.contacts,
         &profile.audit_options(),
+        &crate::audit::Context {
+            links: Some(&topology.source_links),
+            patches: &topology.surface_source_patches,
+        },
     );
     audit.include(crate::audit::unbuilt(&topology));
     stage("audit");
