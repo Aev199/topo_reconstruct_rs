@@ -84,3 +84,38 @@ fn slab_and_wall_get_one_conforming_mesh() {
     };
     assert!(edge_nodes.iter().all(|n| users(0).contains(n) && users(1).contains(n)));
 }
+
+#[test]
+fn a_pressure_contour_through_elements_keeps_its_resultant_on_the_mesh() {
+    use topo_reconstruct_rs::loads::Load;
+    use topo_reconstruct_rs::mesh_loads;
+    let gmsh = match Gmsh::load() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("Gmsh library not available ({e}): test skipped");
+            return;
+        }
+    };
+    let path = std::env::temp_dir().join(format!("gmsh_mesh_loads_{}.txt", std::process::id()));
+    std::fs::write(&path, source()).unwrap();
+    let profile = Profile::plaxis();
+    let output = pipeline::run(&path, &profile, &Options::default(), &mut |_| {}).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let session = Session::new(&output.topology, profile.audit_options());
+    let state = session.state();
+    // Element size 0.7 does not divide the contour (x from 0 to 2.5): elements are cut by it.
+    let mesh = mesh_state(&gmsh, state, 0.7, false).unwrap();
+    let slab = (0..state.model.surfaces().len())
+        .find(|&s| state.model.planes()[state.model.surfaces()[s].plane].normal()[2].abs() > 0.9)
+        .unwrap();
+    let load = Load::Surface {
+        case: 1,
+        surface: slab,
+        polygons: vec![vec![[0., 0., 0.], [2.5, 0., 0.], [2.5, 4., 0.], [0., 4., 0.]]],
+        sigma: [0., 0., -3.],
+    };
+    let on_mesh = mesh_loads::transfer(&mesh, state, &[load], 0.02);
+    let resultant = on_mesh.resultants(&mesh)[&1];
+    let expected = -3. * 2.5 * 4.;
+    assert!((resultant.z - expected).abs() < 1e-6, "{resultant:?} vs {expected}");
+}

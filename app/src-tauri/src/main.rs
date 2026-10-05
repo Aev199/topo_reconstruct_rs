@@ -44,6 +44,12 @@ fn data_dir(app: &tauri::App) -> std::path::PathBuf {
 }
 
 fn main() {
+    // The Gmsh library inside the executable (a build with GMSH_DLL_PATH).
+    #[cfg(gmsh_embedded)]
+    topo_reconstruct_rs::gmsh::embed(
+        include_bytes!(env!("GMSH_DLL_PATH")),
+        std::path::Path::new(env!("GMSH_DLL_PATH")).file_name().and_then(|n| n.to_str()).unwrap_or("gmsh.dll"),
+    );
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {

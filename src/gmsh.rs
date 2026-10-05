@@ -12,6 +12,38 @@ use std::sync::Mutex;
 
 static LOCK: Mutex<()> = Mutex::new(());
 
+/// The Gmsh library carried inside the executable (see `embed`).
+static EMBEDDED: std::sync::OnceLock<(&'static [u8], String)> = std::sync::OnceLock::new();
+
+/// Register the library bytes carried inside the executable (a build with
+/// `GMSH_DLL_PATH` set embeds them). `load` writes them once to a folder in
+/// the temporary directory and loads that file, so one executable is enough.
+pub fn embed(bytes: &'static [u8], file_name: &str) {
+    let _ = EMBEDDED.set((bytes, file_name.to_string()));
+}
+
+/// The embedded library as a file (written on first use, reused while the
+/// size matches).
+fn extract_embedded() -> Option<PathBuf> {
+    let (bytes, name) = EMBEDDED.get()?;
+    let dir = std::env::temp_dir().join(format!("topo-editor-gmsh-{}", bytes.len()));
+    let path = dir.join(name);
+    if std::fs::metadata(&path).map(|m| m.len() as usize == bytes.len()).unwrap_or(false) {
+        return Some(path);
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    let partial = dir.join(format!("{name}.{}.part", std::process::id()));
+    std::fs::write(&partial, bytes).ok()?;
+    if std::fs::rename(&partial, &path).is_err() {
+        // Another instance won the race: its file is the same.
+        let _ = std::fs::remove_file(&partial);
+        if !path.exists() {
+            return None;
+        }
+    }
+    Some(path)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Error(pub String);
 
@@ -90,6 +122,7 @@ fn candidates() -> Vec<PathBuf> {
             found.extend(names);
         }
     }
+    found.extend(extract_embedded());
     found
 }
 

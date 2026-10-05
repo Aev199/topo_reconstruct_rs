@@ -14,6 +14,7 @@
     <button id="open-project">Открыть проект</button>
     <button id="save-project" disabled>Сохранить проект</button>
     <button id="export-report" disabled title="Отредактированная геометрия с журналом и аудитом (JSON)">Сохранить результат</button>
+    <button id="export-midas" disabled title="Сетка gmsh, нагрузки по загружениям, файл .mxt для MIDAS Civil">Экспорт в MIDAS…</button>
     <button id="export-plaxis" disabled title="Плиты и балки с материалами для PLAXIS 3D (через Python API)">Экспорт в PLAXIS…</button>
     <span class="sep"></span>
     <button id="undo" disabled title="Ctrl+Z">Отменить</button>
@@ -84,6 +85,27 @@
       <div class="row">
         <button value="file">Только файл обмена</button>
         <button value="run" class="primary">Построить в PLAXIS</button>
+        <button value="cancel">Отмена</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="midas-dialog">
+    <form method="dialog">
+      <h3>Экспорт в MIDAS Civil (.mxt)</h3>
+      <p class="hint">Геометрия разбивается сеткой gmsh (общие узлы по общим рёбрам), нагрузки идут каждое
+        загружение отдельно с исходными контурами. Собственный вес, стадии монтажа и динамика по умолчанию не передаются.
+        Нужна библиотека Gmsh (gmsh-4.x.dll рядом с программой).</p>
+      <label>Размер элемента, м <input id="mid-size" type="number" step="any" value="0.5" min="0.05"></label>
+      <label><input id="mid-quads" type="checkbox"> четырёхугольные элементы где возможно</label>
+      <label>Единица силы ЛИРА → кН <input id="mid-factor" type="number" step="any" value="9.80665"></label>
+      <label>Жёсткость
+        <select id="mid-stiffness">
+          <option value="effective">расчётная из ЛИРА (EF, EI, WLKE/PLKE)</option>
+          <option value="nominal">номинальная по размерам сечения</option>
+        </select></label>
+      <table id="mid-cases"><thead><tr><th>передать</th><th>№</th><th>загружение</th><th>строк</th></tr></thead><tbody></tbody></table>
+      <div class="row">
+        <button value="run" class="primary">Сохранить .mxt</button>
         <button value="cancel">Отмена</button>
       </div>
     </form>

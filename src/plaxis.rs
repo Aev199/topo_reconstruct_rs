@@ -677,6 +677,27 @@ pub fn exchange(
     settings: Settings,
     source: &str,
 ) -> Exchange {
+    exchange_with(state, materials, settings, source, true)
+}
+
+/// The materials and beams of the exchange without the polygons of the
+/// plates (for exports that mesh the surfaces themselves).
+pub fn exchange_materials(
+    state: &State,
+    materials: &HashMap<u32, Material>,
+    settings: Settings,
+    source: &str,
+) -> Exchange {
+    exchange_with(state, materials, settings, source, false)
+}
+
+fn exchange_with(
+    state: &State,
+    materials: &HashMap<u32, Material>,
+    settings: Settings,
+    source: &str,
+    with_polygons: bool,
+) -> Exchange {
     let Settings {
         force_factor,
         min_edge,
@@ -746,7 +767,11 @@ pub fn exchange(
     let plates: Vec<Plate> = (0..model.surfaces().len())
         .map(|s| {
             let surface = &model.surfaces()[s];
-            let (polygons, how) = surface_polygons(model, s, min_edge);
+            let (polygons, how) = if with_polygons {
+                surface_polygons(model, s, min_edge)
+            } else {
+                (vec![], Cut::No)
+            };
             match how {
                 Cut::No => {}
                 Cut::Pieces => cut_surfaces += 1,
@@ -887,6 +912,27 @@ pub fn exchange(
         missing_materials: missing.into_iter().collect(),
         cut_surfaces,
         triangulated_surfaces,
+        load_cases: vec![],
+        loads: vec![],
+        load_report: None,
+    }
+}
+
+/// An exchange without objects (materials are added by the caller).
+pub fn empty_exchange() -> Exchange {
+    Exchange {
+        format: "topo-plaxis-1",
+        source: String::new(),
+        stiffness: StiffnessMode::Effective,
+        warnings: vec![],
+        units: Units { length: "m", force_factor: TONNE_TO_KN, stress: "kN/m2", unit_weight: "kN/m3" },
+        plate_materials: vec![],
+        beam_materials: vec![],
+        plates: vec![],
+        beams: vec![],
+        missing_materials: vec![],
+        cut_surfaces: 0,
+        triangulated_surfaces: 0,
         load_cases: vec![],
         loads: vec![],
         load_report: None,

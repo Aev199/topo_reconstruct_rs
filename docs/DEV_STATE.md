@@ -481,11 +481,35 @@ UI: dialog table of cases (use / factor; self-weight and seismic cases off by
 default), mode «сочетание» / «по загружениям, исходные контуры». Not yet
 verified in a real PLAXIS.
 
-Next (user's plan, not started): MIDAS pipeline = every load except the
+## MIDAS export (2026-10-05)
+
+Format decision (user): MIDAS Civil `.mxt` as written by Lira_Midas-converter
+(that converter has no FPN output); gmsh embedded in the exe.
+Chain: `meshing::mesh_state` (Gmsh C API via libloading, `gmsh.rs`; shell
+elements per surface with shared boundary curves, bar pieces between
+anchors, vertices on an edge's inside split it, unused nodes dropped) →
+`loads::transfer` with `combination: None` and `cases` = chosen cases →
+`mesh_loads::transfer` (pressure by the exact area fraction of the contour in
+each element, bar lines on bar pieces, plate-edge lines to boundary nodes,
+point loads to the bar/nearest nodes) → `midas::write_mxt` (*NODE, *ELEMENT
+bars then plates, *MATERIAL, *SECTION VALUE with torsion J of the rectangle,
+*THICKNESS, *STLDCASE, *USE-STLD with *CONLOAD/*BEAMLOAD/*PRESSURE, names
+transliterated and made safe as in the converter). Service command
+`export_midas`, button «Экспорт в MIDAS…» (size, quads, cases table; self-weight,
+stages and dynamic cases off by default; construction stages are modelled as
+load cases in LIRA and are not transferred to PLAXIS or MIDAS).
+Checked on the fixtures: no duplicate nodes, resultants on the mesh match the
+geometry loads (≤ 1.2 %), скала2 → 14.3 k nodes, 25 k plates, 3 k bars,
+13 cases, 5.8 MB. Gmsh library: `TOPO_GMSH_LIB`, beside the exe, or embedded
+(`GMSH_DLL_PATH` at build time; the CI app job fetches the SDK's
+gmsh-4.15.dll, 89 MB, and embeds it; extracted to the temp folder on first
+use). Gmsh is GPL: the embedded build is for internal use or must be released
+under GPL-compatible terms. Not verified in MIDAS: beam local axes (beta
+angle 0 as in the converter), supports (not exported), quad ordering.
+
+Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:
-None` path of `transfer` gives that); then gmsh meshing; then transfer of the
-mesh with its loads to FPN as in the Lira_Midas-converter (to be read:
-`writers/midas_writer.py`, `docs/midas_format.md`).
+None` path of `transfer` gives that); (done: see above).
 
 ## Next coherent development batch
 

@@ -2,7 +2,9 @@
 pub mod audit;
 pub mod editor;
 pub mod gmsh;
+pub mod mesh_loads;
 pub mod meshing;
+pub mod midas;
 pub mod input;
 pub mod loads;
 pub mod parsers;

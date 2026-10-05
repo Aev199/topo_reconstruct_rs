@@ -102,6 +102,16 @@ jobs:
           npm ci
           npm run build
 
+      # Gmsh meshes the model for the MIDAS export: its DLL goes inside the
+      # executable (extracted to the temporary folder on first use).
+      - name: Fetch the Gmsh library
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://gmsh.info/bin/Windows/gmsh-4.15.2-Windows64-sdk.zip -OutFile gmsh-sdk.zip
+          Expand-Archive gmsh-sdk.zip -DestinationPath gmsh-sdk
+          $dll = Get-ChildItem gmsh-sdk -Recurse -Filter "gmsh-4*.dll" | Select-Object -First 1
+          "GMSH_DLL_PATH=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Build portable executable
         working-directory: app/src-tauri
         run: npx --prefix ../ui tauri build

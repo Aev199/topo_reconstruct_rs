@@ -112,6 +112,8 @@ function explain(message) {
     ['bar_invariant', 'Отклонено: правка нарушила бы стержень (узел вне оси, совпадающие узлы или пустой участок).'],
     ['node_beyond', 'Отклонено: узел вышел бы за соседний узел или конец стержня.'],
     ['input_changed', 'Файл модели ЛИРА изменился после открытия — откройте его заново, чтобы перенести нагрузки, или снимите галочку «перенести нагрузки».'],
+    ['gmsh_missing', 'Не найдена библиотека Gmsh: положите gmsh-4.x.dll рядом с программой или укажите путь в TOPO_GMSH_LIB.'],
+    ['meshing_failed', 'Gmsh не смог построить сетку — проверьте геометрию (аудит) и размер элемента.'],
     ['plaxis_loader_failed', 'Загрузчик PLAXIS завершился с ошибкой — проверьте, что PLAXIS Input открыт, сервер скриптов включён, порт и пароль верны.'],
     ['no Python with plxscripting', 'Не найден Python с plxscripting — укажите путь к python.exe из поставки PLAXIS.'],
     ['no_junction', 'Поверхности не пересекаются и не примыкают.'],
@@ -207,6 +209,7 @@ function renderSummary() {
   $('save-project').disabled = false;
   $('export-report').disabled = false;
   $('export-plaxis').disabled = false;
+  $('export-midas').disabled = false;
   $('undo').disabled = s.edits === 0;
   $('redo').disabled = !s.can_redo;
 }
@@ -654,6 +657,53 @@ $('export-plaxis').onclick = async () => {
     status(`PLAXIS: создано плит ${r.plates ?? '?'}, балок ${r.beams ?? '?'}, материалов ${r.plate_materials ?? '?'}+${r.beam_materials ?? '?'}${oriented} за ${r.seconds ?? '?'} с (${text}${loadsText})${loadWarnings(r)}`,
       r.rectangular_beams > r.oriented_beams || !!loadWarnings(r));
   }
+};
+
+/// The MIDAS export: mesh with Gmsh, loads per case, `.mxt` file.
+$('export-midas').onclick = async () => {
+  const a = state.summary?.audit;
+  if (a && !a.passed && !await question(`Аудит геометрии не пройден (ошибок ${a.failures}). Экспортировать всё равно?`)) return;
+  const body = $('mid-cases').tBodies[0];
+  body.replaceChildren();
+  try {
+    for (const c of (await call('load_cases')).cases) {
+      const row = body.insertRow();
+      row.dataset.case = c.case;
+      const off = c.self_weight || c.dynamic || c.stage;
+      row.innerHTML = `<td><input type="checkbox" class="use" ${off ? '' : 'checked'}></td><td>${c.case}</td><td></td><td>${c.rows}</td>`;
+      row.cells[2].textContent = c.name || '—';
+    }
+  } catch (e) {
+    status(explain(e.message || e), true);
+    return;
+  }
+  const dialog = $('midas-dialog');
+  dialog.returnValue = '';
+  dialog.showModal();
+  const choice = await new Promise((resolve) => dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true }));
+  if (choice !== 'run') return;
+  const path = await pickFile('mxt', true);
+  if (!path) return;
+  const result = await busy('Сетка gmsh, нагрузки, запись .mxt…', () => call('export_midas', {
+    path,
+    size: Number($('mid-size').value) || 0.5,
+    quads: $('mid-quads').checked,
+    force_factor: Number($('mid-factor').value) || 9.80665,
+    stiffness: $('mid-stiffness').value,
+    include_cases: [...body.rows].filter((r) => r.querySelector('.use').checked).map((r) => Number(r.dataset.case)),
+  }));
+  if (!result) return;
+  const r = result.report;
+  let worst = 0;
+  for (const c of result.cases) {
+    const base = Math.hypot(...c.geometry);
+    if (base > 1) worst = Math.max(worst, Math.hypot(...c.geometry.map((x, i) => x - c.mesh[i])) / base);
+  }
+  const skipped = Object.entries(result.skipped).map(([what, n]) => `${what}: ${n}`).join('; ');
+  status(`MIDAS: ${path} — узлов ${r.nodes}, стержней ${r.bars}, пластин ${r.plates} (треугольников ${result.triangles}, четырёхугольников ${result.quads}), `
+    + `загружений ${r.load_cases}, расхождение равнодействующих сетка/геометрия до ${(worst * 100).toFixed(1)}%`
+    + (skipped ? `, не перенесено — ${skipped}` : '') + (r.warnings.length ? `; ${r.warnings.join('; ')}` : ''),
+    r.warnings.length > 0);
 };
 
 $('undo').onclick = () => busy('Отмена…', async () => { await call('undo'); await refresh(); status('Правка отменена'); });

@@ -7,12 +7,13 @@ use topo_reconstruct_rs::pipeline::{self, Options, Profile};
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
     let input = std::path::PathBuf::from(args.next().ok_or("usage: mesh_probe MODEL.txt")?);
-    let (mut cache, mut size, mut quads) = (None, 0.5, false);
+    let (mut cache, mut size, mut quads, mut with_loads) = (None, 0.5, false, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--frame-cache" => cache = args.next().map(std::path::PathBuf::from),
             "--size" => size = args.next().and_then(|s| s.parse().ok()).unwrap_or(size),
             "--quads" => quads = true,
+            "--loads" => with_loads = true,
             _ => {}
         }
     }
@@ -27,6 +28,35 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "{} nodes, {} shells ({} triangles, {} quads), {} bar elements, {:?}",
         mesh.nodes.len(), mesh.shells.len(), tri, mesh.shells.len() - tri, mesh.bars.len(), started.elapsed()
     );
+    if with_loads {
+        let bytes = std::fs::read(&input)?;
+        let source = topo_reconstruct_rs::parsers::lira::LiraParser::mesh_from(&bytes)?;
+        let set = topo_reconstruct_rs::parsers::loads::parse(&bytes);
+        let selected: std::collections::BTreeSet<u32> = set
+            .cases
+            .iter()
+            .filter(|(_, n)| !topo_reconstruct_rs::loads::is_self_weight(n) && !topo_reconstruct_rs::loads::is_stage(n) && !topo_reconstruct_rs::loads::is_dynamic(n))
+            .map(|(c, _)| *c)
+            .collect();
+        let (loads, report) = topo_reconstruct_rs::loads::transfer(
+            session.state(),
+            &output.topology.vertex_source_nodes,
+            &source,
+            &set,
+            topo_reconstruct_rs::loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination: None, cases: Some(selected) },
+        );
+        let t = std::time::Instant::now();
+        let on_mesh = topo_reconstruct_rs::mesh_loads::transfer(&mesh, session.state(), &loads, 0.02);
+        let resultants = on_mesh.resultants(&mesh);
+        println!("loads on the mesh: {} pressures, {} bar loads, {} nodal, in {:?}", on_mesh.pressures.len(), on_mesh.bar_loads.len(), on_mesh.nodal.len(), t.elapsed());
+        for c in &report.cases {
+            let m = resultants.get(&c.case).copied().unwrap_or_default();
+            let e = glam::DVec3::from_array(c.exported);
+            let lost = on_mesh.lost.get(&c.case).copied().unwrap_or_default();
+            let flag = if (m - e).length() > 0.02 * e.length().max(1.) { "DIFF" } else { "ok" };
+            println!("  case {} {:?}: geometry {:.1?} mesh {:.1?} lost {:.1?} {flag}", c.case, c.name, e.to_array(), m.to_array(), lost);
+        }
+    }
     // Conformity: no two nodes in one place; every bar node is a shell node
     // or a bar-only node; free shell edges per surface.
     let mut grid = std::collections::HashMap::new();

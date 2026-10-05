@@ -142,6 +142,7 @@ impl Service {
                 self.export_plaxis(Path::new(&text("path")?), factor, stiffness, with_loads, combination, cases)
             }
             "load_cases" => self.load_cases(),
+            "export_midas" => self.export_midas(&args),
             "run_plaxis" => self.run_plaxis(&args),
             "export_report" => {
                 self.export_report(Path::new(&text("path")?))?;
@@ -475,6 +476,85 @@ impl Service {
         exchange.loads = loads;
         exchange.load_report = Some(report);
         Ok(())
+    }
+
+    /// Mesh the geometry with Gmsh, carry the loads of the chosen cases onto
+    /// the mesh and write a MIDAS Civil `.mxt` file.
+    fn export_midas(&self, args: &Value) -> Result<Value, String> {
+        let path = args.get("path").and_then(Value::as_str).ok_or("missing argument `path`")?;
+        let size = args.get("size").and_then(Value::as_f64).filter(|s| *s > 0.).unwrap_or(self.profile.element_size);
+        let quads = args.get("quads").and_then(Value::as_bool).unwrap_or(false);
+        let factor = args.get("force_factor").and_then(Value::as_f64).unwrap_or(crate::plaxis::TONNE_TO_KN);
+        let gmsh = crate::gmsh::Gmsh::load().map_err(|e| format!("gmsh_missing: {e}"))?;
+        let state = self.session()?.state();
+        let input = self.input.as_ref().ok_or("no model is open")?;
+        let materials = self.materials.as_ref().ok_or("no model is open")?;
+        let mesh = crate::meshing::mesh_state(&gmsh, state, size, quads).map_err(|e| format!("meshing_failed: {e}"))?;
+        // Cases: the chosen ones, else all but the self-weight, stages and dynamics.
+        let bytes = self.input_bytes()?;
+        let source = crate::parsers::lira::LiraParser::mesh_from(&bytes).map_err(|e| e.to_string())?;
+        let set = crate::parsers::loads::parse(&bytes);
+        let selected: std::collections::BTreeSet<u32> = match args.get("include_cases").and_then(Value::as_array) {
+            Some(a) => a.iter().filter_map(Value::as_u64).map(|c| c as u32).collect(),
+            None => set
+                .cases
+                .iter()
+                .filter(|(_, n)| !crate::loads::is_self_weight(n) && !crate::loads::is_stage(n) && !crate::loads::is_dynamic(n))
+                .map(|(c, _)| *c)
+                .collect(),
+        };
+        let output = self.output.as_ref().ok_or("no model is open")?;
+        let (loads, load_report) = crate::loads::transfer(
+            state,
+            &output.topology.vertex_source_nodes,
+            &source,
+            &set,
+            crate::loads::Settings {
+                force_factor: factor,
+                snap: self.profile.edge_collapse,
+                max_groups: 40,
+                combination: None,
+                cases: Some(selected.clone()),
+            },
+        );
+        let on_mesh = crate::mesh_loads::transfer(&mesh, state, &loads, 0.02);
+        let resultants = on_mesh.resultants(&mesh);
+        let exchange = crate::plaxis::exchange_materials(
+            state,
+            materials,
+            crate::plaxis::Settings {
+                force_factor: factor,
+                min_edge: self.profile.edge_collapse,
+                stiffness: match args.get("stiffness").and_then(Value::as_str) {
+                    Some("nominal") => crate::plaxis::StiffnessMode::Nominal,
+                    _ => crate::plaxis::StiffnessMode::Effective,
+                },
+            },
+            &input.display().to_string(),
+        );
+        let cases: Vec<(u32, String)> = set.cases.iter().filter(|(c, _)| selected.contains(c)).cloned().collect();
+        let (text, report) = crate::midas::write_mxt(&mesh, &on_mesh, &exchange, &cases);
+        std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))?;
+        let per_case: Vec<Value> = load_report
+            .cases
+            .iter()
+            .map(|c| {
+                let m = resultants.get(&c.case).copied().unwrap_or_default();
+                json!({"case": c.case, "name": c.name, "source": c.source, "geometry": c.exported, "mesh": m.to_array(),
+                       "lost": on_mesh.lost.get(&c.case)})
+            })
+            .collect();
+        Ok(json!({
+            "saved": path,
+            "gmsh": gmsh.path().display().to_string(),
+            "report": report,
+            "triangles": mesh.shells.iter().filter(|s| s.nodes.len() == 3).count(),
+            "quads": mesh.shells.iter().filter(|s| s.nodes.len() == 4).count(),
+            "cases": per_case,
+            "skipped": load_report.skipped,
+            "warnings": exchange.warnings,
+            "missing_materials": exchange.missing_materials,
+        }))
     }
 
     /// The source file's bytes, when it is still the file the geometry was

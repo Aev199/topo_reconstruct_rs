@@ -56,7 +56,7 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: v
 #busy[hidden] { display: none; }
 #busy .box { background: #fff; padding: 16px 22px; border-radius: 8px; box-shadow: 0 6px 24px rgba(0,0,0,.2); }
 
-#plaxis-dialog { border: 1px solid var(--line); border-radius: 8px; padding: 16px; max-width: 460px; }
+#plaxis-dialog, #midas-dialog { border: 1px solid var(--line); border-radius: 8px; padding: 16px; max-width: 460px; }
 #plaxis-dialog label { display: block; margin: 6px 0; }
 #plaxis-dialog input:not([type=checkbox]) { width: 100%; box-sizing: border-box; }
 #plaxis-dialog .row { display: flex; gap: 6px; justify-content: flex-end; margin-top: 12px; }
@@ -67,3 +67,11 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: v
 #plx-cases input[type=number] { width: 64px; }
 #plx-cases input[type=checkbox] { width: auto; }
 #plx-cases tr.self-weight td { color: var(--muted, #888); }
+
+#midas-dialog { border: 1px solid var(--line); border-radius: 8px; padding: 16px; max-width: 460px; max-height: 90vh; overflow: auto; }
+#midas-dialog label { display: block; margin: 6px 0; }
+#midas-dialog input:not([type=checkbox]) { width: 100%; box-sizing: border-box; }
+#midas-dialog .row { display: flex; gap: 6px; justify-content: flex-end; margin-top: 12px; }
+#mid-cases { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+#mid-cases th, #mid-cases td { border-bottom: 1px solid var(--line); padding: 2px 4px; text-align: left; }
+#mid-cases input[type=checkbox] { width: auto; }
