@@ -453,7 +453,7 @@ Lira_Midas-converter: the sign of forces is reversed (positive LIRA value acts
 against the axis; verified by the wind case names X±/Y± and gravity cases);
 rows of doc 6 without a case number belong to the previous case (one fixture
 has 1.5 M such rows). Per-case resultants of source and exported loads agree
-(1e-5 on скала1/2/3, up to 3 % on тест 5 and Для testa where clipping to the
+(1e-5 on скала1/2/3, up to 4 % on тест 5, тест 6, ЖК Остров where clipping to the
 contours loses small areas); loads on plate elements not in the geometry are
 reported separately. Skipped (static settlement task): thermal, dynamic,
 stage codes 8/88, prescribed displacements, plate moments, arbitrary

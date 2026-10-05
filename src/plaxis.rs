@@ -867,7 +867,7 @@ pub fn exchange(
     }
     warnings.push("LIRA rotation angles of bar sections are not read: the LIRA default local axes are assumed".into());
     warnings.push(
-        "loads, supports, releases, eccentricities, soils and stages are not exported".into(),
+        "supports, releases, eccentricities, soils and stages are not exported".into(),
     );
     Exchange {
         format: "topo-plaxis-1",
