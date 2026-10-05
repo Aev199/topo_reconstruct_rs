@@ -19,6 +19,15 @@ DATA = {
 }
 
 
+LOADS = dict(DATA, load_cases=[[1, "СВ"], [2, "СНЕГ"]], loads=[
+    {"kind": "point", "case": 1, "at": [2, 1, 0], "force": [0, 0, -10], "moment": [0, 0, 0]},
+    {"kind": "line", "case": 1, "start": [0, 0, 0], "end": [4, 0, 0], "q_start": [0, 0, -5], "q_end": [0, 0, -5]},
+    {"kind": "line", "case": 2, "start": [0, 0, 0], "end": [4, 0, 0], "q_start": [0, 0, -1], "q_end": [0, 0, -3]},
+    {"kind": "surface", "case": 2, "surface": 0, "sigma": [0, 0, -2],
+     "polygons": [[[4, 3, 0], [0, 0, 0], [4, 0, 0]], [[0, 0, 0], [1, 1, 0], [1, 0, 0]]]},
+])
+
+
 class LoaderTests(unittest.TestCase):
     def test_objects_and_materials(self):
         g = Recorder()
@@ -52,6 +61,47 @@ class LoaderTests(unittest.TestCase):
         r = build(g, DATA, progress=lambda _: None)
         self.assertEqual(r["property_sets"], ["beam set 1", "plate set 2"])
         self.assertEqual(len(r["rejected_property_sets"]), 3)
+
+    def test_loads_and_phases(self):
+        g = Recorder()
+        r = build(g, LOADS, progress=lambda _: None)
+        self.assertEqual(r["loads"]["created"], {"point": 1, "line": 2, "surface": 2})
+        self.assertIn("pointload (2.0 1.0 0.0)", g.commands)
+        self.assertIn("set PointLoad_1.Fz -10", g.commands)
+        # A uniform line load sets the start values only; a linear one the end values too.
+        self.assertIn("set LineLoad_1.qz_start -5", g.commands)
+        self.assertNotIn("set LineLoad_1.qz_end -5", g.commands)
+        self.assertIn("set LineLoad_2.qz_end -3", g.commands)
+        self.assertIn("set LineLoad_2.Distribution_z 'Linear'", g.commands)
+        # A load polygon equal to a plate polygon (any start, any direction) loads that polygon.
+        self.assertIn("surfload Polygon_1", g.commands)
+        self.assertIn("set SurfaceLoad_1.sigz -2", g.commands)
+        # The other polygon is given by its points.
+        self.assertIn("surfload (0.0 0.0 0.0) (1.0 1.0 0.0) (1.0 0.0 0.0)", g.commands)
+        self.assertEqual(r["loads"]["phases"], ["1 СВ", "2 СНЕГ"])
+        self.assertIn("gotostages", g.commands)
+        self.assertIn("activate Plate_1 Phase_1", g.commands)
+        self.assertIn("activate Beam_1 Phase_1", g.commands)
+        self.assertIn("activate PointLoad_1 Phase_2", g.commands)
+        self.assertIn("activate SurfaceLoad_1 Phase_3", g.commands)
+        self.assertIn("set Phase_2.Identification '1 СВ'", g.commands)
+
+    def test_loads_without_phases(self):
+        g = Recorder()
+        r = build(g, LOADS, progress=lambda _: None, phases=False)
+        self.assertEqual(r["loads"]["phases"], [])
+        self.assertNotIn("gotostages", g.commands)
+
+    def test_refused_loads_are_reported_not_fatal(self):
+        g = Recorder(reject_commands={"lineload"})
+        r = build(g, LOADS, progress=lambda _: None)
+        self.assertEqual(r["loads"]["created"], {"point": 1, "line": 0, "surface": 2})
+        self.assertEqual(r["loads"]["refused"], {"line": 2})
+        self.assertTrue(any("refused 2 line loads" in w for w in r["warnings"]))
+        g = Recorder(reject_commands={"phase"})
+        r = build(g, LOADS, progress=lambda _: None)
+        self.assertEqual(r["loads"]["phases"], [])
+        self.assertTrue(any("phases were not created" in w for w in r["warnings"]))
 
     def test_refused_orientation_is_reported(self):
         g = Recorder(reject={"AxisFunction"})

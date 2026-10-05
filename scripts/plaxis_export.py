@@ -22,6 +22,13 @@ worked is reported. Materials are assigned with `setmaterial`, as PLAXIS
 logs it. A beam's local axis 2 (PLAXIS: section height direction) is set to
 the LIRA Z1 axis for rectangular sections. On an error every object created
 by this run is deleted again, so a retry does not duplicate them.
+
+Loads (kN, m): when the exchange file has them, every point, line and surface
+load is created (`pointload`, `lineload`, `surfload`: Fx..Mz, qx/qy/qz_start/
+_end, sigx/sigy/sigz) and, in Staged construction, a base phase activates the
+whole structure and one phase per LIRA load case (named after it) activates
+that case's loads. A load PLAXIS refuses is counted and reported, not fatal.
+`--no-phases` creates the loads without phases.
 """
 import argparse
 import json
@@ -106,7 +113,7 @@ def orient(line, axis2):
         return False
 
 
-def build(g_i, data, shift=(0.0, 0.0, 0.0), progress=print):
+def build(g_i, data, shift=(0.0, 0.0, 0.0), progress=print, phases=True):
     """Create materials, plates and beams; returns a report. On an error the
     objects created so far are deleted and the error is raised again."""
     def point(p):
@@ -119,7 +126,7 @@ def build(g_i, data, shift=(0.0, 0.0, 0.0), progress=print):
         return obj
 
     try:
-        return _build(g_i, data, point, keep, progress)
+        return _build(g_i, data, point, keep, progress, phases)
     except Exception:
         for obj in reversed(created):
             try:
@@ -129,7 +136,7 @@ def build(g_i, data, shift=(0.0, 0.0, 0.0), progress=print):
         raise
 
 
-def _build(g_i, data, point, keep, progress):
+def _build(g_i, data, point, keep, progress, phases):
     g_i.gotostructures()
     log = []
     plate_mats, beam_mats, used = {}, {}, set()
@@ -146,13 +153,18 @@ def _build(g_i, data, point, keep, progress):
             rectangular.add(m["name"])
     plates = beams = oriented = 0
     orientation_refused = False
+    structure = []      # plates and beams, activated in the base phase
+    polygons = {}       # outline of a plate polygon -> its surface
     started = time.time()
     total = sum(len(p["polygons"]) for p in data["plates"]) + len(data["beams"])
     done = 0
     for p in data["plates"]:
         for polygon in p["polygons"]:
-            surface = keep(last(g_i.surface(*[point(x) for x in polygon])))
+            points = [point(x) for x in polygon]
+            surface = keep(last(g_i.surface(*points)))
+            polygons[outline(points)] = surface
             plate = last(g_i.plate(surface))
+            structure.append(plate)
             if p["material"]:
                 assign(g_i, plate, plate_mats[p["material"]])
             plates += 1
@@ -162,6 +174,7 @@ def _build(g_i, data, point, keep, progress):
     for b in data["beams"]:
         line = keep(last(g_i.line(point(b["start"]), point(b["end"]))))
         beam = last(g_i.beam(line))
+        structure.append(beam)
         if b["material"]:
             assign(g_i, beam, beam_mats[b["material"]])
             if b["material"] in rectangular and not orientation_refused:
@@ -178,18 +191,127 @@ def _build(g_i, data, point, keep, progress):
     if orientation_refused:
         warnings.append(f"PLAXIS refused the line local axis (AxisFunction/Axis2): {rect_beams - oriented} "
                         "rectangular beams keep the automatic axes - check their orientation")
-    return dict(plates=plates, beams=beams, plate_materials=len(plate_mats),
+    load_report = create_loads(g_i, data, point, keep, progress, phases, structure, polygons, warnings)
+    return dict(plates=plates, beams=beams, plate_materials=len(plate_mats), loads=load_report,
                 beam_materials=len(beam_mats), property_sets=sorted(used),
                 rejected_property_sets=log, oriented_beams=oriented, rectangular_beams=rect_beams,
                 seconds=round(time.time() - started, 1),
                 missing_materials=data.get("missing_materials", []), warnings=warnings)
 
 
+def outline(points):
+    """A polygon outline independent of where it starts and of its direction."""
+    keyed = [tuple(round(c, 6) for c in p) for p in points]
+    return frozenset(keyed)
+
+
+def create_loads(g_i, data, point, keep, progress, phases, structure, polygons, warnings):
+    """Loads of the exchange file, and the phases that activate them. Every
+    failure is counted and reported (`warnings`), none stops the export."""
+    loads = data.get("loads") or []
+    if not loads:
+        return None
+    made = {"point": 0, "line": 0, "surface": 0}
+    refused = {}
+    first_error = {}
+    by_case = {}
+
+    def refuse(kind, error):
+        refused[kind] = refused.get(kind, 0) + 1
+        first_error.setdefault(kind, f"{type(error).__name__}: {error}")
+
+    def configure(obj, values):
+        for name, value in values:
+            setattr(obj, name, value)
+
+    started = time.time()
+    for n, load in enumerate(loads):
+        kind = load["kind"]
+        try:
+            if kind == "point":
+                obj = last(g_i.pointload(point(load["at"])))
+                f, m = load["force"], load["moment"]
+                configure(obj, [("Fx", f[0]), ("Fy", f[1]), ("Fz", f[2]), ("Mx", m[0]), ("My", m[1]), ("Mz", m[2])])
+            elif kind == "line":
+                obj = last(g_i.lineload(point(load["start"]), point(load["end"])))
+                a, b = load["q_start"], load["q_end"]
+                values = [("Distribution_x", "Linear"), ("Distribution_y", "Linear"), ("Distribution_z", "Linear")]
+                configure(obj, [v for v in values if a != b])
+                configure(obj, [("qx_start", a[0]), ("qy_start", a[1]), ("qz_start", a[2])])
+                if a != b:
+                    configure(obj, [("qx_end", b[0]), ("qy_end", b[1]), ("qz_end", b[2])])
+            elif kind == "surface":
+                for polygon in load["polygons"]:
+                    points = [point(x) for x in polygon]
+                    existing = polygons.get(outline(points))
+                    try:
+                        obj = last(g_i.surfload(*([existing] if existing is not None else points)))
+                    except Exception:
+                        if existing is not None:
+                            raise
+                        obj = last(g_i.surfload(keep(last(g_i.surface(*points)))))
+                    s = load["sigma"]
+                    configure(obj, [("sigx", s[0]), ("sigy", s[1]), ("sigz", s[2])])
+                    keep(obj)
+                    by_case.setdefault(load["case"], []).append(obj)
+                    made["surface"] += 1
+                continue
+            else:
+                continue
+            keep(obj)
+            by_case.setdefault(load["case"], []).append(obj)
+            made[kind] += 1
+        except Exception as error:   # a command or property this PLAXIS version does not know
+            refuse(kind, error)
+            if sum(refused.values()) >= 20 and not sum(made.values()):
+                break                # nothing works: do not try every load
+        if n % 200 == 199:
+            progress(f"loads {n + 1}/{len(loads)}, {time.time() - started:.0f} s")
+    for kind, count in refused.items():
+        warnings.append(f"PLAXIS refused {count} {kind} loads (first error: {first_error[kind]})")
+    report = dict(created=made, refused=refused, phases=[])
+    if phases and sum(made.values()):
+        try:
+            report["phases"] = create_phases(g_i, data, by_case, structure, progress)
+        except Exception as error:
+            warnings.append(f"phases were not created ({type(error).__name__}: {error}); "
+                            "the loads exist but are not activated in any phase")
+    return report
+
+
+def create_phases(g_i, data, by_case, structure, progress):
+    """Staged construction: a base phase with the structure, a phase per load
+    case derived from it with that case's loads."""
+    g_i.gotostages()
+    base = last(g_i.phase(g_i.InitialPhase))
+    try:
+        base.Identification = "Structure"
+    except Exception:
+        pass
+    for obj in structure:
+        g_i.activate(obj, base)
+    names = {c[0]: c[1] for c in data.get("load_cases", [])}
+    created = []
+    for case in sorted(by_case):
+        phase = last(g_i.phase(base))
+        label = f"{case} {names.get(case, '')}".strip()
+        try:
+            phase.Identification = label
+        except Exception:
+            pass
+        for obj in by_case[case]:
+            g_i.activate(obj, phase)
+        created.append(label)
+        progress(f"phase {label}: {len(by_case[case])} loads")
+    return created
+
+
 class Recorder:
     """A stand-in for PLAXIS Input (`--dry-run`, tests): records every
     command as PLAXIS logs it and returns named objects."""
 
-    def __init__(self, reject=(), fail_on=None):
+    def __init__(self, reject=(), fail_on=None, reject_commands=()):
+        self.reject_commands = set(reject_commands)
         self.commands = []
         self.counts = {}
         self.reject = set(reject)
@@ -209,14 +331,20 @@ class Recorder:
         self.commands.append(" ".join([name] + [text(a) for a in args]))
 
     def __getattr__(self, name):
-        kinds = {"platemat": "PlateMat", "beammat": "BeamMat", "plate": "Plate", "beam": "Beam"}
+        kinds = {"platemat": "PlateMat", "beammat": "BeamMat", "plate": "Plate", "beam": "Beam",
+                 "pointload": "PointLoad", "lineload": "LineLoad", "surfload": "SurfaceLoad",
+                 "phase": "Phase"}
+
+        if name == "InitialPhase":
+            return self._object("InitialPhase")
 
         def command(*args):
-            if name == self.fail_on:
+            if name == self.fail_on or name in self.reject_commands:
                 raise RuntimeError(f"{name} failed")
             self._log(name, args)
             if name == "surface":
                 return self._object("Polygon")
+
             if name == "line":
                 return [self._object("Point"), self._object("Point"), self._object("Line")]
             if name in kinds:
@@ -255,6 +383,8 @@ def main():
     parser.add_argument("--new", action="store_true", help="start a new PLAXIS project first")
     parser.add_argument("--shift-to-origin", action="store_true",
                         help="move the model so that its lower corner is at (0, 0, top)")
+    parser.add_argument("--no-phases", action="store_true",
+                        help="create the loads but no Staged construction phases")
     parser.add_argument("--dry-run", action="store_true", help="print the commands instead")
     args = parser.parse_args()
     with open(args.exchange, encoding="utf-8") as f:
@@ -269,7 +399,7 @@ def main():
             shift = (min(p[0] for p in points), min(p[1] for p in points), 0.0)
     if args.dry_run:
         g_i = Recorder()
-        report = build(g_i, data, shift)
+        report = build(g_i, data, shift, phases=not args.no_phases)
         print("\n".join(g_i.commands))
     else:
         try:
@@ -280,7 +410,8 @@ def main():
         s_i, g_i = new_server(args.host, args.port, password=args.password)
         if args.new:
             s_i.new()
-        report = build(g_i, data, shift, progress=lambda text: print(text, flush=True))
+        report = build(g_i, data, shift, progress=lambda text: print(text, flush=True),
+                       phases=not args.no_phases)
     report["shift"] = shift
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

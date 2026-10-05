@@ -151,6 +151,10 @@ pub struct Exchange {
     /// Holed surfaces whose cutting failed the area check, exported as
     /// triangles instead.
     pub triangulated_surfaces: usize,
+    /// Load case numbers and names.
+    pub load_cases: Vec<(u32, String)>,
+    pub loads: Vec<crate::loads::Load>,
+    pub load_report: Option<crate::loads::Report>,
 }
 
 fn signed_area(points: &[[f64; 2]]) -> f64 {
@@ -619,6 +623,52 @@ fn cut_holes(contours: &[Vec<[f64; 2]>], min_edge: f64) -> Vec<Vec<[f64; 2]>> {
     out
 }
 
+/// How a surface became polygons.
+pub enum Cut {
+    /// One polygon, the contour.
+    No,
+    /// Cut into hole-free pieces.
+    Pieces,
+    /// Triangles (the cutting failed its area check).
+    Triangles,
+}
+
+/// The hole-free planar polygons of surface `s`, as PLAXIS takes them.
+pub fn surface_polygons(
+    model: &crate::reconstruction::Model,
+    s: usize,
+    min_edge: f64,
+) -> (Vec<Vec<[f64; 3]>>, Cut) {
+    let surface = &model.surfaces()[s];
+    let plane = &model.planes()[surface.plane];
+    if surface.boundaries.len() == 1 {
+        // Exact vertex positions of the contour.
+        let ring = surface.boundaries[0]
+            .iter()
+            .map(|u| model.vertices()[model.edges()[u.edge][usize::from(u.reversed)]])
+            .collect();
+        return (vec![plaxis_polygon(ring)], Cut::No);
+    }
+    let mut pieces = hole_free(&surface.contours, min_edge);
+    let area = signed_area(&surface.contours[0]).abs()
+        - surface.contours[1..]
+            .iter()
+            .map(|h| signed_area(h).abs())
+            .sum::<f64>();
+    let covered: f64 = pieces.iter().map(|p| signed_area(p)).sum();
+    let mut how = Cut::Pieces;
+    if (covered - area).abs() > 1e-6 * area {
+        // Never export wrong material: triangles always fit.
+        how = Cut::Triangles;
+        pieces = triangles(&surface.contours);
+    }
+    let polygons = pieces
+        .into_iter()
+        .map(|piece| plaxis_polygon(piece.into_iter().map(|uv| plane.lift(uv)).collect()))
+        .collect();
+    (polygons, how)
+}
+
 /// The exchange file of the current geometry; cuts of holed surfaces make
 /// no edge shorter than `min_edge` where they can avoid it.
 pub fn exchange(
@@ -696,33 +746,15 @@ pub fn exchange(
     let plates: Vec<Plate> = (0..model.surfaces().len())
         .map(|s| {
             let surface = &model.surfaces()[s];
-            let plane = &model.planes()[surface.plane];
-            let polygons: Vec<Vec<[f64; 3]>> = if surface.boundaries.len() == 1 {
-                // Exact vertex positions of the contour.
-                vec![surface.boundaries[0]
-                    .iter()
-                    .map(|u| model.vertices()[model.edges()[u.edge][usize::from(u.reversed)]])
-                    .collect()]
-            } else {
-                cut_surfaces += 1;
-                let mut pieces = hole_free(&surface.contours, min_edge);
-                let area = signed_area(&surface.contours[0]).abs()
-                    - surface.contours[1..]
-                        .iter()
-                        .map(|h| signed_area(h).abs())
-                        .sum::<f64>();
-                let covered: f64 = pieces.iter().map(|p| signed_area(p)).sum();
-                if (covered - area).abs() > 1e-6 * area {
-                    // Never export wrong material: triangles always fit.
+            let (polygons, how) = surface_polygons(model, s, min_edge);
+            match how {
+                Cut::No => {}
+                Cut::Pieces => cut_surfaces += 1,
+                Cut::Triangles => {
+                    cut_surfaces += 1;
                     triangulated_surfaces += 1;
-                    pieces = triangles(&surface.contours);
                 }
-                pieces
-                    .into_iter()
-                    .map(|piece| piece.into_iter().map(|uv| plane.lift(uv)).collect())
-                    .collect()
-            };
-            let polygons = polygons.into_iter().map(plaxis_polygon).collect();
+            }
             let stiffness = state.stiffness[s];
             let area = signed_area(&surface.contours[0]).abs()
                 - surface.contours[1..]
@@ -855,6 +887,9 @@ pub fn exchange(
         missing_materials: missing.into_iter().collect(),
         cut_surfaces,
         triangulated_surfaces,
+        load_cases: vec![],
+        loads: vec![],
+        load_report: None,
     }
 }
 

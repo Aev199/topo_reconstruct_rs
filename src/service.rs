@@ -133,7 +133,8 @@ impl Service {
                     Some("nominal") => crate::plaxis::StiffnessMode::Nominal,
                     _ => crate::plaxis::StiffnessMode::Effective,
                 };
-                self.export_plaxis(Path::new(&text("path")?), factor, stiffness)
+                let with_loads = args.get("loads").and_then(Value::as_bool).unwrap_or(true);
+                self.export_plaxis(Path::new(&text("path")?), factor, stiffness, with_loads)
             }
             "run_plaxis" => self.run_plaxis(&args),
             "export_report" => {
@@ -383,6 +384,7 @@ impl Service {
         path: &Path,
         force_factor: f64,
         stiffness: crate::plaxis::StiffnessMode,
+        with_loads: bool,
     ) -> Result<Value, String> {
         let input = self.input.as_ref().ok_or("no model is open")?;
         let session = self.session()?;
@@ -399,6 +401,10 @@ impl Service {
             },
             &input.display().to_string(),
         );
+        let mut exchange = exchange;
+        if with_loads {
+            self.add_loads(&mut exchange, force_factor)?;
+        }
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         serde_json::to_writer(std::io::BufWriter::new(file), &exchange)
             .map_err(|e| e.to_string())?;
@@ -417,11 +423,45 @@ impl Service {
             "missing_materials": exchange.missing_materials,
             "audit_passed": session.audit().passed,
             "warnings": exchange.warnings,
+            "loads": exchange.loads.len(),
+            "load_cases": exchange.load_report.as_ref().map(|r| r.cases.len()).unwrap_or(0),
+            "load_report": exchange.load_report,
             "material_notes": exchange.plate_materials.iter().map(|m| (m.name.clone(), m.notes.clone()))
                 .chain(exchange.beam_materials.iter().map(|m| (m.name.clone(), m.notes.clone())))
                 .filter(|(_, n)| !n.is_empty())
                 .collect::<Vec<_>>(),
         }))
+    }
+
+    /// The loads of the opened input, mapped onto the current geometry. The
+    /// file must still be the one the geometry was reconstructed from.
+    fn add_loads(&self, exchange: &mut crate::plaxis::Exchange, force_factor: f64) -> Result<(), String> {
+        let input = self.input.as_ref().ok_or("no model is open")?;
+        let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
+        if Some(content_hash(&bytes)) != self.input_hash {
+            return Err(format!(
+                "input_changed: {} changed after it was opened; open it again to export loads",
+                input.display()
+            ));
+        }
+        let mesh = crate::parsers::lira::LiraParser::mesh_from(&bytes).map_err(|e| e.to_string())?;
+        let set = crate::parsers::loads::parse(&bytes);
+        let output = self.output.as_ref().ok_or("no model is open")?;
+        let (loads, report) = crate::loads::transfer(
+            self.session()?.state(),
+            &output.topology.vertex_source_nodes,
+            &mesh,
+            &set,
+            crate::loads::Settings {
+                force_factor,
+                snap: self.profile.edge_collapse,
+                max_groups: 40,
+            },
+        );
+        exchange.load_cases = set.cases.clone();
+        exchange.loads = loads;
+        exchange.load_report = Some(report);
+        Ok(())
     }
 
     /// Run the loader with a Python that has plxscripting (the PLAXIS

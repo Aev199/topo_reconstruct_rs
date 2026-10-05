@@ -133,6 +133,11 @@ impl LiraParser {
         Self::parse_bytes(&mmap)
     }
 
+    /// The mesh of input bytes already read (the opened snapshot).
+    pub fn mesh_from(content: &[u8]) -> io::Result<MeshData> {
+        Self::parse_bytes(content)
+    }
+
     fn parse_bytes(content: &[u8]) -> io::Result<MeshData> {
         let nodes = Self::extract_block(content, b"4").ok_or_else(|| {
             Error::new(
@@ -328,7 +333,7 @@ impl LiraParser {
     }
 
     /// Быстрый поиск содержимого блока `( <id>/ ... )` без аллокаций строк
-    fn extract_block<'a>(content: &'a [u8], block_id: &[u8]) -> Option<&'a [u8]> {
+    pub(crate) fn extract_block<'a>(content: &'a [u8], block_id: &[u8]) -> Option<&'a [u8]> {
         let mut i = 0;
         let len = content.len();
 
@@ -383,14 +388,14 @@ impl LiraParser {
     }
 
     /// Проверка, пустой ли слайс байт
-    fn is_empty_or_ws(slice: &[u8]) -> bool {
+    pub(crate) fn is_empty_or_ws(slice: &[u8]) -> bool {
         slice
             .iter()
             .all(|&b| b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
     }
 
     /// Итератор по непустым словам (whitespace-separated bytes)
-    fn split_ascii_whitespace_bytes(slice: &[u8]) -> impl Iterator<Item = &[u8]> {
+    pub(crate) fn split_ascii_whitespace_bytes(slice: &[u8]) -> impl Iterator<Item = &[u8]> {
         let mut i = 0;
         let len = slice.len();
 
