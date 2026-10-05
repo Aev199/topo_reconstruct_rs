@@ -49,6 +49,7 @@ const OP = {
   connect_bars: 'Общий узел стержней',
   connect_bar_to_surfaces: 'Узлы стержня с поверхностями',
   connect_surfaces: 'Общее ребро поверхностей',
+  cut_above: 'Обрезка верхних этажей',
 };
 /// Search radius of "connect" edits: the gap closure of the profile.
 const CONNECT_TOLERANCE = 0.05;
@@ -67,6 +68,7 @@ function outcome(text) {
     [/^(\d+) bars deleted$/, (m) => `удалено стержней: ${m[1]}`],
     [/^bars share vertex (\d+), moved ([0-9.]+)$/, (m) => `общий узел ${m[1]}, конец сдвинут на ${m[2]} м`],
     [/^shared node (\d+), moved ([0-9.]+)$/, (m) => `общий узел ${m[1]}, сдвиг ${m[2]} м`],
+    [/^cut at (-?[0-9.]+): (\d+) surfaces removed, (\d+) clipped, (\d+) bars removed, (\d+) trimmed$/, (m) => `обрезано на отметке ${m[1]} м: поверхностей удалено ${m[2]}, разрезано ${m[3]}, стержней удалено ${m[4]}, укорочено ${m[5]}`],
     [/^bars share vertex (\d+)$/, (m) => `общий узел ${m[1]}`],
     [/^bar shares (\d+) node\(s\) with surfaces$/, (m) => `узлов с поверхностями: ${m[1]}`],
     [/^connected, junction ([0-9.]+)$/, (m) => `общее ребро ${m[1]} м`],
@@ -114,6 +116,8 @@ function explain(message) {
     ['input_changed', 'Файл модели ЛИРА изменился после открытия — откройте его заново, чтобы перенести нагрузки, или снимите галочку «перенести нагрузки».'],
     ['gmsh_missing', 'Не найдена библиотека Gmsh: положите gmsh-4.x.dll рядом с программой или укажите путь в TOPO_GMSH_LIB.'],
     ['meshing_failed', 'Gmsh не смог построить сетку — проверьте геометрию (аудит) и размер элемента.'],
+    ['cut_nothing_above', 'Выше выбранного уровня ничего нет.'],
+    ['cut_near_vertex', 'Ребро или стержень пересекает уровень вплотную к своему концу — выберите уровень этажа.'],
     ['plaxis_loader_failed', 'Загрузчик PLAXIS завершился с ошибкой — проверьте, что PLAXIS Input открыт, сервер скриптов включён, порт и пароль верны.'],
     ['no Python with plxscripting', 'Не найден Python с plxscripting — укажите путь к python.exe из поставки PLAXIS.'],
     ['no_junction', 'Поверхности не пересекаются и не примыкают.'],
@@ -210,6 +214,7 @@ function renderSummary() {
   $('export-report').disabled = false;
   $('export-plaxis').disabled = false;
   $('export-midas').disabled = false;
+  $('floors').disabled = false;
   $('undo').disabled = s.edits === 0;
   $('redo').disabled = !s.can_redo;
 }
@@ -619,6 +624,7 @@ $('export-plaxis').onclick = async () => {
   loadPlaxisSettings();
   await fillLoadCases();
   const dialog = $('plaxis-dialog');
+  showCutOptions(dialog);
   dialog.returnValue = '';
   dialog.showModal();
   const choice = await new Promise((resolve) => dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true }));
@@ -628,6 +634,7 @@ $('export-plaxis').onclick = async () => {
   if (!path) return;
   const exported = await busy('Подготовка файла обмена PLAXIS…', () => call('export_plaxis', {
     path, force_factor: Number($('plx-factor').value) || 9.80665, stiffness: $('plx-stiffness').value,
+    cut: chosenCut($('plaxis-dialog')),
     loads: $('plx-loads').checked,
     combination: $('plx-loads').checked ? chosenCombination() : null,
     include_cases: $('plx-loads').checked && $('plx-mode').value === 'cases' ? chosenCases() : null,
@@ -659,6 +666,54 @@ $('export-plaxis').onclick = async () => {
   }
 };
 
+/// Options of the storeys that were cut off in an export dialog (shown when a cut exists).
+function showCutOptions(dialog) {
+  const block = dialog.querySelector('.cut-options');
+  const cut = state.summary?.cut;
+  block.hidden = !cut;
+  if (cut) block.querySelector('.cut-z').textContent = Number(cut.z).toFixed(2);
+}
+function chosenCut(dialog) {
+  const block = dialog.querySelector('.cut-options');
+  if (block.hidden) return null;
+  return {
+    loads: block.querySelector('.cut-loads').checked,
+    cap: block.querySelector('.cut-cap').checked,
+    factor: Number(block.querySelector('.cut-factor').value) || 0,
+  };
+}
+
+/// Floors of the geometry and the cut off of the upper storeys.
+$('floors').onclick = async () => {
+  let info;
+  try {
+    info = await call('floors');
+  } catch (e) {
+    status(explain(e.message || e), true);
+    return;
+  }
+  const body = $('floors-table').tBodies[0];
+  body.replaceChildren();
+  const major = info.floors.filter((f) => f.major);
+  const top = major.length ? major[major.length - 1].z : 0;
+  major.forEach((f, i) => {
+    const row = body.insertRow();
+    row.innerHTML = `<td><input type="radio" name="floor" value="${f.z}" ${i === Math.max(0, major.length - 2) ? 'checked' : ''}></td>`
+      + `<td>${f.z.toFixed(2)}</td><td>${f.slabs}</td><td>${f.area.toFixed(0)}</td><td>${(top - f.z).toFixed(1)}</td>`;
+  });
+  $('floors-note').textContent = info.cut
+    ? `Сейчас модель обрезана на отметке ${info.cut.z.toFixed(2)} м (отменить: «Отменить»). Мелкие площадки (лестницы, приямки) в список не входят.`
+    : `Этажей: ${major.length}. Мелкие площадки (лестницы, приямки) в список не входят.`;
+  const dialog = $('floors-dialog');
+  dialog.returnValue = '';
+  dialog.showModal();
+  const choice = await new Promise((resolve) => dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true }));
+  if (choice !== 'cut') return;
+  const picked = body.querySelector('input[name=floor]:checked');
+  if (!picked) return;
+  await edit({ op: 'cut_above', z: Number(picked.value) }, 'обрезка верхних этажей');
+};
+
 /// The MIDAS export: mesh with Gmsh, loads per case, `.mxt` file.
 $('export-midas').onclick = async () => {
   const a = state.summary?.audit;
@@ -678,6 +733,7 @@ $('export-midas').onclick = async () => {
     return;
   }
   const dialog = $('midas-dialog');
+  showCutOptions(dialog);
   dialog.returnValue = '';
   dialog.showModal();
   const choice = await new Promise((resolve) => dialog.addEventListener('close', () => resolve(dialog.returnValue), { once: true }));
@@ -691,6 +747,7 @@ $('export-midas').onclick = async () => {
     force_factor: Number($('mid-factor').value) || 9.80665,
     stiffness: $('mid-stiffness').value,
     include_cases: [...body.rows].filter((r) => r.querySelector('.use').checked).map((r) => Number(r.dataset.case)),
+    cut: chosenCut($('midas-dialog')),
   }));
   if (!result) return;
   const r = result.report;

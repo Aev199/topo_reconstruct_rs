@@ -110,6 +110,10 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
         }
         edges_on_boundary.extend(count.into_iter().filter(|(_, n)| *n == 1).map(|((a, b), _)| [a, b]));
     }
+    let shell_nodes: Vec<usize> = {
+        let set: std::collections::BTreeSet<usize> = mesh.shells.iter().flat_map(|s| s.nodes.iter().copied()).collect();
+        set.into_iter().collect()
+    };
     for load in loads {
         match load {
             Load::Surface { case, surface, polygons, sigma } => {
@@ -186,6 +190,17 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                     for &n in e {
                         let (d, t) = segment_distance(point(mesh, n), a, b);
                         if d <= tolerance && !chain.iter().any(|x| x.1 == n) {
+                            chain.push((t, n));
+                        }
+                    }
+                }
+                if chain.len() < 2 {
+                    // Not a free edge (a wall standing on a slab, the cut level of a tower):
+                    // the shell nodes along the line.
+                    chain.clear();
+                    for &n in &shell_nodes {
+                        let (d, t) = segment_distance(point(mesh, n), a, b);
+                        if d <= tolerance {
                             chain.push((t, n));
                         }
                     }

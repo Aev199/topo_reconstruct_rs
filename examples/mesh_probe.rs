@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             &output.topology.vertex_source_nodes,
             &source,
             &set,
-            topo_reconstruct_rs::loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination: None, cases: Some(selected) },
+            topo_reconstruct_rs::loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination: None, cases: Some(selected), materials: None, cut_loads: true },
         );
         let t = std::time::Instant::now();
         let on_mesh = topo_reconstruct_rs::mesh_loads::transfer(&mesh, session.state(), &loads, 0.02);

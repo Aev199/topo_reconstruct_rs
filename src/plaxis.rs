@@ -1071,6 +1071,7 @@ mod tests {
             removed: vec![],
             removed_bars: vec![],
             joints: Default::default(),
+            cut: None,
         };
         let mut materials = HashMap::new();
         // 0.5 x 0.8 m with EIy 0.6 and EIz 0.6 of nominal (skala type 1).

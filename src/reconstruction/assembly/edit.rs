@@ -48,6 +48,8 @@ pub struct State {
     pub removed_bars: Vec<RemovedBar>,
     /// Gaps marked as joints: (vertex, surface) kept open on purpose.
     pub joints: BTreeSet<(usize, usize)>,
+    /// Set when the upper storeys were cut off (`cutoff`).
+    pub cut: Option<super::cutoff::Cut>,
 }
 
 impl State {
@@ -61,6 +63,7 @@ impl State {
             removed: vec![],
             removed_bars: vec![],
             joints: BTreeSet::new(),
+            cut: None,
         }
     }
 
@@ -76,6 +79,14 @@ impl State {
 
     /// Surfaces renumbered after a removal: per-surface data, contacts,
     /// joints and earlier `into` references follow.
+    pub(super) fn renumber_after_cut(&mut self, index: &[Option<usize>]) {
+        self.renumber(index);
+    }
+
+    pub(super) fn refresh_after_cut(&mut self) {
+        self.refresh();
+    }
+
     fn renumber(&mut self, index: &[Option<usize>]) {
         let kept = |s: &usize| index[*s].is_some();
         self.stiffness = (0..index.len())
@@ -837,6 +848,7 @@ mod tests {
             removed: vec![],
             removed_bars: vec![],
             joints: BTreeSet::new(),
+            cut: None,
         }
     }
 

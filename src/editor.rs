@@ -66,6 +66,11 @@ pub enum Edit {
         a: usize,
         b: usize,
     },
+    /// Everything above elevation `z` is cut off (upper storeys); what it
+    /// rested on is kept for the export of its loads and stiffness.
+    CutAbove {
+        z: f64,
+    },
 }
 
 /// What an edit was made on, checked again when the journal is replayed
@@ -210,6 +215,7 @@ impl Session {
                     .surfaces
                     .extend([surface(keep), surface(other)].into_iter().flatten())
             }
+            Edit::CutAbove { .. } => {}
             Edit::SplitEdge { edge, .. } => {
                 if let Some(e) = state.model.edges().get(edge) {
                     check.edge = e.iter().filter_map(|&v| vertex(v)).collect();
@@ -262,6 +268,7 @@ impl Session {
             Edit::ConnectBars { a, b, tolerance } => state.connect_bars(a, b, tolerance),
             Edit::ConnectBarToSurfaces { bar } => state.connect_bar_to_surfaces(bar),
             Edit::ConnectSurfaces { a, b } => state.connect_surfaces(a, b),
+            Edit::CutAbove { z } => state.cut_above(z),
         }
     }
 
@@ -469,6 +476,7 @@ mod tests {
             removed: vec![],
             removed_bars: vec![],
             joints: Default::default(),
+            cut: None,
         }
     }
 

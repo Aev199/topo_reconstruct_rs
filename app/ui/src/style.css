@@ -75,3 +75,10 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: v
 #mid-cases { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 12px; }
 #mid-cases th, #mid-cases td { border-bottom: 1px solid var(--line); padding: 2px 4px; text-align: left; }
 #mid-cases input[type=checkbox] { width: auto; }
+
+#floors-dialog { border: 1px solid var(--line); border-radius: 8px; padding: 16px; max-width: 520px; max-height: 90vh; overflow: auto; }
+#floors-dialog .row { display: flex; gap: 6px; justify-content: flex-end; margin-top: 12px; }
+#floors-table { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+#floors-table th, #floors-table td { border-bottom: 1px solid var(--line); padding: 2px 4px; text-align: left; }
+.cut-options { border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; margin: 8px 0; }
+.cut-options input[type=number] { width: 80px; }

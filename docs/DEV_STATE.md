@@ -507,6 +507,43 @@ use). Gmsh is GPL: the embedded build is for internal use or must be released
 under GPL-compatible terms. Not verified in MIDAS: beam local axes (beta
 angle 0 as in the converter), supports (not exported), quad ordering.
 
+## Cutting off upper storeys (2026-10-05)
+
+`reconstruction/assembly/cutoff.rs`: `floors(state)` (horizontal surfaces
+grouped within 0.15 m; `major` = at least 20 % of the largest floor, landings
+and pits are not listed), `State::cut_above(z)` = journal edit `cut_above`
+(undo, project replay, editing before and after work as for any edit).
+Vertices within the shortest edge of the level are on it; an edge crossing
+farther gets one new vertex shared by everything that uses it; surfaces
+crossing the level are clipped (faces of the planar graph of the edges below
+plus chords along the level inside the material; holes below the level go to
+their face, embedded edges stay) and re-added with `Model::add_surface`, so
+edge identity with the neighbours is kept; bars are trimmed (new anchor or
+an existing one near the crossing); everything above is removed with
+provenance (`removed`, `removed_bars` reason `cut`). `State.cut` keeps the
+lines of the walls and points of the columns at the level (supports) and
+the top elevation. Tried on all large fixtures at every major floor: no new
+audit failures (v4: 4 before, 3 after); Для testa 11, Остров 31, скала3 4,
+тест 5 4 levels cut without errors.
+
+Export (`loads.rs`, `storeys.rs`): every load on an element above the
+level (plate pressures, edge lines, bar loads, node loads) and the weight of
+the elements above (pseudo-case `CUT_WEIGHT_CASE`, from density x thickness
+or RO x length, tf) go to the support nearest in plan (line load along a
+wall, point load on a column); the overturning moment of the items about
+the supports is kept by a couple of vertical forces on the supports (least
+squares; the vertical-axis moment is not kept). Resultants of every case
+equal those of the uncut model (checked on Для testa at floor 8). The cap
+slab (horizontal surfaces at the level) gets a bending stiffness for the
+plan sections of the removed walls and columns: `EI' = EI h / H k` (h storey
+height below, H height removed, k the user's factor), plate of the cap's plan
+size `t = (12 EI' / B)^(1/3)` per axis, geometric mean; only the plate factor
+PLKE grows, membrane stiffness and weight stay (typically a few metres of
+equivalent thickness: tune k). Export options `cut: {loads, cap, factor}`
+in `export_plaxis` and `export_midas`; UI button «Этажи…» and options block
+in both export dialogs. Not verified in PLAXIS or MIDAS; the equivalence is
+an engineering approximation to be calibrated by the user.
+
 Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:
 None` path of `transfer` gives that); (done: see above).

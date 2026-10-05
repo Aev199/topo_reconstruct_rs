@@ -139,9 +139,10 @@ impl Service {
                 let cases = args.get("include_cases").and_then(Value::as_array).map(|a| {
                     a.iter().filter_map(Value::as_u64).map(|c| c as u32).collect()
                 });
-                self.export_plaxis(Path::new(&text("path")?), factor, stiffness, with_loads, combination, cases)
+                self.export_plaxis(Path::new(&text("path")?), factor, stiffness, with_loads, combination, cases, CutOptions::from(args.get("cut")))
             }
             "load_cases" => self.load_cases(),
+            "floors" => self.floors(),
             "export_midas" => self.export_midas(&args),
             "run_plaxis" => self.run_plaxis(&args),
             "export_report" => {
@@ -208,6 +209,7 @@ impl Service {
                 "review": audit.findings.iter().filter(|f| f.class == audit::Class::Review).count(),
             },
             "last": session.journal().last(),
+            "cut": state.cut.as_ref().map(|c| json!({"z": c.z, "top": c.top})),
         }))
     }
 
@@ -394,15 +396,20 @@ impl Service {
         with_loads: bool,
         combination: Option<crate::loads::Combination>,
         cases: Option<std::collections::BTreeSet<u32>>,
+        cut: CutOptions,
     ) -> Result<Value, String> {
         let input = self.input.as_ref().ok_or("no model is open")?;
         let session = self.session()?;
         // Materials of the bytes the geometry was reconstructed from, never
         // of a file changed on disk since.
         let materials = self.materials.as_ref().ok_or("no model is open")?;
+        // The storeys that were cut off: a cap slab with their stiffness.
+        let cap = if cut.cap { crate::storeys::with_cap(session.state(), materials, cut.factor) } else { None };
+        let state = cap.as_ref().map_or(session.state(), |c| &c.0);
+        let exchange_materials = cap.as_ref().map_or(materials, |c| &c.1);
         let exchange = crate::plaxis::exchange(
-            session.state(),
-            materials,
+            state,
+            exchange_materials,
             crate::plaxis::Settings {
                 force_factor,
                 min_edge: self.profile.edge_collapse,
@@ -412,7 +419,7 @@ impl Service {
         );
         let mut exchange = exchange;
         if with_loads {
-            self.add_loads(&mut exchange, force_factor, combination, cases)?;
+            self.add_loads(&mut exchange, state, force_factor, combination, cases, cut.loads)?;
         }
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         serde_json::to_writer(std::io::BufWriter::new(file), &exchange)
@@ -435,6 +442,7 @@ impl Service {
             "loads": exchange.loads.len(),
             "load_cases": exchange.load_report.as_ref().map(|r| r.cases.len()).unwrap_or(0),
             "load_report": exchange.load_report,
+            "cap": cap.as_ref().map(|c| &c.2),
             "material_notes": exchange.plate_materials.iter().map(|m| (m.name.clone(), m.notes.clone()))
                 .chain(exchange.beam_materials.iter().map(|m| (m.name.clone(), m.notes.clone())))
                 .filter(|(_, n)| !n.is_empty())
@@ -447,16 +455,18 @@ impl Service {
     fn add_loads(
         &self,
         exchange: &mut crate::plaxis::Exchange,
+        state: &crate::reconstruction::assembly::edit::State,
         force_factor: f64,
         combination: Option<crate::loads::Combination>,
         cases: Option<std::collections::BTreeSet<u32>>,
+        cut_loads: bool,
     ) -> Result<(), String> {
         let bytes = self.input_bytes()?;
         let mesh = crate::parsers::lira::LiraParser::mesh_from(&bytes).map_err(|e| e.to_string())?;
         let set = crate::parsers::loads::parse(&bytes);
         let output = self.output.as_ref().ok_or("no model is open")?;
         let (loads, report) = crate::loads::transfer(
-            self.session()?.state(),
+            state,
             &output.topology.vertex_source_nodes,
             &mesh,
             &set,
@@ -466,6 +476,8 @@ impl Service {
                 max_groups: 40,
                 combination: combination.clone(),
                 cases,
+                materials: self.materials.clone().map(std::sync::Arc::new),
+                cut_loads,
             },
         );
         exchange.load_cases = if combination.is_some() {
@@ -486,9 +498,13 @@ impl Service {
         let quads = args.get("quads").and_then(Value::as_bool).unwrap_or(false);
         let factor = args.get("force_factor").and_then(Value::as_f64).unwrap_or(crate::plaxis::TONNE_TO_KN);
         let gmsh = crate::gmsh::Gmsh::load().map_err(|e| format!("gmsh_missing: {e}"))?;
-        let state = self.session()?.state();
+        let cut = CutOptions::from(args.get("cut"));
         let input = self.input.as_ref().ok_or("no model is open")?;
         let materials = self.materials.as_ref().ok_or("no model is open")?;
+        let cap = if cut.cap { crate::storeys::with_cap(self.session()?.state(), materials, cut.factor) } else { None };
+        let state = cap.as_ref().map_or(self.session()?.state(), |c| &c.0);
+        let exchange_materials = cap.as_ref().map_or(materials, |c| &c.1);
+        let cut_loads = cut.loads;
         let mesh = crate::meshing::mesh_state(&gmsh, state, size, quads).map_err(|e| format!("meshing_failed: {e}"))?;
         // Cases: the chosen ones, else all but the self-weight, stages and dynamics.
         let bytes = self.input_bytes()?;
@@ -501,6 +517,7 @@ impl Service {
                 .iter()
                 .filter(|(_, n)| !crate::loads::is_self_weight(n) && !crate::loads::is_stage(n) && !crate::loads::is_dynamic(n))
                 .map(|(c, _)| *c)
+                .chain(state.cut.iter().map(|_| crate::loads::CUT_WEIGHT_CASE))
                 .collect(),
         };
         let output = self.output.as_ref().ok_or("no model is open")?;
@@ -515,13 +532,15 @@ impl Service {
                 max_groups: 40,
                 combination: None,
                 cases: Some(selected.clone()),
+                materials: self.materials.clone().map(std::sync::Arc::new),
+                cut_loads,
             },
         );
         let on_mesh = crate::mesh_loads::transfer(&mesh, state, &loads, 0.02);
         let resultants = on_mesh.resultants(&mesh);
         let exchange = crate::plaxis::exchange_materials(
             state,
-            materials,
+            exchange_materials,
             crate::plaxis::Settings {
                 force_factor: factor,
                 min_edge: self.profile.edge_collapse,
@@ -532,7 +551,10 @@ impl Service {
             },
             &input.display().to_string(),
         );
-        let cases: Vec<(u32, String)> = set.cases.iter().filter(|(c, _)| selected.contains(c)).cloned().collect();
+        let mut cases: Vec<(u32, String)> = set.cases.iter().filter(|(c, _)| selected.contains(c)).cloned().collect();
+        if state.cut.is_some() && cut_loads && selected.contains(&crate::loads::CUT_WEIGHT_CASE) {
+            cases.push((crate::loads::CUT_WEIGHT_CASE, "Вес отброшенных этажей".into()));
+        }
         let (text, report) = crate::midas::write_mxt(&mesh, &on_mesh, &exchange, &cases);
         std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))?;
         let per_case: Vec<Value> = load_report
@@ -551,6 +573,7 @@ impl Service {
             "triangles": mesh.shells.iter().filter(|s| s.nodes.len() == 3).count(),
             "quads": mesh.shells.iter().filter(|s| s.nodes.len() == 4).count(),
             "cases": per_case,
+            "cap": cap.as_ref().map(|c| &c.2),
             "skipped": load_report.skipped,
             "warnings": exchange.warnings,
             "missing_materials": exchange.missing_materials,
@@ -586,7 +609,21 @@ impl Service {
                 json!({"case": case, "name": name, "rows": count, "self_weight": crate::loads::is_self_weight(&name), "dynamic": crate::loads::is_dynamic(&name), "stage": crate::loads::is_stage(&name)})
             })
             .collect();
+        let mut cases = cases;
+        if self.session()?.state().cut.is_some() {
+            cases.push(json!({"case": crate::loads::CUT_WEIGHT_CASE, "name": "Вес отброшенных этажей", "rows": 0,
+                              "self_weight": false, "dynamic": false, "stage": false}));
+        }
         Ok(json!({"cases": cases}))
+    }
+
+    /// The floors of the geometry and the cut made on it, for the dialog.
+    fn floors(&self) -> Result<Value, String> {
+        let state = self.session()?.state();
+        Ok(json!({
+            "floors": crate::reconstruction::assembly::cutoff::floors(state),
+            "cut": state.cut,
+        }))
     }
 
     /// Run the loader with a Python that has plxscripting (the PLAXIS
@@ -819,4 +856,27 @@ fn combination_from(value: Option<&Value>) -> Result<Option<crate::loads::Combin
         min_fraction: value.get("min_fraction").and_then(Value::as_f64).unwrap_or(defaults.min_fraction),
     });
     Ok(Some(crate::loads::Combination { factors, simplify }))
+}
+
+/// What the export does with the storeys that were cut off:
+/// `{"loads": true, "cap": true, "factor": 1.0}`.
+#[derive(Debug, Clone, Copy)]
+pub struct CutOptions {
+    /// Their loads and weight go to the supports at the level.
+    pub loads: bool,
+    /// A cap slab with their stiffness.
+    pub cap: bool,
+    /// Factor of the equivalent stiffness.
+    pub factor: f64,
+}
+
+impl CutOptions {
+    fn from(value: Option<&Value>) -> CutOptions {
+        let get = |k: &str| value.and_then(|v| v.get(k));
+        CutOptions {
+            loads: get("loads").and_then(Value::as_bool).unwrap_or(true),
+            cap: get("cap").and_then(Value::as_bool).unwrap_or(true),
+            factor: get("factor").and_then(Value::as_f64).filter(|f| *f >= 0.).unwrap_or(1.),
+        }
+    }
 }

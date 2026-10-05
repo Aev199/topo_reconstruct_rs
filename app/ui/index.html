@@ -14,6 +14,7 @@
     <button id="open-project">Открыть проект</button>
     <button id="save-project" disabled>Сохранить проект</button>
     <button id="export-report" disabled title="Отредактированная геометрия с журналом и аудитом (JSON)">Сохранить результат</button>
+    <button id="floors" disabled title="Распознать этажи и отсечь верхние: нагрузки и жёсткость отброшенной части уйдут на уровень отсечения при экспорте">Этажи…</button>
     <button id="export-midas" disabled title="Сетка gmsh, нагрузки по загружениям, файл .mxt для MIDAS Civil">Экспорт в MIDAS…</button>
     <button id="export-plaxis" disabled title="Плиты и балки с материалами для PLAXIS 3D (через Python API)">Экспорт в PLAXIS…</button>
     <span class="sep"></span>
@@ -65,6 +66,12 @@
           <option value="nominal">номинальная по размерам сечения</option>
         </select></label>
       <label>Единица силы ЛИРА → кН <input id="plx-factor" type="number" step="any" value="9.80665"></label>
+      <div class="cut-options" hidden>
+        <p class="hint">Модель обрезана на отметке <b class="cut-z"></b> м. Отброшенные этажи:</p>
+        <label><input class="cut-loads" type="checkbox" checked> нагрузки и вес — на несущие элементы на уровне отсечения</label>
+        <label><input class="cut-cap" type="checkbox" checked> плита-крышка с приведённой изгибной жёсткостью</label>
+        <label>Коэффициент приведённой жёсткости <input class="cut-factor" type="number" step="any" min="0" value="1"></label>
+      </div>
       <label><input id="plx-loads" type="checkbox" checked> перенести нагрузки из ЛИРА (статические)</label>
       <div id="plx-loads-box">
         <label>Вид
@@ -89,6 +96,20 @@
       </div>
     </form>
   </dialog>
+  <dialog id="floors-dialog">
+    <form method="dialog">
+      <h3>Этажи и обрезка</h3>
+      <p class="hint">Этажи распознаны по горизонтальным плитам. Выберите верхний этаж, который остаётся: всё выше него
+        отсекается (плиты этого этажа остаются крышкой). Нагрузки, вес и жёсткость отброшенной части передаются на
+        уровень отсечения при экспорте в PLAXIS и MIDAS. Обрезку можно отменить, править геометрию можно до и после.</p>
+      <table id="floors-table"><thead><tr><th>оставить до</th><th>отметка, м</th><th>плит</th><th>площадь, м²</th><th>выше, м</th></tr></thead><tbody></tbody></table>
+      <p class="hint" id="floors-note"></p>
+      <div class="row">
+        <button value="cut" class="primary">Обрезать выше выбранного</button>
+        <button value="cancel">Закрыть</button>
+      </div>
+    </form>
+  </dialog>
   <dialog id="midas-dialog">
     <form method="dialog">
       <h3>Экспорт в MIDAS Civil (.mxt)</h3>
@@ -103,6 +124,12 @@
           <option value="effective">расчётная из ЛИРА (EF, EI, WLKE/PLKE)</option>
           <option value="nominal">номинальная по размерам сечения</option>
         </select></label>
+      <div class="cut-options" hidden>
+        <p class="hint">Модель обрезана на отметке <b class="cut-z"></b> м. Отброшенные этажи:</p>
+        <label><input class="cut-loads" type="checkbox" checked> нагрузки и вес — на несущие элементы на уровне отсечения</label>
+        <label><input class="cut-cap" type="checkbox" checked> плита-крышка с приведённой изгибной жёсткостью</label>
+        <label>Коэффициент приведённой жёсткости <input class="cut-factor" type="number" step="any" min="0" value="1"></label>
+      </div>
       <table id="mid-cases"><thead><tr><th>передать</th><th>№</th><th>загружение</th><th>строк</th></tr></thead><tbody></tbody></table>
       <div class="row">
         <button value="run" class="primary">Сохранить .mxt</button>

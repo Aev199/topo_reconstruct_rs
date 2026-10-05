@@ -12,16 +12,26 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let input = std::path::PathBuf::from(args.next().ok_or("usage: loads_check MODEL.txt")?);
     let mut cache = None;
     let mut combine = false;
+    let mut cut_at: Option<usize> = None;
     while let Some(a) = args.next() {
         if a == "--frame-cache" {
             cache = args.next().map(std::path::PathBuf::from);
         } else if a == "--combine" {
             combine = true;
+        } else if a == "--cut" {
+            cut_at = args.next().and_then(|s| s.parse().ok());
         }
     }
     let profile = Profile::plaxis();
     let output = pipeline::run(&input, &profile, &Options { mesh: false, frame_cache: cache }, &mut |_| {})?;
-    let session = Session::new(&output.topology, profile.audit_options());
+    let mut session = Session::new(&output.topology, profile.audit_options());
+    let uncut = session.state().clone();
+    if let Some(k) = cut_at {
+        let z = topo_reconstruct_rs::reconstruction::assembly::cutoff::floors(session.state())[k].z;
+        session.apply(topo_reconstruct_rs::editor::Edit::CutAbove { z }, "probe")?;
+        println!("cut at z {z:.3}");
+    }
+    let materials = std::sync::Arc::new(topo_reconstruct_rs::parsers::lira::LiraParser::parse_materials(&input)?);
     let bytes = std::fs::read(&input)?;
     let mesh = topo_reconstruct_rs::parsers::lira::LiraParser::mesh_from(&bytes)?;
     let set = topo_reconstruct_rs::parsers::loads::parse(&bytes);
@@ -35,8 +45,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &output.topology.vertex_source_nodes,
         &mesh,
         &set,
-        loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination, cases: None },
+        loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination, cases: None, materials: Some(materials.clone()), cut_loads: true },
     );
+    let reference = if cut_at.is_some() {
+        Some(loads::transfer(
+            &uncut,
+            &output.topology.vertex_source_nodes,
+            &mesh,
+            &set,
+            loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination: None, cases: None, materials: Some(materials.clone()), cut_loads: true },
+        ).1)
+    } else { None };
     let mut exported: BTreeMap<u32, DVec3> = BTreeMap::new();
     let mut by_kind: BTreeMap<(u32, &str), DVec3> = BTreeMap::new();
     for l in &list {
@@ -61,7 +80,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     println!("by kind: {by_kind:?}");
     for c in &report.cases {
-        println!("case {} {:?}: source {:?} exported {:?}", c.case, c.name, c.source, c.exported);
+        let full = reference.as_ref().and_then(|r| r.cases.iter().find(|x| x.case == c.case)).map(|x| x.exported);
+        println!("case {} {:?}: source {:?} exported {:?} uncut {:?}", c.case, c.name, c.source, c.exported, full);
     }
     println!("surface-only exported: {exported:?}");
     println!("skipped {:?}\napprox {:?}", report.skipped, report.approximated);

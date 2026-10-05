@@ -12,3 +12,4 @@ pub mod pipeline;
 pub mod plaxis;
 pub mod reconstruction;
 pub mod service;
+pub mod storeys;
