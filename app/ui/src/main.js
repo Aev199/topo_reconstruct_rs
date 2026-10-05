@@ -518,7 +518,7 @@ $('export-report').onclick = async () => {
 };
 
 /// PLAXIS settings of the dialog, remembered per viewer.
-const PLAXIS_FIELDS = ['plx-port', 'plx-python', 'plx-factor', 'plx-stiffness', 'plx-new', 'plx-shift', 'plx-loads', 'plx-phases'];
+const PLAXIS_FIELDS = ['plx-port', 'plx-python', 'plx-factor', 'plx-stiffness', 'plx-new', 'plx-shift', 'plx-loads', 'plx-phases', 'plx-mode', 'plx-center', 'plx-fraction'];
 function loadPlaxisSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem('plaxis') || '{}');
@@ -556,10 +556,61 @@ function loadWarnings(r) {
   return refused ? ` · PLAXIS отклонил нагрузки: ${refused}` : '';
 }
 
+/// The load cases of the source file in the dialog: use, number, name, factor.
+async function fillLoadCases() {
+  const body = $('plx-cases').tBodies[0];
+  body.replaceChildren();
+  let cases = [];
+  try {
+    cases = (await call('load_cases')).cases;
+  } catch (e) {
+    $('plx-cases-hint').textContent = `Загружения не прочитаны: ${explain(e.message || e)}`;
+    syncLoadMode();
+    return;
+  }
+  $('plx-cases-hint').textContent = 'Собственный вес не передаётся: PLAXIS учитывает его сам. Снимите «учесть» у ненужных загружений, задайте коэффициенты сочетания.';
+  for (const c of cases) {
+    const row = body.insertRow();
+    row.dataset.case = c.case;
+    const off = c.self_weight || c.dynamic;
+    row.classList.toggle('self-weight', off);
+    row.innerHTML = `<td><input type="checkbox" class="use" ${off ? '' : 'checked'}></td><td>${c.case}</td>`
+      + `<td></td><td>${c.rows}</td><td><input type="number" class="factor" step="any" value="1"></td>`;
+    row.cells[2].textContent = c.name || '—';
+    if (off) row.cells[2].title = c.self_weight ? 'Похоже на собственный вес — по умолчанию не передаётся' : 'Динамическое загружение — по умолчанию не передаётся';
+  }
+  syncLoadMode();
+}
+function syncLoadMode() {
+  const on = $('plx-loads').checked;
+  $('plx-loads-box').hidden = !on;
+  const combination = $('plx-mode').value === 'combination';
+  $('plx-cases').hidden = !combination;
+  $('plx-simplify').hidden = !combination;
+}
+$('plx-loads').onchange = syncLoadMode;
+$('plx-mode').onchange = syncLoadMode;
+
+/// The combination chosen in the dialog, or null (cases keep their contours).
+function chosenCombination() {
+  if ($('plx-mode').value !== 'combination') return null;
+  const cases = [...$('plx-cases').tBodies[0].rows]
+    .filter((r) => r.querySelector('.use').checked)
+    .map((r) => ({ case: Number(r.dataset.case), factor: Number(r.querySelector('.factor').value) || 0 }))
+    .filter((c) => c.factor !== 0);
+  return {
+    cases,
+    simplify: true,
+    center_tolerance: (Number($('plx-center').value) || 0) / 100,
+    min_fraction: (Number($('plx-fraction').value) || 0) / 100,
+  };
+}
+
 $('export-plaxis').onclick = async () => {
   const a = state.summary?.audit;
   if (a && !a.passed && !await question(`Аудит геометрии не пройден (ошибок ${a.failures}). Экспортировать всё равно?`)) return;
   loadPlaxisSettings();
+  await fillLoadCases();
   const dialog = $('plaxis-dialog');
   dialog.returnValue = '';
   dialog.showModal();
@@ -571,6 +622,7 @@ $('export-plaxis').onclick = async () => {
   const exported = await busy('Подготовка файла обмена PLAXIS…', () => call('export_plaxis', {
     path, force_factor: Number($('plx-factor').value) || 9.80665, stiffness: $('plx-stiffness').value,
     loads: $('plx-loads').checked,
+    combination: $('plx-loads').checked ? chosenCombination() : null,
   }));
   if (!exported) return;
   const missing = exported.missing_materials.length ? `; без материала жёсткости: ${exported.missing_materials.join(', ')}` : '';

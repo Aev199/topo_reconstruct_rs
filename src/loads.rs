@@ -89,7 +89,59 @@ pub struct Report {
     pub approximated: BTreeMap<String, usize>,
 }
 
+/// Whether a load case is the self-weight of the structure (PLAXIS applies
+/// it itself): "СВ", "СВ_...", "СОБСТВЕННЫЙ ВЕС ...", "self weight".
+pub fn is_self_weight(name: &str) -> bool {
+    let n = name.trim().to_lowercase();
+    n == "св"
+        || n.starts_with("св ")
+        || n.starts_with("св_")
+        || n.starts_with("св.")
+        || n.contains("собствен")
+        || n.contains("self weight")
+        || n.contains("self-weight")
+        || n.contains("selfweight")
+}
+
+/// Whether a load case looks dynamic (seismic, dynamic): not part of a static
+/// settlement combination by default.
+pub fn is_dynamic(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("сейсм") || n.contains("динам") || n.contains("seism")
+}
+
+/// The case number of the load combination (`Settings::combination`).
+pub const COMBINATION: u32 = 0;
+
+/// How the combination is reduced for PLAXIS: its geometry must stay valid,
+/// so a plate load is uniform over the whole plate and a bar load uniform
+/// over the whole bar, or a point load where that would move the resultant.
 #[derive(Debug, Clone, Copy)]
+pub struct Simplify {
+    /// Largest distance of the centre of pressure from the centre of the
+    /// plate or bar for a uniform load, as a fraction of its size.
+    pub center_tolerance: f64,
+    /// Smallest loaded part of a plate or bar for a uniform load.
+    pub min_fraction: f64,
+}
+
+impl Default for Simplify {
+    fn default() -> Self {
+        Simplify { center_tolerance: 0.15, min_fraction: 0.3 }
+    }
+}
+
+/// Load cases combined into one case with a factor each.
+#[derive(Debug, Clone)]
+pub struct Combination {
+    /// Factor per load case; cases that are absent or 0 are left out (the
+    /// self-weight case, which PLAXIS applies itself).
+    pub factors: BTreeMap<u32, f64>,
+    /// `None`: the loads keep the contours of the source.
+    pub simplify: Option<Simplify>,
+}
+
+#[derive(Debug, Clone)]
 pub struct Settings {
     /// Force unit of the model in kN (LIRA tf: 9.80665).
     pub force_factor: f64,
@@ -97,6 +149,8 @@ pub struct Settings {
     pub snap: f64,
     /// Most surface loads of one surface and case: values are binned.
     pub max_groups: usize,
+    /// One combined case instead of the cases of the source.
+    pub combination: Option<Combination>,
 }
 
 struct Context<'a> {
@@ -349,6 +403,79 @@ impl Context<'_> {
         }
 
         self.spread_stamps(&stamps, &mut pressure, &mut report);
+        if let Some(combination) = &self.settings.combination {
+            // One case of the weighted sum; cases without a factor are dropped.
+            let weight = |case: u32| combination.factors.get(&case).copied().unwrap_or(0.);
+            let mut combined: HashMap<u32, Pressure> = HashMap::new();
+            for (&case, elements) in &pressure {
+                for (&e, p) in elements {
+                    combined.entry(e).or_default().vector += p.vector * weight(case);
+                }
+            }
+            pressure = BTreeMap::from([(COMBINATION, combined)]);
+            let mut nodes = BTreeMap::new();
+            for (&(case, node), &(force, moment)) in &node_loads {
+                let entry: &mut (DVec3, DVec3) = nodes.entry((COMBINATION, node)).or_default();
+                entry.0 += force * weight(case);
+                entry.1 += moment * weight(case);
+            }
+            node_loads = nodes;
+            let mut uniform = BTreeMap::new();
+            for (&(case, e), &q) in &bar_uniform {
+                if weight(case) != 0. {
+                    *uniform.entry((COMBINATION, e)).or_default() += q * weight(case);
+                }
+            }
+            bar_uniform = uniform;
+            let mut segments: BTreeMap<(u32, usize), Vec<(f64, f64, DVec3, DVec3)>> = BTreeMap::new();
+            for (&(case, axis), list) in &bar_lines {
+                let w = weight(case);
+                if w == 0. {
+                    continue;
+                }
+                segments
+                    .entry((COMBINATION, axis))
+                    .or_default()
+                    .extend(list.iter().map(|&(ta, tb, qa, qb)| (ta, tb, qa * w, qb * w)));
+            }
+            bar_lines = segments;
+            let mut edges: Vec<(DVec3, DVec3, DVec3, DVec3)> = vec![];
+            for (&case, list) in &edge_lines {
+                let w = weight(case);
+                if w == 0. {
+                    continue;
+                }
+                edges.extend(list.iter().map(|&(a, b, qa, qb)| (a, b, qa * w, qb * w)));
+            }
+            edge_lines = BTreeMap::from([(COMBINATION, edges)]);
+            // Point loads and trapezoids of bars were made while reading.
+            loads = std::mem::take(&mut loads)
+                .into_iter()
+                .filter(|l| weight(l.case()) != 0.)
+                .map(|l| match l {
+                    Load::Point { case, at, force, moment } => {
+                        let w = weight(case);
+                        Load::Point {
+                            case: COMBINATION,
+                            at,
+                            force: (DVec3::from_array(force) * w).to_array(),
+                            moment: (DVec3::from_array(moment) * w).to_array(),
+                        }
+                    }
+                    other => other,
+                })
+                .collect();
+            let mut merged_source: BTreeMap<u32, DVec3> = BTreeMap::new();
+            for (&case, &v) in &source {
+                *merged_source.entry(COMBINATION).or_default() += v * weight(case);
+            }
+            source = merged_source;
+            let mut merged_lost: BTreeMap<u32, DVec3> = BTreeMap::new();
+            for (&case, &v) in &lost {
+                *merged_lost.entry(COMBINATION).or_default() += v * weight(case);
+            }
+            lost = merged_lost;
+        }
 
         // ---- node loads
         for (&(case, node), &(force, moment)) in &node_loads {
@@ -395,6 +522,10 @@ impl Context<'_> {
                 }
                 merged.push((ta, tb, qa, qb));
             }
+            if let Some(simplify) = self.simplify() {
+                self.simplified_bar(case, a, b, &merged, simplify, &mut loads, &mut report);
+                continue;
+            }
             for (ta, tb, qa, qb) in merged {
                 loads.push(Load::Line {
                     case,
@@ -426,6 +557,10 @@ impl Context<'_> {
                 }
                 merged.push((a, b, qa, qb));
             }
+            if self.simplify().is_some() {
+                self.simplified_edges(case, &merged, &mut loads, &mut report);
+                continue;
+            }
             for (a, b, qa, qb) in merged {
                 loads.push(Load::Line {
                     case,
@@ -439,7 +574,12 @@ impl Context<'_> {
 
         // ---- shell pressures: surface loads
         for (&case, elements) in &pressure {
-            self.surface_loads(case, elements, &mut loads, &mut source, &mut lost, &mut report);
+            match self.simplify() {
+                Some(simplify) => {
+                    self.simplified_surface_loads(case, elements, simplify, &mut loads, &mut source, &mut lost, &mut report)
+                }
+                None => self.surface_loads(case, elements, &mut loads, &mut source, &mut lost, &mut report),
+            }
         }
 
         // ---- reports per case
@@ -482,6 +622,303 @@ impl Context<'_> {
             });
         }
         (loads, report)
+    }
+
+    fn simplify(&self) -> Option<Simplify> {
+        self.settings.combination.as_ref().and_then(|c| c.simplify)
+    }
+
+    /// The loads of one bar axis (segments `(ta, tb, qa, qb)`, kN/m after
+    /// the force factor) as a uniform load over the whole bar when their
+    /// resultant acts near its middle and covers enough of it, else as point
+    /// loads at the centres of the segments: no new points on the bar and
+    /// the resultant is kept.
+    #[allow(clippy::too_many_arguments)]
+    fn simplified_bar(
+        &self,
+        case: u32,
+        a: DVec3,
+        b: DVec3,
+        segments: &[(f64, f64, DVec3, DVec3)],
+        simplify: Simplify,
+        loads: &mut Vec<Load>,
+        report: &mut Report,
+    ) {
+        let factor = self.settings.force_factor;
+        let length = a.distance(b);
+        let mut force = DVec3::ZERO;
+        let mut moment_arm = 0.;
+        let mut weight = 0.;
+        let mut covered = 0.;
+        let mut pieces = vec![];
+        for &(ta, tb, qa, qb) in segments {
+            let f = (qa + qb) / 2. * (tb - ta) * length;
+            // The centre of a trapezoid by the magnitudes of its ends.
+            let (ma, mb) = (qa.length(), qb.length());
+            let t = if ma + mb > 1e-15 { ta + (tb - ta) * (ma + 2. * mb) / (3. * (ma + mb)) } else { (ta + tb) / 2. };
+            force += f;
+            moment_arm += f.length() * t;
+            weight += f.length();
+            covered += tb - ta;
+            pieces.push((f, t));
+        }
+        if weight < 1e-15 || length < 1e-9 {
+            return;
+        }
+        let center = moment_arm / weight;
+        if covered.min(1.) >= simplify.min_fraction && (center - 0.5).abs() <= simplify.center_tolerance {
+            loads.push(Load::Line {
+                case,
+                start: a.to_array(),
+                end: b.to_array(),
+                q_start: (force / length * factor).to_array(),
+                q_end: (force / length * factor).to_array(),
+            });
+            if segments.len() > 1 || covered < 1. - 1e-6 {
+                *report.approximated.entry("нагрузка на стержень приведена к равномерной по всей длине".into()).or_default() += 1;
+            }
+        } else {
+            for (f, t) in pieces {
+                loads.push(Load::Point {
+                    case,
+                    at: a.lerp(b, t).to_array(),
+                    force: (f * factor).to_array(),
+                    moment: [0.; 3],
+                });
+            }
+            *report.approximated.entry("нагрузка на часть стержня заменена точечными силами".into()).or_default() += 1;
+        }
+    }
+
+    /// Line loads along plate edges: kept as lines between model vertices
+    /// when both ends lie on one (no new points in the geometry), else the
+    /// resultant is applied at the centre of the load.
+    fn simplified_edges(
+        &self,
+        case: u32,
+        lines: &[(DVec3, DVec3, DVec3, DVec3)],
+        loads: &mut Vec<Load>,
+        report: &mut Report,
+    ) {
+        let factor = self.settings.force_factor;
+        let vertices = self.state.model.vertices();
+        let snap = self.settings.snap.max(1e-6);
+        let mut grid: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
+        let cell = |p: DVec3| [0, 1, 2].map(|k| (p[k] / snap).floor() as i64);
+        for (i, v) in vertices.iter().enumerate() {
+            grid.entry(cell(DVec3::from_array(*v))).or_default().push(i);
+        }
+        let nearest = |p: DVec3| -> Option<DVec3> {
+            let c = cell(p);
+            let mut best: Option<(f64, DVec3)> = None;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        for &i in grid.get(&[c[0] + dx, c[1] + dy, c[2] + dz]).into_iter().flatten() {
+                            let v = DVec3::from_array(vertices[i]);
+                            let d = v.distance(p);
+                            if d <= snap && best.is_none_or(|x| d < x.0) {
+                                best = Some((d, v));
+                            }
+                        }
+                    }
+                }
+            }
+            best.map(|x| x.1)
+        };
+        // Equal loads on the same line (after snapping) add up.
+        let mut by_line: BTreeMap<[i64; 6], (DVec3, DVec3, DVec3, DVec3)> = BTreeMap::new();
+        for &(a, b, qa, qb) in lines {
+            if let (Some(sa), Some(sb)) = (nearest(a), nearest(b)) {
+                if sa.distance(sb) > 1e-9 {
+                    let key = |p: DVec3| [0, 1, 2].map(|k| (p[k] * 1e6).round() as i64);
+                    let (ka, kb) = (key(sa), key(sb));
+                    let (k, flip) = if ka <= kb { ([ka[0], ka[1], ka[2], kb[0], kb[1], kb[2]], false) } else { ([kb[0], kb[1], kb[2], ka[0], ka[1], ka[2]], true) };
+                    let (start, end, q0, q1) = if flip { (sb, sa, qb, qa) } else { (sa, sb, qa, qb) };
+                    let entry = by_line.entry(k).or_insert((start, end, DVec3::ZERO, DVec3::ZERO));
+                    entry.2 += q0;
+                    entry.3 += q1;
+                    continue;
+                }
+            }
+            // Not between vertices: the resultant at the centre of the load.
+            let length = a.distance(b);
+            let (ma, mb) = (qa.length(), qb.length());
+            let t = if ma + mb > 1e-15 { (ma + 2. * mb) / (3. * (ma + mb)) } else { 0.5 };
+            loads.push(Load::Point {
+                case,
+                at: a.lerp(b, t).to_array(),
+                force: (((qa + qb) / 2. * length) * factor).to_array(),
+                moment: [0.; 3],
+            });
+            *report.approximated.entry("нагрузка по кромке плиты вне вершин модели заменена точечной силой".into()).or_default() += 1;
+        }
+        for (start, end, q0, q1) in by_line.into_values() {
+            loads.push(Load::Line {
+                case,
+                start: start.to_array(),
+                end: end.to_array(),
+                q_start: (q0 * factor).to_array(),
+                q_end: (q1 * factor).to_array(),
+            });
+        }
+    }
+
+    /// Plate pressures of the combination, one load per plate: uniform over
+    /// the whole plate when enough of it is loaded and the centre of
+    /// pressure is near its centre, else point loads at the centres of
+    /// pressure of the connected loaded parts. No new contours; the
+    /// resultant of every plate is kept.
+    #[allow(clippy::too_many_arguments)]
+    fn simplified_surface_loads(
+        &self,
+        case: u32,
+        elements: &HashMap<u32, Pressure>,
+        simplify: Simplify,
+        loads: &mut Vec<Load>,
+        source: &mut BTreeMap<u32, DVec3>,
+        lost: &mut BTreeMap<u32, DVec3>,
+        report: &mut Report,
+    ) {
+        let factor = self.settings.force_factor;
+        let model = &self.state.model;
+        let mut by_surface: BTreeMap<usize, Vec<(u32, DVec3, f64, DVec3)>> = BTreeMap::new();
+        for (&e, pressure) in elements {
+            let Some(positions) = element(self.mesh, e).and_then(|el| positions(self.mesh, el)) else { continue };
+            let ring = shell_ring(&positions);
+            let area = polygon_area(&ring);
+            let centre = ring.iter().sum::<DVec3>() / ring.len() as f64;
+            let Some(&s) = self.surface_of_element.get(&e) else {
+                if pressure.vector.length() > 1e-15 {
+                    *report.skipped.entry("нагрузка на пластины, которых нет в геометрии".into()).or_default() += 1;
+                    *lost.entry(case).or_default() += pressure.vector * area * factor;
+                }
+                continue;
+            };
+            if pressure.vector.length() < 1e-15 {
+                continue;
+            }
+            *source.entry(case).or_default() += pressure.vector * area * factor;
+            by_surface.entry(s).or_default().push((e, pressure.vector, area, centre));
+        }
+        for (s, items) in by_surface {
+            let force: DVec3 = items.iter().map(|x| x.1 * x.2).sum();
+            let polygons = surface_polygons(model, s, self.settings.snap).0;
+            let pieces: Vec<Vec<DVec3>> = polygons
+                .iter()
+                .map(|p| p.iter().map(|&x| DVec3::from_array(x)).collect())
+                .collect();
+            let surface_area: f64 = pieces.iter().map(|p| polygon_area(p)).sum();
+            if surface_area <= 0. || force.length() < 1e-15 {
+                continue;
+            }
+            // Centre of the plate: area-weighted centres of the fans of its pieces.
+            let mut centre_sum = DVec3::ZERO;
+            for p in &pieces {
+                for i in 1..p.len().saturating_sub(1) {
+                    let t = (p[i] - p[0]).cross(p[i + 1] - p[0]).length() / 2.;
+                    centre_sum += (p[0] + p[i] + p[i + 1]) / 3. * t;
+                }
+            }
+            let plate_centre = centre_sum / surface_area;
+            let direction = force.normalize();
+            let weights: Vec<f64> = items.iter().map(|x| (x.1.dot(direction)).max(0.) * x.2).collect();
+            let weight_sum: f64 = weights.iter().sum();
+            let pressure_centre = if weight_sum > 1e-15 {
+                items.iter().zip(&weights).map(|(x, w)| x.3 * *w).sum::<DVec3>() / weight_sum
+            } else {
+                plate_centre
+            };
+            let loaded: f64 = items.iter().map(|x| x.2).sum();
+            let uniform = loaded / surface_area >= simplify.min_fraction
+                && pressure_centre.distance(plate_centre) <= simplify.center_tolerance * surface_area.sqrt();
+            if uniform {
+                loads.push(Load::Surface {
+                    case,
+                    surface: s,
+                    polygons,
+                    sigma: (force / surface_area * factor).to_array(),
+                });
+                if items.len() > 1 {
+                    *report.approximated.entry("давление на пластину приведено к равномерному по всей пластине".into()).or_default() += 1;
+                }
+                continue;
+            }
+            // Point loads: one per connected loaded part (elements sharing nodes).
+            let mut parent: Vec<usize> = (0..items.len()).collect();
+            fn find(parent: &mut [usize], i: usize) -> usize {
+                let mut r = i;
+                while parent[r] != r {
+                    r = parent[r];
+                }
+                let mut j = i;
+                while parent[j] != r {
+                    let next = parent[j];
+                    parent[j] = r;
+                    j = next;
+                }
+                r
+            }
+            let mut owner: HashMap<u32, usize> = HashMap::new();
+            for (i, x) in items.iter().enumerate() {
+                for &n in element(self.mesh, x.0).map(|el| el.nodes.as_slice()).unwrap_or(&[]) {
+                    match owner.get(&n) {
+                        Some(&j) => {
+                            let (a, b) = (find(&mut parent, i), find(&mut parent, j));
+                            parent[a] = b;
+                        }
+                        None => {
+                            owner.insert(n, i);
+                        }
+                    }
+                }
+            }
+            let mut parts: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            for i in 0..items.len() {
+                let r = find(&mut parent, i);
+                parts.entry(r).or_default().push(i);
+            }
+            let plane = &model.planes()[model.surfaces()[s].plane];
+            let inside = |p: DVec3| -> bool {
+                let q = DVec2::from_array(plane.project(p.to_array()));
+                pieces.iter().any(|piece| {
+                    let ring: Vec<DVec2> = piece.iter().map(|&v| DVec2::from_array(plane.project(v.to_array()))).collect();
+                    let mut odd = false;
+                    for i in 0..ring.len() {
+                        let (a, b) = (ring[i], ring[(i + 1) % ring.len()]);
+                        if (a.y > q.y) != (b.y > q.y) && q.x < a.x + (q.y - a.y) / (b.y - a.y) * (b.x - a.x) {
+                            odd = !odd;
+                        }
+                    }
+                    odd
+                })
+            };
+            for members in parts.values() {
+                let f: DVec3 = members.iter().map(|&i| items[i].1 * items[i].2).sum();
+                let w: Vec<f64> = members.iter().map(|&i| items[i].1.dot(direction).max(0.) * items[i].2).collect();
+                let ws: f64 = w.iter().sum();
+                let mut at = if ws > 1e-15 {
+                    members.iter().zip(&w).map(|(&i, w)| items[i].3 * *w).sum::<DVec3>() / ws
+                } else {
+                    items[members[0]].3
+                };
+                if !inside(at) {
+                    // Outside the plate (an L, a hole): the nearest loaded element centre.
+                    at = members
+                        .iter()
+                        .map(|&i| items[i].3)
+                        .min_by(|x, y| x.distance(at).total_cmp(&y.distance(at)))
+                        .unwrap_or(at);
+                }
+                loads.push(Load::Point {
+                    case,
+                    at: at.to_array(),
+                    force: (f * factor).to_array(),
+                    moment: [0.; 3],
+                });
+            }
+            *report.approximated.entry("давление на часть пластины заменено точечными силами".into()).or_default() += 1;
+        }
     }
 
     /// Stamp forces become pressures. The rows of one case, direction and
@@ -1007,6 +1444,16 @@ mod tests {
         let tensor_hanging = [DVec3::ZERO, DVec3::new(1., 0., 0.), DVec3::new(0., 1., 0.), DVec3::new(2., 0., 0.)];
         assert_eq!(shell_order(&tensor_hanging).len(), 4);
         assert!((polygon_area(&shell_ring(&tensor)) - 1.).abs() < 1e-12);
+    }
+
+    #[test]
+    fn self_weight_cases_are_recognized_by_name() {
+        for name in ["СВ", " св ", "СВ_1.1", "СОБСТВЕННЫЙ ВЕС", "Собственный вес плиты перекрытия 11-го этажа", "Self weight"] {
+            assert!(is_self_weight(name), "{name}");
+        }
+        for name in ["СВЕТ", "СНЕГ_1.4|0.5", "ПОЛЫ НОРМ", "СТАДИЯ 1", "ПОКРЫТИЕ_1.3", ""] {
+            assert!(!is_self_weight(name), "{name}");
+        }
     }
 
     #[test]

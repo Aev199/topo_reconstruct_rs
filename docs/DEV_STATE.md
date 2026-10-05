@@ -461,6 +461,32 @@ trapezoids on plates. Loader: `pointload/lineload/surfload`, phases per case —
 not verified against a real PLAXIS yet (command and property names from the
 documentation).
 
+## PLAXIS load combination (2026-10-05)
+
+`Settings.combination` (`loads.rs`): the cases of the source become ONE
+case (`COMBINATION`) with a factor per case chosen by the user (cases
+without a factor, the self-weight case first, are dropped; PLAXIS applies
+the self-weight itself). With `Simplify` the combined loads are reduced so
+that the PLAXIS geometry gets no new contours and the resultant stays:
+plate pressure → one uniform load over the whole plate when the loaded part
+is at least `min_fraction` (30 %) of it and the centre of pressure is within
+`center_tolerance` (15 %) of its size from the plate centre, else point
+loads at the centres of pressure of the connected loaded parts; bar loads →
+uniform over the whole bar or point loads at the segment centres; plate-edge
+lines stay lines between model vertices, otherwise point loads; node loads
+by node. Check on the fixtures: resultant of the combination equals the
+weighted source (exact within 1e-5); many partly loaded plates become point
+loads (e.g. тест 5: 98 of 99 plates) — the tolerances are in the dialog.
+UI: dialog table of cases (use / factor; self-weight and seismic cases off by
+default), mode «сочетание» / «по загружениям, исходные контуры». Not yet
+verified in a real PLAXIS.
+
+Next (user's plan, not started): MIDAS pipeline = every load except the
+self-weight as its own load case with the source contours (`combination:
+None` path of `transfer` gives that); then gmsh meshing; then transfer of the
+mesh with its loads to FPN as in the Lira_Midas-converter (to be read:
+`writers/midas_writer.py`, `docs/midas_format.md`).
+
 ## Next coherent development batch
 
 - Use the editor on the Багратион v4 residuals and record what the edits

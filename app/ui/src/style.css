@@ -60,3 +60,10 @@ h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: v
 #plaxis-dialog label { display: block; margin: 6px 0; }
 #plaxis-dialog input:not([type=checkbox]) { width: 100%; box-sizing: border-box; }
 #plaxis-dialog .row { display: flex; gap: 6px; justify-content: flex-end; margin-top: 12px; }
+
+#plaxis-dialog { max-height: 90vh; overflow: auto; }
+#plx-cases { width: 100%; border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+#plx-cases th, #plx-cases td { border-bottom: 1px solid var(--line); padding: 2px 4px; text-align: left; }
+#plx-cases input[type=number] { width: 64px; }
+#plx-cases input[type=checkbox] { width: auto; }
+#plx-cases tr.self-weight td { color: var(--muted, #888); }

@@ -64,8 +64,21 @@
           <option value="nominal">номинальная по размерам сечения</option>
         </select></label>
       <label>Единица силы ЛИРА → кН <input id="plx-factor" type="number" step="any" value="9.80665"></label>
-      <label><input id="plx-loads" type="checkbox" checked> перенести нагрузки из ЛИРА (статические, по загружениям)</label>
-      <label><input id="plx-phases" type="checkbox" checked> фаза на каждое загружение (Staged construction)</label>
+      <label><input id="plx-loads" type="checkbox" checked> перенести нагрузки из ЛИРА (статические)</label>
+      <div id="plx-loads-box">
+        <label>Вид
+          <select id="plx-mode">
+            <option value="combination">сочетание, упрощённые контуры (для PLAXIS)</option>
+            <option value="cases">по загружениям, исходные контуры</option>
+          </select></label>
+        <table id="plx-cases"><thead><tr><th>учесть</th><th>№</th><th>загружение</th><th>строк</th><th>коэфф.</th></tr></thead><tbody></tbody></table>
+        <p class="hint" id="plx-cases-hint">Собственный вес не передаётся: PLAXIS учитывает его сам.</p>
+        <div id="plx-simplify">
+          <label>Допуск смещения равнодействующей, % размера плиты/стержня <input id="plx-center" type="number" step="1" min="0" value="15"></label>
+          <label>Наименьшая нагруженная доля для равномерной нагрузки, % <input id="plx-fraction" type="number" step="5" min="0" max="100" value="30"></label>
+        </div>
+        <label><input id="plx-phases" type="checkbox" checked> фаза Staged construction: сочетание (по загружениям — фаза на каждое)</label>
+      </div>
       <label><input id="plx-new" type="checkbox"> начать новый проект</label>
       <label><input id="plx-shift" type="checkbox"> сдвинуть модель к началу координат</label>
       <div class="row">

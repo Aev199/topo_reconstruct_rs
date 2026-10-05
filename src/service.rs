@@ -134,8 +134,10 @@ impl Service {
                     _ => crate::plaxis::StiffnessMode::Effective,
                 };
                 let with_loads = args.get("loads").and_then(Value::as_bool).unwrap_or(true);
-                self.export_plaxis(Path::new(&text("path")?), factor, stiffness, with_loads)
+                let combination = combination_from(args.get("combination"))?;
+                self.export_plaxis(Path::new(&text("path")?), factor, stiffness, with_loads, combination)
             }
+            "load_cases" => self.load_cases(),
             "run_plaxis" => self.run_plaxis(&args),
             "export_report" => {
                 self.export_report(Path::new(&text("path")?))?;
@@ -385,6 +387,7 @@ impl Service {
         force_factor: f64,
         stiffness: crate::plaxis::StiffnessMode,
         with_loads: bool,
+        combination: Option<crate::loads::Combination>,
     ) -> Result<Value, String> {
         let input = self.input.as_ref().ok_or("no model is open")?;
         let session = self.session()?;
@@ -403,7 +406,7 @@ impl Service {
         );
         let mut exchange = exchange;
         if with_loads {
-            self.add_loads(&mut exchange, force_factor)?;
+            self.add_loads(&mut exchange, force_factor, combination)?;
         }
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         serde_json::to_writer(std::io::BufWriter::new(file), &exchange)
@@ -435,15 +438,13 @@ impl Service {
 
     /// The loads of the opened input, mapped onto the current geometry. The
     /// file must still be the one the geometry was reconstructed from.
-    fn add_loads(&self, exchange: &mut crate::plaxis::Exchange, force_factor: f64) -> Result<(), String> {
-        let input = self.input.as_ref().ok_or("no model is open")?;
-        let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
-        if Some(content_hash(&bytes)) != self.input_hash {
-            return Err(format!(
-                "input_changed: {} changed after it was opened; open it again to export loads",
-                input.display()
-            ));
-        }
+    fn add_loads(
+        &self,
+        exchange: &mut crate::plaxis::Exchange,
+        force_factor: f64,
+        combination: Option<crate::loads::Combination>,
+    ) -> Result<(), String> {
+        let bytes = self.input_bytes()?;
         let mesh = crate::parsers::lira::LiraParser::mesh_from(&bytes).map_err(|e| e.to_string())?;
         let set = crate::parsers::loads::parse(&bytes);
         let output = self.output.as_ref().ok_or("no model is open")?;
@@ -456,12 +457,49 @@ impl Service {
                 force_factor,
                 snap: self.profile.edge_collapse,
                 max_groups: 40,
+                combination: combination.clone(),
             },
         );
-        exchange.load_cases = set.cases.clone();
+        exchange.load_cases = if combination.is_some() {
+            vec![(crate::loads::COMBINATION, "Сочетание".to_string())]
+        } else {
+            set.cases.clone()
+        };
         exchange.loads = loads;
         exchange.load_report = Some(report);
         Ok(())
+    }
+
+    /// The source file's bytes, when it is still the file the geometry was
+    /// reconstructed from.
+    fn input_bytes(&self) -> Result<Vec<u8>, String> {
+        let input = self.input.as_ref().ok_or("no model is open")?;
+        let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
+        if Some(content_hash(&bytes)) != self.input_hash {
+            return Err(format!(
+                "input_changed: {} changed after it was opened; open it again to export loads",
+                input.display()
+            ));
+        }
+        Ok(bytes)
+    }
+
+    /// The load cases of the opened input for the combination dialog.
+    fn load_cases(&self) -> Result<Value, String> {
+        let set = crate::parsers::loads::parse(&self.input_bytes()?);
+        let mut rows: std::collections::BTreeMap<u32, usize> = Default::default();
+        for row in &set.rows {
+            *rows.entry(row.case).or_default() += 1;
+        }
+        let names: std::collections::BTreeMap<u32, &String> = set.cases.iter().map(|(n, s)| (*n, s)).collect();
+        let cases: Vec<Value> = rows
+            .iter()
+            .map(|(&case, &count)| {
+                let name = names.get(&case).map(|s| s.to_string()).unwrap_or_default();
+                json!({"case": case, "name": name, "rows": count, "self_weight": crate::loads::is_self_weight(&name), "dynamic": crate::loads::is_dynamic(&name)})
+            })
+            .collect();
+        Ok(json!({"cases": cases}))
     }
 
     /// Run the loader with a Python that has plxscripting (the PLAXIS
@@ -671,4 +709,27 @@ mod tests {
             json!(0.5)
         );
     }
+}
+
+/// `{"cases": [{"case": 1, "factor": 1.35}, ...], "simplify": true,
+/// "center_tolerance": 0.15, "min_fraction": 0.3}` as a load combination.
+fn combination_from(value: Option<&Value>) -> Result<Option<crate::loads::Combination>, String> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let mut factors = std::collections::BTreeMap::new();
+    for entry in value.get("cases").and_then(Value::as_array).ok_or("combination: missing `cases`")? {
+        let case = entry.get("case").and_then(Value::as_u64).ok_or("combination: bad case number")?;
+        let factor = entry.get("factor").and_then(Value::as_f64).ok_or("combination: bad factor")?;
+        if !factor.is_finite() {
+            return Err("combination: factor is not a number".into());
+        }
+        factors.insert(case as u32, factor);
+    }
+    let defaults = crate::loads::Simplify::default();
+    let simplify = value.get("simplify").and_then(Value::as_bool).unwrap_or(true).then(|| crate::loads::Simplify {
+        center_tolerance: value.get("center_tolerance").and_then(Value::as_f64).unwrap_or(defaults.center_tolerance),
+        min_fraction: value.get("min_fraction").and_then(Value::as_f64).unwrap_or(defaults.min_fraction),
+    });
+    Ok(Some(crate::loads::Combination { factors, simplify }))
 }

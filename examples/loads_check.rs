@@ -11,9 +11,12 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut args = std::env::args().skip(1);
     let input = std::path::PathBuf::from(args.next().ok_or("usage: loads_check MODEL.txt")?);
     let mut cache = None;
+    let mut combine = false;
     while let Some(a) = args.next() {
         if a == "--frame-cache" {
             cache = args.next().map(std::path::PathBuf::from);
+        } else if a == "--combine" {
+            combine = true;
         }
     }
     let profile = Profile::plaxis();
@@ -22,12 +25,17 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bytes = std::fs::read(&input)?;
     let mesh = topo_reconstruct_rs::parsers::lira::LiraParser::mesh_from(&bytes)?;
     let set = topo_reconstruct_rs::parsers::loads::parse(&bytes);
+    // --combine: every case with factor 1 except the self-weight, simplified.
+    let combination = combine.then(|| loads::Combination {
+        factors: set.cases.iter().filter(|(_, n)| !loads::is_self_weight(n)).map(|(c, _)| (*c, 1.)).collect(),
+        simplify: Some(loads::Simplify::default()),
+    });
     let (list, report) = loads::transfer(
         session.state(),
         &output.topology.vertex_source_nodes,
         &mesh,
         &set,
-        loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40 },
+        loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination },
     );
     let mut exported: BTreeMap<u32, DVec3> = BTreeMap::new();
     let mut by_kind: BTreeMap<(u32, &str), DVec3> = BTreeMap::new();

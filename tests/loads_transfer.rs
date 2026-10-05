@@ -9,7 +9,7 @@ use topo_reconstruct_rs::pipeline::{self, Options, Profile};
 /// of even index, perimeter order for the others), `n` loaded by case:
 /// case 1: 2 tf/m2 downward on the left half, 3 on the right half (global);
 /// case 2: a line load along the edge nodes 1-2 of element 1 (positive values act against the axes, as in LIRA).
-fn source(transform: impl Fn(DVec3) -> DVec3) -> String {
+fn source(transform: impl Fn(DVec3) -> DVec3, loaded: impl Fn(usize, usize) -> bool) -> String {
     let (nx, ny) = (6usize, 4usize);
     let node = |i: usize, j: usize| j * (nx + 1) + i + 1;
     let mut elements = String::new();
@@ -34,11 +34,13 @@ fn source(transform: impl Fn(DVec3) -> DVec3) -> String {
     }
     let mut loads = String::new();
     let mut n = 0;
-    for _ in 0..ny {
+    for j in 0..ny {
         for i in 0..nx {
             n += 1;
             let parameters = if i < nx / 2 { 1 } else { 2 };
-            loads += &format!("{n} 16 3 {parameters} 1 /\n");
+            if loaded(i, j) {
+                loads += &format!("{n} 16 3 {parameters} 1 /\n");
+            }
         }
     }
     // Case 2: a line load along edge 1-2 of element 1 (global z, 4 tf/m).
@@ -51,6 +53,10 @@ fn source(transform: impl Fn(DVec3) -> DVec3) -> String {
 }
 
 fn run(text: &str, tag: &str) -> (Vec<Load>, loads::Report) {
+    run_with(text, tag, None)
+}
+
+fn run_with(text: &str, tag: &str, combination: Option<loads::Combination>) -> (Vec<Load>, loads::Report) {
     let path = std::env::temp_dir().join(format!("loads_transfer_{tag}_{}.txt", std::process::id()));
     std::fs::write(&path, text).unwrap();
     let profile = Profile::plaxis();
@@ -63,7 +69,7 @@ fn run(text: &str, tag: &str) -> (Vec<Load>, loads::Report) {
         &output.topology.vertex_source_nodes,
         &mesh,
         &set,
-        loads::Settings { force_factor: 10., snap: profile.edge_collapse, max_groups: 40 },
+        loads::Settings { force_factor: 10., snap: profile.edge_collapse, max_groups: 40, combination },
     );
     let _ = std::fs::remove_file(path);
     result
@@ -93,7 +99,7 @@ fn resultant(list: &[Load], case: u32) -> DVec3 {
 }
 
 fn check(transform: impl Fn(DVec3) -> DVec3, tag: &str, unit: f64) {
-    let (list, report) = run(&source(&transform), tag);
+    let (list, report) = run(&source(&transform, |_, _| true), tag);
     // Left half 3 x 4 m at -2 tf/m2, right half at -3: -60 tf = -600 kN (force factor 10).
     let expected_case1 = DVec3::new(0., 0., -(2. + 3.) * 12. * 10. * unit * unit);
     let r1 = resultant(&list, 1);
@@ -119,4 +125,43 @@ fn slab_loads_keep_their_resultant_in_any_placement() {
     let q = DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.7);
     check(|p| p * 2., "scaled", 2.);
     check(move |p| q * p + DVec3::new(100., -50., 20.), "rotated", 1.);
+}
+
+fn combination(factors: &[(u32, f64)]) -> Option<loads::Combination> {
+    Some(loads::Combination {
+        factors: factors.iter().copied().collect(),
+        simplify: Some(loads::Simplify::default()),
+    })
+}
+
+#[test]
+fn combination_is_one_uniform_load_per_plate_and_drops_cases_without_a_factor() {
+    let q = DQuat::from_axis_angle(DVec3::new(1., 2., 3.).normalize(), 0.7);
+    let place = move |p: DVec3| q * p + DVec3::new(100., -50., 20.);
+    let text = source(place, |_, _| true);
+    // Case 1 weighted 1.5, case 2 left out (as the self-weight case would be).
+    let (list, report) = run_with(&text, "combined", combination(&[(1, 1.5)]));
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert!(matches!(list[0], Load::Surface { case: 0, .. }));
+    let expected = DVec3::new(0., 0., -600. * 1.5);
+    let got = resultant(&list, 0);
+    assert!((got - expected).length() < 1e-6 * expected.length(), "{got:?} vs {expected:?}");
+    assert_eq!(report.cases.len(), 1);
+    // Both cases (weighted 1 and 2): the edge load between two vertices stays a line load.
+    let (list, _) = run_with(&text, "combined2", combination(&[(1, 1.), (2, 2.)]));
+    let expected = DVec3::new(0., 0., -600. - 2. * 40.);
+    let got = resultant(&list, 0);
+    assert!((got - expected).length() < 1e-6 * expected.length(), "{got:?} vs {expected:?}");
+    assert_eq!(list.iter().filter(|l| matches!(l, Load::Line { .. })).count(), 1);
+    assert_eq!(list.len(), 2);
+}
+
+#[test]
+fn a_small_patch_becomes_a_point_load_at_its_centre() {
+    let text = source(|p| p, |i, j| i == 0 && j == 0);
+    let (list, _) = run_with(&text, "patch", combination(&[(1, 1.)]));
+    assert_eq!(list.len(), 1, "{list:?}");
+    let Load::Point { at, force, .. } = &list[0] else { panic!("{list:?}") };
+    assert!((DVec3::from_array(*at) - DVec3::new(0.5, 0.5, 0.)).length() < 1e-9, "{at:?}");
+    assert!((DVec3::from_array(*force) - DVec3::new(0., 0., -20.)).length() < 1e-9, "{force:?}");
 }
