@@ -195,8 +195,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let exchange = topo_reconstruct_rs::plaxis::exchange(
             session.state(),
             &materials,
-            topo_reconstruct_rs::plaxis::TONNE_TO_KN,
-            profile.edge_collapse,
+            topo_reconstruct_rs::plaxis::Settings {
+                force_factor: topo_reconstruct_rs::plaxis::TONNE_TO_KN,
+                min_edge: profile.edge_collapse,
+                stiffness: topo_reconstruct_rs::plaxis::StiffnessMode::Effective,
+            },
             &input.display().to_string(),
         );
         println!(

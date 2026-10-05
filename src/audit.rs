@@ -500,6 +500,15 @@ pub fn run(model: &Model, axes: &[Axis], contacts: &[Contact], options: &Options
     let vertices = model.vertices();
     let edges = model.edges();
     let mut findings = vec![];
+    // Bar representation: straight bars through ordered, distinct nodes.
+    for (i, defect) in crate::reconstruction::assembly::bars::axis_defects(model, axes) {
+        let mut f = Finding::new("broken_bar", Class::Failure).bars([i]);
+        if let Some(axis) = axes.get(i) {
+            f = f.at(p3(vertices[axis.endpoints[0]]));
+        }
+        f.detail = defect;
+        findings.push(f);
+    }
     let surfaces: Vec<Surface> = model
         .surfaces()
         .iter()

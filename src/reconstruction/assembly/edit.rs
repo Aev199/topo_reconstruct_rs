@@ -402,14 +402,20 @@ impl State {
                 let p = DVec3::from_array(self.model.vertices()[n.vertex]);
                 // An end moves onto the other bar; an interior node only
                 // along its own bar (onto the exact crossing).
-                let target = if self.axes[k].endpoints.contains(&n.vertex) {
+                if self.axes[k].endpoints.contains(&n.vertex) {
                     let d = o1 - o0;
-                    o0 + d * ((p - o0).dot(d) / d.length_squared()).clamp(0., 1.)
+                    let target = o0 + d * ((p - o0).dot(d) / d.length_squared()).clamp(0., 1.);
+                    cleanup::move_with_axes(&mut trial, &axes, n.vertex, target, f64::MAX)?;
+                    (n.vertex, o, n.source_node, target)
                 } else {
-                    x
-                };
-                cleanup::move_with_axes(&mut trial, &axes, n.vertex, target, f64::MAX)?;
-                (n.vertex, o, n.source_node, target)
+                    // An interior node slides along its bar (and any other
+                    // bar it is a node of) onto the crossing.
+                    if distance > self.model.precision {
+                        return Err(format!("skew_bars: {distance:e}"));
+                    }
+                    slide_node(&mut trial, &mut axes, n.vertex, x)?;
+                    (n.vertex, o, n.source_node, x)
+                }
             }
             None => {
                 if distance > self.model.precision {
@@ -460,21 +466,25 @@ impl State {
     pub fn connect_bar_to_surfaces(&mut self, b: usize) -> Result<String, String> {
         self.check_bar(b)?;
         let mut trial = self.model.clone();
-        let mut one = vec![self.axes[b].clone()];
+        // All bars: nodes shared with other bars stay guarded.
+        let mut one = self.axes.clone();
         let precision = trial.precision;
-        let imprinted: Vec<_> = bars::imprint_crossings(&mut trial, &mut one)
+        let imprinted: Vec<_> = bars::imprint_crossings_of(&mut trial, &mut one, Some(b))
             .into_iter()
             .filter(|i| i.kind != "slid_anchor" || i.movement > precision)
             .collect();
-        if imprinted.is_empty() {
+        // A bar lying in a surface's plane gets nodes where it crosses that
+        // surface's contour (its piece inside then is an interval contact).
+        let in_plane = imprint_in_plane(&mut trial, &mut one, b)?;
+        if imprinted.is_empty() && in_plane == 0 {
             return Err("no_crossing_to_share".into());
         }
-        self.axes[b] = one.pop().unwrap();
+        self.axes = one;
         self.model = trial;
         self.refresh();
         Ok(format!(
             "bar shares {} node(s) with surfaces",
-            imprinted.len()
+            imprinted.len() + in_plane
         ))
     }
 
@@ -537,6 +547,102 @@ impl State {
     }
 }
 
+/// Nodes of bar `b` where it crosses the contour of a surface whose plane
+/// it lies in: an existing contour vertex on the bar becomes a node of it,
+/// otherwise a generated vertex splits the contour edge. Crossings within
+/// the minimum edge of a node of the bar are left alone. Returns how many
+/// nodes were added.
+fn imprint_in_plane(model: &mut Model, axes: &mut [Axis], b: usize) -> Result<usize, String> {
+    let precision = model.precision;
+    let on_plane = 5. * precision;
+    let minimum = model.minimum_edge;
+    let mut added = 0;
+    for s in 0..model.surfaces.len() {
+        let [p, q] = axes[b]
+            .endpoints
+            .map(|v| DVec3::from_array(model.vertices[v]));
+        let plane = model.planes[model.surfaces[s].plane].clone();
+        if plane.distance(p.to_array()).abs() > on_plane
+            || plane.distance(q.to_array()).abs() > on_plane
+        {
+            continue;
+        }
+        let d = q - p;
+        let length = d.length();
+        // Contour edges (with their vertices) crossed by the bar.
+        let mut hits: Vec<(f64, usize, Option<usize>)> = vec![];
+        for e in model.surface_edges(s).collect::<Vec<_>>() {
+            let [u, w] = model.edges[e];
+            let (a, c) = (
+                DVec3::from_array(model.vertices[u]),
+                DVec3::from_array(model.vertices[w]),
+            );
+            for (v, x) in [(u, a), (w, c)] {
+                let t = (x - p).dot(d) / (length * length);
+                if t > 0. && t < 1. && x.distance(p + d * t) <= precision {
+                    hits.push((t, e, Some(v)));
+                }
+            }
+            let Some((t, r)) = segment_parameters(p, q, a, c) else {
+                continue;
+            };
+            if t > 0.
+                && t < 1.
+                && r > 0.
+                && r < 1.
+                && (p + d * t).distance(a + (c - a) * r) <= precision
+            {
+                let x = a + (c - a) * r;
+                if x.distance(a) >= minimum && x.distance(c) >= minimum {
+                    hits.push((t, e, None));
+                }
+            }
+        }
+        hits.sort_by(|x, y| x.0.total_cmp(&y.0));
+        for (t, e, vertex) in hits {
+            let near = axes[b]
+                .anchors
+                .iter()
+                .any(|n| (n.t - t).abs() * length < minimum);
+            if near {
+                continue;
+            }
+            let v = match vertex {
+                Some(v) => v,
+                None => {
+                    let v = model
+                        .add_vertex((p + d * t).to_array())
+                        .map_err(|e| format!("{e:?}"))?;
+                    model
+                        .split_edge_within(e, v, precision)
+                        .map_err(|e| format!("split_{e:?}"))?;
+                    v
+                }
+            };
+            axes[b].anchors.push(Anchor {
+                source_node: bars::NO_SOURCE_NODE,
+                vertex: v,
+                t,
+            });
+            axes[b].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+            added += 1;
+        }
+    }
+    Ok(added)
+}
+
+/// Parameters (t on p-q, r on a-c) of the closest points of two segment
+/// lines; `None` when parallel.
+fn segment_parameters(p: DVec3, q: DVec3, a: DVec3, c: DVec3) -> Option<(f64, f64)> {
+    let (u, v, w) = (q - p, c - a, p - a);
+    let (aa, bb, cc, dd, ee) = (u.dot(u), u.dot(v), v.dot(v), u.dot(w), v.dot(w));
+    let den = aa * cc - bb * bb;
+    if den <= 1e-12 * aa * cc {
+        return None;
+    }
+    Some(((bb * ee - cc * dd) / den, (aa * ee - bb * dd) / den))
+}
+
 /// Move node `v` of bars to `q` without bending any bar: `q` must be on the
 /// line of every bar having `v` (inside the span for an interior node). A
 /// bar end slides along its own line; the parameters of its nodes and
@@ -581,7 +687,7 @@ fn slide_node(model: &mut Model, axes: &mut [Axis], v: usize, q: DVec3) -> Resul
             }
         }
         axis.anchors[n].t = t;
-        if axis.anchors.windows(2).any(|w| w[1].t < w[0].t) {
+        if axis.anchors.windows(2).any(|w| w[1].t <= w[0].t) {
             return Err("node_beyond_neighbour".into());
         }
     }
@@ -589,7 +695,16 @@ fn slide_node(model: &mut Model, axes: &mut [Axis], v: usize, q: DVec3) -> Resul
         if !(t1 - t0 > 0.) {
             return Err("bar_would_collapse".into());
         }
-        let map = |x: f64| ((x - t0) / (t1 - t0)).clamp(0., 1.);
+        // The moved end stays the end (0 or 1); anything else maps without
+        // clamping, a node beyond the new end being refused below.
+        let moved = if t0 != 0. { 0. } else { 1. };
+        let map = |x: f64| {
+            if x == moved {
+                moved
+            } else {
+                (x - t0) / (t1 - t0)
+            }
+        };
         let axis = &mut axes[k];
         for a in &mut axis.anchors {
             a.t = if axis.endpoints[0] == a.vertex {
@@ -603,7 +718,13 @@ fn slide_node(model: &mut Model, axes: &mut [Axis], v: usize, q: DVec3) -> Resul
         for s in &mut axis.spans {
             (s.start_t, s.end_t) = (map(s.start_t), map(s.end_t));
         }
-        if axis.anchors.windows(2).any(|w| w[1].t < w[0].t) {
+        if axis.anchors.iter().any(|a| !(0. ..=1.).contains(&a.t))
+            || axis.anchors.windows(2).any(|w| w[1].t <= w[0].t)
+            || axis
+                .spans
+                .iter()
+                .any(|s| !(s.start_t >= 0. && s.start_t < s.end_t && s.end_t <= 1.))
+        {
             return Err("node_beyond_bar_end".into());
         }
     }
@@ -873,6 +994,153 @@ mod tests {
             let v = s.axes[0].anchors[1].vertex;
             assert!(near(&s, v, &place, [1., 1., 0.]));
             assert!(s.connect_bar_to_surfaces(0).is_err());
+        }
+    }
+
+    /// A node of bar `k` at `p`, with source spans split there.
+    fn node(s: &mut State, place: &Placement, k: usize, p: [f64; 3]) -> usize {
+        let v = s.model.add_vertex(place.point(p)).unwrap();
+        let [a, b] = s.ends(k);
+        let x = DVec3::from_array(s.model.vertices()[v]);
+        let t = (x - a).dot(b - a) / (b - a).length_squared();
+        let axis = &mut s.axes[k];
+        axis.anchors.push(Anchor {
+            source_node: 1000 + v as u32,
+            vertex: v,
+            t,
+        });
+        axis.anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+        let mut spans = vec![];
+        for span in &axis.spans {
+            if span.start_t < t && t < span.end_t {
+                spans.push(crate::reconstruction::recognize::SourceSpan {
+                    end_t: t,
+                    ..span.clone()
+                });
+                spans.push(crate::reconstruction::recognize::SourceSpan {
+                    start_t: t,
+                    element: span.element + 100,
+                    stiffness: span.stiffness + 1,
+                    ..span.clone()
+                });
+            } else {
+                spans.push(span.clone());
+            }
+        }
+        axis.spans = spans;
+        v
+    }
+
+    #[test]
+    fn nodes_never_coincide_or_pass_the_bar_end() {
+        for place in Placement::all() {
+            let mut m = build(&place, &[slab(0., 2.)]);
+            let a = bar(&mut m, &place, 0, [0., 3., 1.], [4., 3., 1.]);
+            let mut s = state(m, 1);
+            s.axes = vec![a];
+            let one = node(&mut s, &place, 0, [1., 3., 1.]);
+            let two = node(&mut s, &place, 0, [2., 3., 1.]);
+            assert!(bars::axis_defects(&s.model, &s.axes).is_empty());
+            // Onto its neighbour: two nodes in one point, an empty span.
+            assert!(s.move_vertex(two, place.point([1., 3., 1.])).is_err());
+            // Along the bar between its neighbours: fine.
+            s.move_vertex(two, place.point([1.5, 3., 1.])).unwrap();
+            assert!(
+                bars::axis_defects(&s.model, &s.axes).is_empty(),
+                "{:?}",
+                bars::axis_defects(&s.model, &s.axes)
+            );
+            // A bar end that is a node of another bar along the same line
+            // slides; past an interior node of its own bar it is refused.
+            let end = s.axes[0].endpoints[0];
+            let mut long = bar(&mut s.model, &place, 1, [-1., 3., 1.], [6., 3., 1.]);
+            long.anchors.insert(
+                1,
+                Anchor {
+                    source_node: 9,
+                    vertex: end,
+                    t: 1. / 7.,
+                },
+            );
+            s.axes.push(long);
+            assert!(s.move_vertex(end, place.point([1.2, 3., 1.])).is_err());
+            s.move_vertex(end, place.point([0.5, 3., 1.])).unwrap();
+            assert!(
+                bars::axis_defects(&s.model, &s.axes).is_empty(),
+                "{:?}",
+                bars::axis_defects(&s.model, &s.axes)
+            );
+            assert!(s.move_vertex(one, place.point([0., 3., 1.])).is_err());
+            assert!(bars::axis_defects(&s.model, &s.axes).is_empty());
+        }
+    }
+
+    #[test]
+    fn an_interior_node_slides_onto_the_crossing() {
+        for place in Placement::all() {
+            let mut m = build(&place, &[slab(0., 2.)]);
+            let a = bar(&mut m, &place, 0, [0., 3., 1.], [4., 3., 1.]);
+            let b = bar(&mut m, &place, 1, [2., 0., 1.], [2., 6., 1.]);
+            let mut s = state(m, 1);
+            s.axes = vec![a, b];
+            // A node of bar 0 20 mm from the crossing.
+            let v = node(&mut s, &place, 0, [2.02, 3., 1.]);
+            s.connect_bars(0, 1, 0.05 * place.scale).unwrap();
+            assert!(near(&s, v, &place, [2., 3., 1.]));
+            assert!(s.axes[1].anchors.iter().any(|n| n.vertex == v));
+            assert!(bars::axis_defects(&s.model, &s.axes).is_empty());
+        }
+    }
+
+    #[test]
+    fn connecting_one_bar_never_bends_another() {
+        for place in Placement::all() {
+            let mut m = build(&place, &[slab(0., 2.)]);
+            let up = bar(&mut m, &place, 0, [1., 1., -1.], [1., 1., 1.]);
+            let across = bar(&mut m, &place, 1, [1., -1., 0.0005], [1., 3., 0.0005]);
+            let mut s = state(m, 1);
+            s.axes = vec![up, across];
+            // One node of both bars 0.5 mm above the slab.
+            let v = node(&mut s, &place, 0, [1., 1., 0.0005]);
+            let t = 0.5;
+            s.axes[1].anchors.push(Anchor {
+                source_node: 7,
+                vertex: v,
+                t,
+            });
+            s.axes[1].anchors.sort_by(|x, y| x.t.total_cmp(&y.t));
+            assert!(bars::axis_defects(&s.model, &s.axes).is_empty());
+            let _ = s.connect_bar_to_surfaces(0);
+            assert!(
+                bars::axis_defects(&s.model, &s.axes).is_empty(),
+                "{:?}",
+                bars::axis_defects(&s.model, &s.axes)
+            );
+        }
+    }
+
+    #[test]
+    fn a_bar_in_the_slab_plane_gets_nodes_on_its_contour() {
+        for place in Placement::all() {
+            let mut m = build(&place, &[panel(0., 4.)]);
+            let a = bar(&mut m, &place, 0, [-1., 2., 0.], [5., 2., 0.]);
+            let mut s = state(m, 1);
+            s.axes = vec![a];
+            s.refresh();
+            assert!(!s
+                .contacts
+                .iter()
+                .any(|c| matches!(c, Contact::Interval { .. })));
+            s.connect_bar_to_surfaces(0).unwrap();
+            assert_eq!(s.axes[0].anchors.len(), 4);
+            assert!(bars::axis_defects(&s.model, &s.axes).is_empty());
+            assert!(
+                s.contacts
+                    .iter()
+                    .any(|c| matches!(c, Contact::Interval { .. })),
+                "{:?}",
+                s.contacts
+            );
         }
     }
 }

@@ -22,6 +22,8 @@ pub struct Service {
     /// The journal as last saved in (or opened from) a project: edits
     /// differing from it are unsaved.
     saved_journal: Vec<crate::editor::Entry>,
+    /// Materials of the opened input bytes (the snapshot the geometry is).
+    materials: Option<hashbrown::HashMap<u32, crate::parsers::lira::Material>>,
 }
 
 /// Display data of the current geometry.
@@ -57,6 +59,7 @@ impl Service {
             output: None,
             session: None,
             saved_journal: vec![],
+            materials: None,
         }
     }
 
@@ -126,7 +129,11 @@ impl Service {
                     .get("force_factor")
                     .and_then(Value::as_f64)
                     .unwrap_or(crate::plaxis::TONNE_TO_KN);
-                self.export_plaxis(Path::new(&text("path")?), factor)
+                let stiffness = match args.get("stiffness").and_then(Value::as_str) {
+                    Some("nominal") => crate::plaxis::StiffnessMode::Nominal,
+                    _ => crate::plaxis::StiffnessMode::Effective,
+                };
+                self.export_plaxis(Path::new(&text("path")?), factor, stiffness)
             }
             "run_plaxis" => self.run_plaxis(&args),
             "export_report" => {
@@ -166,6 +173,7 @@ impl Service {
         self.output = Some(result);
         self.input = Some(path.to_path_buf());
         self.input_hash = Some(content_hash(&bytes));
+        self.materials = Some(crate::parsers::lira::LiraParser::materials_from(&bytes));
         self.saved_journal.clear();
         Ok(())
     }
@@ -370,16 +378,25 @@ impl Service {
     }
 
     /// Write the PLAXIS exchange file and, beside it, the loader script.
-    fn export_plaxis(&self, path: &Path, force_factor: f64) -> Result<Value, String> {
+    fn export_plaxis(
+        &self,
+        path: &Path,
+        force_factor: f64,
+        stiffness: crate::plaxis::StiffnessMode,
+    ) -> Result<Value, String> {
         let input = self.input.as_ref().ok_or("no model is open")?;
         let session = self.session()?;
-        let materials = crate::parsers::lira::LiraParser::parse_materials(input)
-            .map_err(|e| format!("{}: {e}", input.display()))?;
+        // Materials of the bytes the geometry was reconstructed from, never
+        // of a file changed on disk since.
+        let materials = self.materials.as_ref().ok_or("no model is open")?;
         let exchange = crate::plaxis::exchange(
             session.state(),
-            &materials,
-            force_factor,
-            self.profile.edge_collapse,
+            materials,
+            crate::plaxis::Settings {
+                force_factor,
+                min_edge: self.profile.edge_collapse,
+                stiffness,
+            },
             &input.display().to_string(),
         );
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
@@ -399,6 +416,11 @@ impl Service {
             "beam_materials": exchange.beam_materials.len(),
             "missing_materials": exchange.missing_materials,
             "audit_passed": session.audit().passed,
+            "warnings": exchange.warnings,
+            "material_notes": exchange.plate_materials.iter().map(|m| (m.name.clone(), m.notes.clone()))
+                .chain(exchange.beam_materials.iter().map(|m| (m.name.clone(), m.notes.clone())))
+                .filter(|(_, n)| !n.is_empty())
+                .collect::<Vec<_>>(),
         }))
     }
 

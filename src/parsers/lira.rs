@@ -23,20 +23,28 @@ pub enum Section {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Material {
     /// GEI: shell of thickness `thickness` (m); `density` is per volume.
+    /// `membrane` (WLKE) and `bending` (PLKE) scale E for in-plane and
+    /// out-of-plane work; WLKG/PLKG scale G (not representable in PLAXIS).
     Plate {
         e: f64,
         nu: f64,
         thickness: f64,
         density: Option<f64>,
+        membrane: Option<f64>,
+        bending: Option<f64>,
+        shear: [Option<f64>; 2],
     },
-    /// S0: rectangular bar `width` x `height` (m, given in cm); `density`
-    /// (RO) is per length.
+    /// S0: rectangular bar `width` (along local Y1) x `height` (along Z1),
+    /// m (given in cm); `density` (RO) is per length. `stiffness`: the
+    /// numeric EF, EIy, EIz, GIk of the type when given (they may differ
+    /// from E and the S0 dimensions: LIRA allows independent stiffness).
     Bar {
         e: f64,
         nu: Option<f64>,
         width: f64,
         height: f64,
         density: Option<f64>,
+        stiffness: Option<[f64; 4]>,
     },
 }
 
@@ -47,6 +55,11 @@ impl LiraParser {
         let file = File::open(filepath)?;
         let mmap = unsafe { Mmap::map(&file)? };
         Ok(Self::materials_bytes(&mmap))
+    }
+
+    /// Materials of input bytes already read (the opened snapshot).
+    pub fn materials_from(content: &[u8]) -> HashMap<u32, Material> {
+        Self::materials_bytes(content)
     }
 
     fn materials_bytes(content: &[u8]) -> HashMap<u32, Material> {
@@ -89,14 +102,21 @@ impl LiraParser {
                         nu: number(words.get(i + 2))?,
                         thickness: number(words.get(i + 3)).filter(|v| *v > 0.)?,
                         density,
+                        membrane: after(&words, "WLKE", 1),
+                        bending: after(&words, "PLKE", 1),
+                        shear: [after(&words, "WLKG", 1), after(&words, "PLKG", 1)],
                     }
                 } else if words.iter().any(|w| w == "S0") {
+                    // A row starting with numbers: EF EIy EIz GIk ...
+                    let numeric: Vec<f64> = words.iter().map_while(|w| number(Some(w))).collect();
                     Material::Bar {
                         e: after(&words, "S0", 1).filter(|v| *v > 0.)?,
                         width: after(&words, "S0", 2).filter(|v| *v > 0.)? / 100.,
                         height: after(&words, "S0", 3).filter(|v| *v > 0.)? / 100.,
                         nu: after(&words, "Mu", 1),
                         density,
+                        stiffness: (numeric.len() >= 4 && numeric[..3].iter().all(|v| *v > 0.))
+                            .then(|| [numeric[0], numeric[1], numeric[2], numeric[3]]),
                     }
                 } else {
                     return None;
@@ -404,7 +424,7 @@ mod material_tests {
 
     #[test]
     fn plates_and_bars_with_continuation_rows() {
-        let text = b"( 3/\n1 1.2e+006 38400 15000 22572.8 0 0 /\n 0 RO 1/\n 0 S0 3e+006 50 80/\n 0 Mu 0.2/\n7 GEI 3e+006 0.2 0.2 RO 2.5 /\n 0 WLKE 1 WLKG 1 /\n2 S0 0.305915 20 20/\n 0 RO 0.0101972/\n)";
+        let text = b"( 3/\n1 1.2e+006 38400 15000 22572.8 0 0 /\n 0 RO 1/\n 0 S0 3e+006 50 80/\n 0 Mu 0.2/\n7 GEI 3e+006 0.2 0.2 RO 2.5 /\n 0 WLKE 1 WLKG 1 PLKE 0.6 PLKG 0.6 /\n2 S0 0.305915 20 20/\n 0 RO 0.0101972/\n)";
         let m = LiraParser::materials_bytes(text);
         assert_eq!(
             m[&1],
@@ -413,7 +433,8 @@ mod material_tests {
                 nu: Some(0.2),
                 width: 0.5,
                 height: 0.8,
-                density: Some(1.)
+                density: Some(1.),
+                stiffness: Some([1.2e6, 38400., 15000., 22572.8]),
             }
         );
         assert_eq!(
@@ -422,7 +443,10 @@ mod material_tests {
                 e: 3e6,
                 nu: 0.2,
                 thickness: 0.2,
-                density: Some(2.5)
+                density: Some(2.5),
+                membrane: Some(1.),
+                bending: Some(0.6),
+                shear: [Some(1.), Some(0.6)],
             }
         );
         assert_eq!(
@@ -432,7 +456,8 @@ mod material_tests {
                 nu: None,
                 width: 0.2,
                 height: 0.2,
-                density: Some(0.0101972)
+                density: Some(0.0101972),
+                stiffness: None,
             }
         );
     }

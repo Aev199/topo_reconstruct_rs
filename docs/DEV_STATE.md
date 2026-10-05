@@ -362,6 +362,35 @@ network policy: command names come from PLAXIS command logs quoted in
 search results and plxscripting 1.0.4 from PyPI. Not verified against a
 real PLAXIS 3D 2022 yet (Windows + licence needed).
 
+Re-audit of 9419b92 (2026-10-05), fixed:
+- R1 effective stiffness: the parser keeps the numeric EF/EIy/EIz/GIk of
+  a bar type and WLKE/PLKE/WLKG/PLKG of a shell; export mode `effective`
+  (default) gives A = EF/E, I3 = EIy/E, I2 = EIz/E and, for shells, an
+  equivalent thickness and E keeping membrane and bending stiffness and
+  the weight; `nominal` uses b x h and the GEI values. What cannot be
+  transferred (GIk, WLKG/PLKG) is listed per material.
+- I2/I3 and orientation (PLAXIS Reference Manual: section height along
+  local axis 2, I3 = width x height^3 / 12): local axis 2 = LIRA Z1 by the
+  LIRA default rule (upward in the bar's vertical plane, global X for a
+  vertical bar); the loader sets the line's AxisFunction Manual / Axis2
+  for rectangular sections and reports when PLAXIS refuses. LIRA rotation
+  angles of sections are not read (warning in the file).
+- R3 property sets from Bentley's table: plates Identification/d/
+  Isotropic/StructNu12/Gamma (V22.02+), D3d (V22.00), MaterialName/d/
+  IsIsotropic/Nu12/w (V21); beams CrossSectionType "User-defined", A/I2/I3/
+  E/Gamma (V21: BeamType, Iyy/Izz, w). `setmaterial` as PLAXIS logs it. A
+  failed run deletes the objects it created.
+- R4 materials come from the opened input bytes, not the file on disk.
+- R2/R5/R6 bars: `bars::axis_defects` (node off the straight bar, nodes not
+  strictly ordered or closer than the minimum edge, ends not nodes at 0/1,
+  empty spans) is a failure in the Rust audit (`broken_bar`) and the
+  session refuses any edit adding one; a bar end slid along its line keeps
+  its spans and refuses passing an interior node; connect-to-surfaces works
+  on the chosen bar with every bar guarding its nodes and also splits
+  contours a bar lying in a surface's plane crosses; connect-bars slides an
+  interior node onto the crossing. The assembly checker checks node order
+  of edited bars. Zero-length beam pieces are skipped with a warning.
+
 ## Next coherent development batch
 
 - Use the editor on the Багратион v4 residuals and record what the edits

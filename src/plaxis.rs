@@ -52,6 +52,27 @@ pub struct Units {
     pub unit_weight: &'static str,
 }
 
+/// Which stiffness of a LIRA type goes to PLAXIS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StiffnessMode {
+    /// The stiffness the LIRA model computes with: the numeric EF, EIy, EIz
+    /// of a bar type, the WLKE/PLKE factors of a shell.
+    Effective,
+    /// From E and the section dimensions only.
+    Nominal,
+}
+
+/// Export settings.
+#[derive(Debug, Clone, Copy)]
+pub struct Settings {
+    /// Force unit of the model in kN (LIRA t: 9.80665).
+    pub force_factor: f64,
+    /// Cuts of holed surfaces avoid edges shorter than this.
+    pub min_edge: f64,
+    pub stiffness: StiffnessMode,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PlateMaterial {
     pub name: String,
@@ -62,6 +83,9 @@ pub struct PlateMaterial {
     pub nu: f64,
     pub d: f64,
     pub gamma: f64,
+    /// How the values were derived from the LIRA type (what was changed or
+    /// could not be transferred).
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,14 +94,17 @@ pub struct BeamMaterial {
     pub stiffness: u32,
     pub e: f64,
     pub nu: f64,
-    /// Rectangle b x h (m): area, second moments (I2 about the width axis,
-    /// I3 about the height axis), unit weight (kN/m3).
+    /// LIRA section b (along local Y1) x h (along Z1), m.
     pub width: f64,
     pub height: f64,
+    /// Area and second moments in PLAXIS terms: the beam's local axis 2 is
+    /// the LIRA Z1 axis (the section height, PLAXIS "Height in local
+    /// direction 2"), so I3 (bending about axis 3) is LIRA Iy and I2 is Iz.
     pub a: f64,
     pub i2: f64,
     pub i3: f64,
     pub gamma: f64,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -98,6 +125,10 @@ pub struct Beam {
     pub material: Option<String>,
     pub start: [f64; 3],
     pub end: [f64; 3],
+    /// Local axis 2 of the beam (the LIRA Z1 axis by the LIRA default rule:
+    /// the upward normal of the bar in its vertical plane, global X for a
+    /// vertical bar). LIRA rotation angles of sections are not read.
+    pub axis2: [f64; 3],
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -105,6 +136,9 @@ pub struct Exchange {
     pub format: &'static str,
     pub source: String,
     pub units: Units,
+    pub stiffness: StiffnessMode,
+    /// What the file does not carry or approximates.
+    pub warnings: Vec<String>,
     pub plate_materials: Vec<PlateMaterial>,
     pub beam_materials: Vec<BeamMaterial>,
     pub plates: Vec<Plate>,
@@ -546,36 +580,72 @@ fn cut_holes(contours: &[Vec<[f64; 2]>], min_edge: f64) -> Vec<Vec<[f64; 2]>> {
 pub fn exchange(
     state: &State,
     materials: &HashMap<u32, Material>,
-    force_factor: f64,
-    min_edge: f64,
+    settings: Settings,
     source: &str,
 ) -> Exchange {
+    let Settings {
+        force_factor,
+        min_edge,
+        stiffness: mode,
+    } = settings;
     let model = &state.model;
+    let mut warnings = vec![];
     let mut missing = std::collections::BTreeSet::new();
     let mut plate_materials = BTreeMap::new();
     let mut beam_materials = BTreeMap::new();
     let mut plate_material = |id: u32| -> Option<String> {
-        if let Some(Material::Plate {
+        let Some(&Material::Plate {
             e,
             nu,
             thickness,
             density,
+            membrane,
+            bending,
+            shear,
         }) = materials.get(&id)
-        {
-            let name = format!("GEI_{id}_h{:.0}", thickness * 1000.);
-            plate_materials.entry(id).or_insert_with(|| PlateMaterial {
+        else {
+            missing.insert(id);
+            return None;
+        };
+        let name = format!("GEI_{id}_h{:.0}", thickness * 1000.);
+        plate_materials.entry(id).or_insert_with(|| {
+            let mut notes = vec![];
+            let (km, kb) = (membrane.unwrap_or(1.), bending.unwrap_or(1.));
+            let (mut e, mut d, mut gamma) = (e, thickness, density.unwrap_or(0.));
+            if (km - 1.).abs() > 1e-12 || (kb - 1.).abs() > 1e-12 {
+                if mode == StiffnessMode::Effective && km > 0. && kb > 0. {
+                    // E'd' = E d km and E'd'^3 = E d^3 kb keep the membrane
+                    // and bending stiffness; gamma' d' = gamma d the weight.
+                    let d2 = thickness * (kb / km).sqrt();
+                    e = e * km * thickness / d2;
+                    gamma = gamma * thickness / d2;
+                    d = d2;
+                    notes.push(format!(
+                        "WLKE {km}, PLKE {kb}: equivalent thickness {d2:.4} m and E keep the membrane and bending stiffness and the weight"
+                    ));
+                } else {
+                    notes.push(format!("WLKE {km}, PLKE {kb} not applied (nominal stiffness)"));
+                }
+            }
+            if shear.iter().flatten().any(|g| (g - 1.).abs() > 1e-12) {
+                let show = |g: Option<f64>| g.map_or("-".to_string(), |g| g.to_string());
+                notes.push(format!(
+                    "WLKG {}, PLKG {} not transferable: PLAXIS derives G from E and nu",
+                    show(shear[0]),
+                    show(shear[1])
+                ));
+            }
+            PlateMaterial {
                 name: name.clone(),
                 stiffness: id,
                 e: e * force_factor,
-                nu: *nu,
-                d: *thickness,
-                gamma: density.unwrap_or(0.) * force_factor,
-            });
-            Some(name)
-        } else {
-            missing.insert(id);
-            None
-        }
+                nu,
+                d,
+                gamma: gamma * force_factor,
+                notes,
+            }
+        });
+        Some(name)
     };
     let mut cut_surfaces = 0;
     let mut triangulated_surfaces = 0;
@@ -640,32 +710,67 @@ pub fn exchange(
                 _ => runs.push((span.stiffness, span.start_t, span.end_t)),
             }
         }
+        let along = (q - p).normalize();
+        // LIRA default local axes: Z1 in the vertical plane of the bar,
+        // upwards; global X for a vertical bar.
+        let horizontal = DVec3::new(along.x, along.y, 0.).length();
+        let axis2 = if horizontal < 1e-9 {
+            DVec3::X
+        } else {
+            (DVec3::Z - along * along.z).normalize()
+        };
         for (stiffness, t0, t1) in runs {
+            if (t1 - t0) * p.distance(q) <= model.precision() {
+                warnings.push(format!("bar {k}: zero-length piece [{t0}, {t1}] skipped"));
+                continue;
+            }
             let material = match materials.get(&stiffness) {
-                Some(Material::Bar {
+                Some(&Material::Bar {
                     e,
                     nu,
                     width,
                     height,
                     density,
+                    stiffness: numeric,
                 }) => {
                     let name = format!("S0_{stiffness}_{:.0}x{:.0}", width * 100., height * 100.);
-                    let a = width * height;
-                    beam_materials
-                        .entry(stiffness)
-                        .or_insert_with(|| BeamMaterial {
+                    beam_materials.entry(stiffness).or_insert_with(|| {
+                        let mut notes = vec![];
+                        let nominal = (width * height, width * height.powi(3) / 12., height * width.powi(3) / 12.);
+                        let (a, iy, iz) = match (mode, numeric) {
+                            (StiffnessMode::Effective, Some([ef, eiy, eiz, _])) => {
+                                notes.push(format!(
+                                    "EA, EIy, EIz from the LIRA type ({:.3}, {:.3}, {:.3} of nominal); GIk not transferable (PLAXIS derives J)",
+                                    ef / e / nominal.0,
+                                    eiy / e / nominal.1,
+                                    eiz / e / nominal.2
+                                ));
+                                (ef / e, eiy / e, eiz / e)
+                            }
+                            (StiffnessMode::Nominal, Some(_)) => {
+                                notes.push("nominal b x h stiffness; the LIRA type gives other EF/EI".into());
+                                nominal
+                            }
+                            _ => nominal,
+                        };
+                        if (width - height).abs() > 1e-9 {
+                            notes.push("rectangular: orientation from the LIRA default local axes".into());
+                        }
+                        BeamMaterial {
                             name: name.clone(),
                             stiffness,
                             e: e * force_factor,
                             nu: nu.unwrap_or(0.2),
-                            width: *width,
-                            height: *height,
+                            width,
+                            height,
                             a,
-                            i2: width * height.powi(3) / 12.,
-                            i3: height * width.powi(3) / 12.,
-                            // RO of a bar is per length.
+                            i2: iz,
+                            i3: iy,
+                            // RO of a bar is per length; PLAXIS weighs gamma x A.
                             gamma: density.unwrap_or(0.) / a * force_factor,
-                        });
+                            notes,
+                        }
+                    });
                     Some(name)
                 }
                 _ => {
@@ -679,12 +784,19 @@ pub fn exchange(
                 material,
                 start: p.lerp(q, t0).to_array(),
                 end: p.lerp(q, t1).to_array(),
+                axis2: axis2.to_array(),
             });
         }
     }
+    warnings.push("LIRA rotation angles of bar sections are not read: the LIRA default local axes are assumed".into());
+    warnings.push(
+        "loads, supports, releases, eccentricities, soils and stages are not exported".into(),
+    );
     Exchange {
         format: "topo-plaxis-1",
         source: source.into(),
+        stiffness: mode,
+        warnings,
         units: Units {
             length: "m",
             force_factor,
@@ -788,5 +900,112 @@ mod tests {
         assert!((t - 84.).abs() < 1e-9, "{t}");
         // Without holes the contour is kept as it is.
         assert_eq!(hole_free(&[outer.clone()], 0.), vec![outer]);
+    }
+
+    #[test]
+    fn stiffness_modes_axes_and_shell_factors() {
+        use crate::reconstruction::assembly::bars::{Anchor, Axis};
+        use crate::reconstruction::assembly::junctions::tests::{build, slab, Placement};
+        use crate::reconstruction::recognize::SourceSpan;
+        let place = &Placement::all()[0];
+        let mut model = build(place, &[slab(0., 4.)]);
+        let mut axis = |m: &mut crate::reconstruction::Model, a: [f64; 3], b: [f64; 3]| {
+            let (va, vb) = (m.add_vertex(a).unwrap(), m.add_vertex(b).unwrap());
+            Axis {
+                source_axis: 0,
+                endpoints: [va, vb],
+                anchors: vec![
+                    Anchor {
+                        source_node: 0,
+                        vertex: va,
+                        t: 0.,
+                    },
+                    Anchor {
+                        source_node: 1,
+                        vertex: vb,
+                        t: 1.,
+                    },
+                ],
+                spans: vec![SourceSpan {
+                    element: 1,
+                    stiffness: 5,
+                    start_t: 0.,
+                    end_t: 1.,
+                }],
+            }
+        };
+        let beam = axis(&mut model, [0., 1., 3.], [4., 1., 3.]);
+        let column = axis(&mut model, [1., 1., 0.], [1., 1., 3.]);
+        let state = State {
+            model,
+            axes: vec![beam, column],
+            contacts: vec![],
+            stiffness: vec![7],
+            patches: vec![0],
+            removed: vec![],
+            removed_bars: vec![],
+            joints: Default::default(),
+        };
+        let mut materials = HashMap::new();
+        // 0.5 x 0.8 m with EIy 0.6 and EIz 0.6 of nominal (skala type 1).
+        materials.insert(
+            5,
+            Material::Bar {
+                e: 3e6,
+                nu: Some(0.2),
+                width: 0.5,
+                height: 0.8,
+                density: Some(1.),
+                stiffness: Some([1.2e6, 38400., 15000., 22572.8]),
+            },
+        );
+        materials.insert(
+            7,
+            Material::Plate {
+                e: 3e6,
+                nu: 0.2,
+                thickness: 0.2,
+                density: Some(2.5),
+                membrane: Some(1.),
+                bending: Some(0.6),
+                shear: [None, None],
+            },
+        );
+        let settings = |stiffness| Settings {
+            force_factor: 1.,
+            min_edge: 0.05,
+            stiffness,
+        };
+        let x = exchange(
+            &state,
+            &materials,
+            settings(StiffnessMode::Effective),
+            "test",
+        );
+        let m = &x.beam_materials[0];
+        assert!((m.a - 0.4).abs() < 1e-12);
+        // Height along PLAXIS local axis 2 (LIRA Z1): I3 = EIy / E.
+        assert!((m.i3 - 38400. / 3e6).abs() < 1e-12 && (m.i2 - 15000. / 3e6).abs() < 1e-12);
+        assert!((m.gamma * m.a - 1.).abs() < 1e-12);
+        // Z1 of a horizontal bar points up; of a vertical one along X.
+        assert_eq!(x.beams[0].axis2, [0., 0., 1.]);
+        assert_eq!(x.beams[1].axis2, [1., 0., 0.]);
+        let p = &x.plate_materials[0];
+        let (e, d) = (p.e, p.d);
+        assert!((e * d - 3e6 * 0.2).abs() < 1e-6, "membrane E d kept");
+        assert!(
+            (e * d.powi(3) - 0.6 * 3e6 * 0.2f64.powi(3)).abs() < 1e-6,
+            "bending E d^3 x PLKE"
+        );
+        assert!(
+            (p.gamma * d - 2.5 * 0.2).abs() < 1e-12,
+            "weight per area kept"
+        );
+        let n = exchange(&state, &materials, settings(StiffnessMode::Nominal), "test");
+        let m = &n.beam_materials[0];
+        assert!((m.i3 - 0.5 * 0.8f64.powi(3) / 12.).abs() < 1e-12);
+        assert!((m.i2 - 0.8 * 0.5f64.powi(3) / 12.).abs() < 1e-12);
+        assert!(!m.notes.is_empty());
+        assert_eq!(n.plate_materials[0].d, 0.2);
     }
 }

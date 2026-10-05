@@ -432,6 +432,11 @@ def check(data, baseline=None):
         a, b = (vertices[v] for v in axis["endpoints"])
         assert math.dist(a, b) > epsilon
         if axis["source_axis"] in user_bars:
+            ts = [x["t"] for x in axis["anchors"]]
+            nodes = [x["vertex"] for x in axis["anchors"]]
+            # Ordered, distinct nodes from end to end.
+            assert ts == sorted(ts) and len(set(ts)) == len(ts) and len(set(nodes)) == len(nodes)
+            assert (nodes[0], ts[0]) == (axis["endpoints"][0], 0) and (nodes[-1], ts[-1]) == (axis["endpoints"][1], 1)
             for anchor in axis["anchors"]:
                 assert 0 <= anchor["t"] <= 1
                 interpolated = [x + (y - x) * anchor["t"] for x, y in zip(a, b)]

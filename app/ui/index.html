@@ -58,6 +58,11 @@
       <label>Порт <input id="plx-port" type="number" value="10000"></label>
       <label>Пароль <input id="plx-password" type="password"></label>
       <label>Python с plxscripting <input id="plx-python" placeholder="авто: Python из поставки PLAXIS"></label>
+      <label>Жёсткость
+        <select id="plx-stiffness">
+          <option value="effective">расчётная из ЛИРА (EF, EI, коэффициенты WLKE/PLKE)</option>
+          <option value="nominal">номинальная по размерам сечения</option>
+        </select></label>
       <label>Единица силы ЛИРА → кН <input id="plx-factor" type="number" step="any" value="9.80665"></label>
       <label><input id="plx-new" type="checkbox"> начать новый проект</label>
       <label><input id="plx-shift" type="checkbox"> сдвинуть модель к началу координат</label>

@@ -5,6 +5,7 @@
 //! input, the profile and the journal, and every replayed edit is checked
 //! against the geometry it was made on.
 use crate::audit::{self, Class};
+use crate::reconstruction::assembly::bars;
 use crate::reconstruction::assembly::edit::State;
 use crate::reconstruction::assembly::Report;
 use serde::{Deserialize, Serialize};
@@ -250,6 +251,20 @@ impl Session {
         let check = Self::check_of(&self.state, &edit);
         let mut trial = self.state.clone();
         let outcome = Self::execute(&mut trial, &edit)?;
+        // Whatever an operation reports, it must not break a bar: a node
+        // off its straight bar, nodes out of order or coincident, an empty
+        // span (the green audit verdicts alone do not catch all of these).
+        let before: std::collections::BTreeSet<String> =
+            bars::axis_defects(&self.state.model, &self.state.axes)
+                .into_iter()
+                .map(|(_, d)| d)
+                .collect();
+        if let Some((axis, defect)) = bars::axis_defects(&trial.model, &trial.axes)
+            .into_iter()
+            .find(|(_, d)| !before.contains(d))
+        {
+            return Err(format!("bar_invariant: bar {axis}: {defect}"));
+        }
         self.state = trial;
         self.journal.push(Entry {
             edit,

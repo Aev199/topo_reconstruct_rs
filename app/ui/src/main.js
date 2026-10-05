@@ -27,6 +27,7 @@ const KIND = {
   bar_near_miss: 'Стержни рядом',
   bar_surface_near_miss: 'Стержень рядом с поверхностью',
   short_bar: 'Короткий стержень',
+  broken_bar: 'Нарушено представление стержня',
 };
 const CLASS = { failure: 'ошибка', plaxis: 'PLAXIS', review: 'обзор' };
 const OP = {
@@ -99,6 +100,8 @@ function explain(message) {
     ['node_off_bar', 'Отклонено: узел ушёл бы со своего стержня.'],
     ['no_crossing_to_share', 'Нечего связывать: свободных пересечений не найдено.'],
     ['already_connected', 'Уже связано общим ребром.'],
+    ['bar_invariant', 'Отклонено: правка нарушила бы стержень (узел вне оси, совпадающие узлы или пустой участок).'],
+    ['node_beyond', 'Отклонено: узел вышел бы за соседний узел или конец стержня.'],
     ['plaxis_loader_failed', 'Загрузчик PLAXIS завершился с ошибкой — проверьте, что PLAXIS Input открыт, сервер скриптов включён, порт и пароль верны.'],
     ['no Python with plxscripting', 'Не найден Python с plxscripting — укажите путь к python.exe из поставки PLAXIS.'],
     ['no_junction', 'Поверхности не пересекаются и не примыкают.'],
@@ -478,7 +481,7 @@ $('export-report').onclick = async () => {
 };
 
 /// PLAXIS settings of the dialog, remembered per viewer.
-const PLAXIS_FIELDS = ['plx-port', 'plx-python', 'plx-factor', 'plx-new', 'plx-shift'];
+const PLAXIS_FIELDS = ['plx-port', 'plx-python', 'plx-factor', 'plx-stiffness', 'plx-new', 'plx-shift'];
 function loadPlaxisSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem('plaxis') || '{}');
@@ -507,12 +510,13 @@ $('export-plaxis').onclick = async () => {
   const path = await pickFile('plaxis', true);
   if (!path) return;
   const exported = await busy('Подготовка файла обмена PLAXIS…', () => call('export_plaxis', {
-    path, force_factor: Number($('plx-factor').value) || 9.80665,
+    path, force_factor: Number($('plx-factor').value) || 9.80665, stiffness: $('plx-stiffness').value,
   }));
   if (!exported) return;
   const missing = exported.missing_materials.length ? `; без материала жёсткости: ${exported.missing_materials.join(', ')}` : '';
+  const notes = exported.material_notes.length ? `; пересчитано материалов: ${exported.material_notes.length}` : '';
   const text = `плит ${exported.plates} (полигонов ${exported.polygons}, с отверстиями разрезано ${exported.cut_surfaces}), `
-    + `балок ${exported.beams}, материалов ${exported.plate_materials}+${exported.beam_materials}${missing}`;
+    + `балок ${exported.beams}, материалов ${exported.plate_materials}+${exported.beam_materials}${missing}${notes}`;
   if (choice === 'file') {
     status(`Файл обмена сохранён: ${path} (${text}). Загрузчик: ${exported.script}`);
     return;
@@ -527,7 +531,9 @@ $('export-plaxis').onclick = async () => {
   }));
   if (result) {
     const r = result.report;
-    status(`PLAXIS: создано плит ${r.plates ?? '?'}, балок ${r.beams ?? '?'}, материалов ${r.plate_materials ?? '?'}+${r.beam_materials ?? '?'} за ${r.seconds ?? '?'} с (${text})`);
+    const oriented = r.rectangular_beams ? `, ориентировано прямоугольных балок ${r.oriented_beams}/${r.rectangular_beams}` : '';
+    status(`PLAXIS: создано плит ${r.plates ?? '?'}, балок ${r.beams ?? '?'}, материалов ${r.plate_materials ?? '?'}+${r.beam_materials ?? '?'}${oriented} за ${r.seconds ?? '?'} с (${text})`,
+      r.rectangular_beams > r.oriented_beams);
   }
 };
 

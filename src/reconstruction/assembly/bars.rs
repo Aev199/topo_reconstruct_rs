@@ -73,6 +73,53 @@ pub struct Report {
     pub imprinted: Vec<Imprint>,
 }
 
+/// Broken invariants of a bar axis: nodes off the straight bar, nodes not
+/// in strictly increasing order, coincident or too close consecutive nodes,
+/// ends that are not nodes at 0 and 1, empty source spans. `(axis, what)`.
+pub fn axis_defects(model: &Model, axes: &[Axis]) -> Vec<(usize, String)> {
+    let precision = model.precision;
+    let mut out = vec![];
+    for (i, axis) in axes.iter().enumerate() {
+        let [a, b] = axis.endpoints.map(|v| DVec3::from_array(model.vertices[v]));
+        if a.distance(b) <= model.minimum_edge {
+            out.push((i, "zero_length_bar".into()));
+            continue;
+        }
+        let first = axis.anchors.first().map(|n| (n.vertex, n.t));
+        let last = axis.anchors.last().map(|n| (n.vertex, n.t));
+        if first != Some((axis.endpoints[0], 0.)) || last != Some((axis.endpoints[1], 1.)) {
+            out.push((i, "bar_ends_not_nodes".into()));
+        }
+        for w in axis.anchors.windows(2) {
+            let (p, q) = (
+                DVec3::from_array(model.vertices[w[0].vertex]),
+                DVec3::from_array(model.vertices[w[1].vertex]),
+            );
+            if w[1].t <= w[0].t || w[0].vertex == w[1].vertex || p.distance(q) < model.minimum_edge
+            {
+                out.push((
+                    i,
+                    format!("degenerate_bar_piece {}-{}", w[0].vertex, w[1].vertex),
+                ));
+            }
+        }
+        for n in &axis.anchors {
+            let p = DVec3::from_array(model.vertices[n.vertex]);
+            if p.distance(a.lerp(b, n.t)) > 10. * precision {
+                out.push((i, format!("bar_node_off_axis {}", n.vertex)));
+            }
+        }
+        if axis
+            .spans
+            .iter()
+            .any(|s| !(s.start_t >= 0. && s.start_t < s.end_t && s.end_t <= 1.))
+        {
+            out.push((i, "empty_bar_span".into()));
+        }
+    }
+    out
+}
+
 /// Anchor source node of a generated bar-surface crossing.
 pub const NO_SOURCE_NODE: u32 = u32::MAX;
 
@@ -106,6 +153,16 @@ pub struct Imprint {
 /// along its bar onto the crossing: the bar stays straight and shares the
 /// node with the surface.
 pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
+    imprint_crossings_of(model, axes, None)
+}
+
+/// `imprint_crossings` for one axis (`Some(i)`), every other axis still
+/// guarding the nodes it shares.
+pub fn imprint_crossings_of(
+    model: &mut Model,
+    axes: &mut [Axis],
+    only: Option<usize>,
+) -> Vec<Imprint> {
     let precision = model.precision;
     let minimum = model.minimum_edge;
     let boxes: Vec<(DVec3, DVec3)> = (0..model.surfaces.len())
@@ -122,6 +179,9 @@ pub fn imprint_crossings(model: &mut Model, axes: &mut [Axis]) -> Vec<Imprint> {
         .collect();
     let mut out = vec![];
     for i in 0..axes.len() {
+        if only.is_some_and(|o| o != i) {
+            continue;
+        }
         let [ea, eb] = axes[i].endpoints;
         let a = DVec3::from_array(model.vertices[ea]);
         let b = DVec3::from_array(model.vertices[eb]);
