@@ -8,7 +8,7 @@ use topo_reconstruct_rs::pipeline::{self, Options, Profile};
 /// A 6 x 4 m slab of 1 m plates (tensor-product numbering for the elements
 /// of even index, perimeter order for the others), `n` loaded by case:
 /// case 1: 2 tf/m2 downward on the left half, 3 on the right half (global);
-/// case 2: a line load along the slab's edge nodes 1-2 of element 1.
+/// case 2: a line load along the edge nodes 1-2 of element 1 (positive values act against the axes, as in LIRA).
 fn source(transform: impl Fn(DVec3) -> DVec3) -> String {
     let (nx, ny) = (6usize, 4usize);
     let node = |i: usize, j: usize| j * (nx + 1) + i + 1;
@@ -46,7 +46,7 @@ fn source(transform: impl Fn(DVec3) -> DVec3) -> String {
     format!(
         "( 0/ 1; SLAB/ 2; 5/\n39;\n1: LEFT RIGHT ;\n2: EDGE ;\n/\n)\n\
          ( 1/\n{elements})\n( 3/\n1 GEI 0.305915 0.17 0.2 RO 0.254929 /\n)\n( 4/\n{nodes})\n\
-         ( 6/\n{loads})\n( 7/\n1 -2 0 / 2 -3 0 / 3 1 2 -4 /\n)\n"
+         ( 6/\n{loads})\n( 7/\n1 2 0 / 2 3 0 / 3 1 2 4 /\n)\n"
     )
 }
 

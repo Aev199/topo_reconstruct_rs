@@ -439,6 +439,28 @@ strict audit and PLAXIS profile pass; ЖК Остров PLAXIS items gap 60 -> 4
 short edge 27 -> 24, sharp corner 4 -> 5; all other fixtures unchanged
 (strict 12/13, v4 the same residuals).
 
+## Load transfer (2026-10-05)
+
+Static loads are parsed from the source LIRA file (`parsers/loads.rs`) and
+mapped onto the reconstructed geometry (`loads.rs`): node forces → point
+loads, bar and plate-edge loads → line loads along the bar axes, plate
+pressures → surface loads on hole-free polygons (whole surface when all its
+elements carry the value, otherwise the region of the elements clipped to the
+surface contour; at most 40 value groups per surface). Plate stamps (code
+5/15 point forces) are clustered by case, direction, level and force and
+spread evenly over their elements. Cross-checked against the user's
+Lira_Midas-converter: the sign of forces is reversed (positive LIRA value acts
+against the axis; verified by the wind case names X±/Y± and gravity cases);
+rows of doc 6 without a case number belong to the previous case (one fixture
+has 1.5 M such rows). Per-case resultants of source and exported loads agree
+(1e-5 on скала1/2/3, up to 3 % on тест 5 and Для testa where clipping to the
+contours loses small areas); loads on plate elements not in the geometry are
+reported separately. Skipped (static settlement task): thermal, dynamic,
+stage codes 8/88, prescribed displacements, plate moments, arbitrary
+trapezoids on plates. Loader: `pointload/lineload/surfload`, phases per case —
+not verified against a real PLAXIS yet (command and property names from the
+documentation).
+
 ## Next coherent development batch
 
 - Use the editor on the Багратион v4 residuals and record what the edits
@@ -449,7 +471,6 @@ short edge 27 -> 24, sharp corner 4 -> 5; all other fixtures unchanged
 
 ### Also pending
 
-- Load transfer (loads are not in the reconstruction input).
 - Rigid-body/coupled-displacement docs other than LIRA block 25 (the
   "объединение перемещений" block is not identified yet).
 - The LIRA units block (33/) is not read: lengths and plate thickness are

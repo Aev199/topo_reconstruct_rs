@@ -110,24 +110,43 @@ pub fn parse(content: &[u8]) -> LoadSet {
     };
     if let Some(block) = LiraParser::extract_block(content, b"6") {
         let rows: Vec<&[u8]> = block.split(|&b| b == b'/').collect();
-        set.rows = rows
+        // A row without a case number belongs to the case of the row before.
+        let parsed: Vec<(LoadRow, bool)> = rows
             .par_iter()
             .filter_map(|row| {
                 let mut words = LiraParser::split_ascii_whitespace_bytes(row);
-                let (target, code, direction, parameters, case) = (
-                    integer(words.next()?)?,
+                let (target, code, direction, parameters) = (
                     integer(words.next()?)?,
                     integer(words.next()?)?,
                     integer(words.next()?)?,
                     integer(words.next()?)?,
                 );
-                words.next().is_none().then_some(LoadRow {
-                    target,
-                    code: u16::try_from(code).ok()?,
-                    direction: u8::try_from(direction).ok()?,
-                    parameters,
-                    case,
-                })
+                let case = match words.next() {
+                    Some(word) => Some(integer(word)?),
+                    None => None,
+                };
+                words.next().is_none().then_some((
+                    LoadRow {
+                        target,
+                        code: u16::try_from(code).ok()?,
+                        direction: u8::try_from(direction).ok()?,
+                        parameters,
+                        case: case.unwrap_or(0),
+                    },
+                    case.is_some(),
+                ))
+            })
+            .collect();
+        let mut current = 1;
+        set.rows = parsed
+            .into_iter()
+            .map(|(mut row, has_case)| {
+                if has_case {
+                    current = row.case;
+                } else {
+                    row.case = current;
+                }
+                row
             })
             .collect();
     }
@@ -199,6 +218,13 @@ mod tests {
         assert_eq!(s.parameters(9), &[] as &[f64]);
         assert_eq!(s.node_axes[&5], [DVec3::X, DVec3::Y]);
         assert_eq!(s.element_axes[&7], vec![0., 0., 1.]);
+    }
+
+    #[test]
+    fn rows_without_a_case_number_belong_to_the_case_before() {
+        let text = "( 6/\n 1 16 3 1 2 / 2 16 3 1 / 3 16 3 1 / 4 16 3 1 5 / 5 16 3 1 /\n)\n( 7/ 1 1 / )\n";
+        let cases: Vec<u32> = parse(text.as_bytes()).rows.iter().map(|r| r.case).collect();
+        assert_eq!(cases, vec![2, 2, 2, 5, 5]);
     }
 
     #[test]

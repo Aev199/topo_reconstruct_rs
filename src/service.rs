@@ -501,6 +501,9 @@ impl Service {
         if args.get("new").and_then(Value::as_bool).unwrap_or(false) {
             command.arg("--new");
         }
+        if args.get("phases").and_then(Value::as_bool) == Some(false) {
+            command.arg("--no-phases");
+        }
         if args
             .get("shift_to_origin")
             .and_then(Value::as_bool)

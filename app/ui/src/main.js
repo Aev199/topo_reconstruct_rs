@@ -111,6 +111,7 @@ function explain(message) {
     ['already_connected', 'Уже связано общим ребром.'],
     ['bar_invariant', 'Отклонено: правка нарушила бы стержень (узел вне оси, совпадающие узлы или пустой участок).'],
     ['node_beyond', 'Отклонено: узел вышел бы за соседний узел или конец стержня.'],
+    ['input_changed', 'Файл модели ЛИРА изменился после открытия — откройте его заново, чтобы перенести нагрузки, или снимите галочку «перенести нагрузки».'],
     ['plaxis_loader_failed', 'Загрузчик PLAXIS завершился с ошибкой — проверьте, что PLAXIS Input открыт, сервер скриптов включён, порт и пароль верны.'],
     ['no Python with plxscripting', 'Не найден Python с plxscripting — укажите путь к python.exe из поставки PLAXIS.'],
     ['no_junction', 'Поверхности не пересекаются и не примыкают.'],
@@ -517,7 +518,7 @@ $('export-report').onclick = async () => {
 };
 
 /// PLAXIS settings of the dialog, remembered per viewer.
-const PLAXIS_FIELDS = ['plx-port', 'plx-python', 'plx-factor', 'plx-stiffness', 'plx-new', 'plx-shift'];
+const PLAXIS_FIELDS = ['plx-port', 'plx-python', 'plx-factor', 'plx-stiffness', 'plx-new', 'plx-shift', 'plx-loads', 'plx-phases'];
 function loadPlaxisSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem('plaxis') || '{}');
@@ -531,6 +532,28 @@ function savePlaxisSettings() {
     localStorage.setItem('plaxis', JSON.stringify(Object.fromEntries(
       PLAXIS_FIELDS.map((id) => [id, $(id).type === 'checkbox' ? $(id).checked : $(id).value]))));
   } catch { /* storage unavailable */ }
+}
+
+/// The load transfer in a line: cases, loads, the worst disagreement of a
+/// case resultant between the source and the exported loads, what was skipped.
+function loadsSummary(exported) {
+  const report = exported.load_report;
+  if (!report) return '';
+  const norm = (v) => Math.hypot(...v);
+  let worst = 0;
+  for (const c of report.cases) {
+    const base = norm(c.source);
+    if (base > 1) worst = Math.max(worst, norm(c.source.map((x, i) => x - c.exported[i])) / base);
+  }
+  const skipped = Object.entries(report.skipped).map(([what, n]) => `${what}: ${n}`).join('; ');
+  return `, нагрузок ${exported.loads} в ${report.cases.length} загружениях, расхождение равнодействующих до ${(worst * 100).toFixed(1)}%`
+    + (skipped ? `, не перенесено — ${skipped}` : '');
+}
+function loadWarnings(r) {
+  const l = r.loads;
+  if (!l) return '';
+  const refused = Object.entries(l.refused || {}).map(([k, n]) => `${k} ${n}`).join(', ');
+  return refused ? ` · PLAXIS отклонил нагрузки: ${refused}` : '';
 }
 
 $('export-plaxis').onclick = async () => {
@@ -547,14 +570,16 @@ $('export-plaxis').onclick = async () => {
   if (!path) return;
   const exported = await busy('Подготовка файла обмена PLAXIS…', () => call('export_plaxis', {
     path, force_factor: Number($('plx-factor').value) || 9.80665, stiffness: $('plx-stiffness').value,
+    loads: $('plx-loads').checked,
   }));
   if (!exported) return;
   const missing = exported.missing_materials.length ? `; без материала жёсткости: ${exported.missing_materials.join(', ')}` : '';
   const notes = exported.material_notes.length ? `; пересчитано материалов: ${exported.material_notes.length}` : '';
   const text = `плит ${exported.plates} (полигонов ${exported.polygons}, с отверстиями разрезано ${exported.cut_surfaces}), `
     + `балок ${exported.beams}, материалов ${exported.plate_materials}+${exported.beam_materials}${missing}${notes}`;
+  const loadsText = loadsSummary(exported);
   if (choice === 'file') {
-    status(`Файл обмена сохранён: ${path} (${text}). Загрузчик: ${exported.script}`);
+    status(`Файл обмена сохранён: ${path} (${text}${loadsText}). Загрузчик: ${exported.script}`);
     return;
   }
   const result = await busy('Построение модели в PLAXIS…', () => call('run_plaxis', {
@@ -563,13 +588,14 @@ $('export-plaxis').onclick = async () => {
     password: $('plx-password').value,
     python: $('plx-python').value.trim(),
     new: $('plx-new').checked,
+    phases: $('plx-phases').checked,
     shift_to_origin: $('plx-shift').checked,
   }));
   if (result) {
     const r = result.report;
     const oriented = r.rectangular_beams ? `, ориентировано прямоугольных балок ${r.oriented_beams}/${r.rectangular_beams}` : '';
-    status(`PLAXIS: создано плит ${r.plates ?? '?'}, балок ${r.beams ?? '?'}, материалов ${r.plate_materials ?? '?'}+${r.beam_materials ?? '?'}${oriented} за ${r.seconds ?? '?'} с (${text})`,
-      r.rectangular_beams > r.oriented_beams);
+    status(`PLAXIS: создано плит ${r.plates ?? '?'}, балок ${r.beams ?? '?'}, материалов ${r.plate_materials ?? '?'}+${r.beam_materials ?? '?'}${oriented} за ${r.seconds ?? '?'} с (${text}${loadsText})${loadWarnings(r)}`,
+      r.rectangular_beams > r.oriented_beams || !!loadWarnings(r));
   }
 };
 

@@ -206,6 +206,14 @@ fn frame(code: u16) -> u16 {
     code / 10
 }
 
+/// Sign of force loads. A positive value in a LIRA file acts against the
+/// positive axis it is given along: gravity loads are entered positive and
+/// the wind cases named after a direction (X+, Y-) push towards it only with
+/// the sign reversed (checked on the fixtures: the reversed resultants point
+/// as the case names say, in global and local axes alike). Moments keep
+/// their sign, as the existing LIRA to MIDAS converter does.
+const FORCE_SIGN: f64 = -1.0;
+
 fn skip(report: &mut Report, what: impl Into<String>) {
     *report.skipped.entry(what.into()).or_default() += 1;
 }
@@ -265,6 +273,19 @@ pub fn transfer(
     context.run()
 }
 
+/// A point force on a plate element (a "stamp" row of LIRA: the stamp's
+/// force given per element it covers).
+struct Stamp {
+    case: u32,
+    element: u32,
+    value: f64,
+    /// Unit direction of the force, sign included.
+    direction: DVec3,
+    area: f64,
+    /// Height of the element's centre along the force.
+    level: f64,
+}
+
 /// Pressure of a shell element (tf/m2, global).
 #[derive(Default, Clone, Copy)]
 struct Pressure {
@@ -293,6 +314,7 @@ impl Context<'_> {
         let mut edge_lines: BTreeMap<u32, Vec<(DVec3, DVec3, DVec3, DVec3)>> = BTreeMap::new();
         // Resultants of loads on plates that are not in the geometry.
         let mut lost: BTreeMap<u32, DVec3> = BTreeMap::new();
+        let mut stamps: Vec<Stamp> = vec![];
         let mut shell_geometry: HashMap<u32, Option<(Vec<DVec3>, [DVec3; 3], f64)>> = HashMap::new();
 
         for row in &self.set.rows {
@@ -319,12 +341,14 @@ impl Context<'_> {
                         skip(&mut report, "пластина с вырожденной геометрией");
                         continue;
                     };
-                    self.shell_row(row, params, &p, &axes, area, &mut pressure, &mut edge_lines, &mut report);
+                    self.shell_row(row, params, &p, &axes, area, &mut pressure, &mut edge_lines, &mut stamps, &mut report);
                 }
                 10 => self.bar_row(row, params, e, &mut bar_uniform, &mut bar_lines, &mut loads, &mut source, &mut report),
                 other => skip(&mut report, format!("нагрузка на элемент типа {other}")),
             }
         }
+
+        self.spread_stamps(&stamps, &mut pressure, &mut report);
 
         // ---- node loads
         for (&(case, node), &(force, moment)) in &node_loads {
@@ -460,6 +484,66 @@ impl Context<'_> {
         (loads, report)
     }
 
+    /// Stamp forces become pressures. The rows of one case, direction and
+    /// level with equal forces make one stamp: its total force is spread
+    /// evenly over the area of the elements it covers (so the pressure of
+    /// the stamp is uniform and the resultant is kept).
+    fn spread_stamps(
+        &self,
+        stamps: &[Stamp],
+        pressure: &mut BTreeMap<u32, HashMap<u32, Pressure>>,
+        report: &mut Report,
+    ) {
+        const FORCE_TOLERANCE: f64 = 1e-3;
+        let quantize = |x: f64, step: f64| (x / step).round() as i64;
+        let mut groups: BTreeMap<(u32, [i64; 3], i64), Vec<&Stamp>> = BTreeMap::new();
+        for stamp in stamps {
+            let key = (
+                stamp.case,
+                [0, 1, 2].map(|k| quantize(stamp.direction[k], 1e-6)),
+                quantize(stamp.level, 1e-3),
+            );
+            groups.entry(key).or_default().push(stamp);
+        }
+        for group in groups.values_mut() {
+            group.sort_by(|a, b| a.value.total_cmp(&b.value).then(a.element.cmp(&b.element)));
+            let mut start = 0;
+            while start < group.len() {
+                let first = group[start].value;
+                let end = (start..group.len())
+                    .find(|&i| (group[i].value - first).abs() > FORCE_TOLERANCE)
+                    .unwrap_or(group.len());
+                let cluster = &group[start..end];
+                let force: f64 = cluster.iter().map(|s| s.value).sum();
+                let mut elements: BTreeMap<u32, f64> = BTreeMap::new();
+                for s in cluster {
+                    elements.insert(s.element, s.area);
+                }
+                let area: f64 = elements.values().sum();
+                if area > 0. {
+                    let intensity = force / area;
+                    for &element in elements.keys() {
+                        pressure
+                            .entry(cluster[0].case)
+                            .or_default()
+                            .entry(element)
+                            .or_default()
+                            .vector += cluster[0].direction * intensity;
+                    }
+                    if cluster.len() > 1 {
+                        *report
+                            .approximated
+                            .entry("сосредоточенные силы на пластинах (штампы) заменены равномерным давлением на их элементы".into())
+                            .or_default() += 1;
+                    }
+                } else {
+                    skip(report, "сосредоточенная сила на пластине нулевой площади");
+                }
+                start = end;
+            }
+        }
+    }
+
     fn node_row(
         &self,
         row: &LoadRow,
@@ -480,6 +564,7 @@ impl Context<'_> {
             }
             None => axis * value,
         };
+        let vector = if row.direction <= 3 { vector * FORCE_SIGN } else { vector };
         let entry = node_loads.entry((row.case, row.target)).or_default();
         if row.direction <= 3 {
             entry.0 += vector;
@@ -498,6 +583,7 @@ impl Context<'_> {
         area: f64,
         pressure: &mut BTreeMap<u32, HashMap<u32, Pressure>>,
         edge_lines: &mut BTreeMap<u32, Vec<(DVec3, DVec3, DVec3, DVec3)>>,
+        stamps: &mut Vec<Stamp>,
         report: &mut Report,
     ) {
         let code = row.code;
@@ -512,6 +598,7 @@ impl Context<'_> {
             0 => axes[row.direction as usize - 1],
             _ => unit(row.direction).unwrap(),
         };
+        let direction = direction * FORCE_SIGN;
         if fr == 4 {
             *report.approximated.entry("нагрузки «выравнивания» приняты глобальными".into()).or_default() += 1;
         }
@@ -540,13 +627,20 @@ impl Context<'_> {
                 }
                 add(pressure, projected(direction) * mean);
             }
-            // A point force: spread over its element (the resultant is kept).
+            // A point force on a plate is a stamp: the forces of its elements
+            // are spread over them by `spread_stamps`.
             (5, _) if params.len() <= 4 => {
                 let Some(&value) = params.first() else {
                     return skip(report, "нагрузка без параметров");
                 };
-                *report.approximated.entry("сосредоточенная сила на пластине заменена давлением на её элемент".into()).or_default() += 1;
-                add(pressure, direction * value / area);
+                stamps.push(Stamp {
+                    case: row.case,
+                    element: row.target,
+                    value,
+                    direction: direction.normalize_or_zero(),
+                    area,
+                    level: (p.iter().sum::<DVec3>() / p.len() as f64).dot(direction.normalize_or_zero()),
+                });
             }
             (5, _) => skip(report, "произвольная трапециевидная нагрузка на пластину"),
             // Line loads along an element edge.
@@ -613,6 +707,7 @@ impl Context<'_> {
         } else {
             unit(row.direction).unwrap()
         };
+        let dir = if moment { dir } else { dir * FORCE_SIGN };
         let [a, b] = self.state.axes[axis].endpoints.map(|v| DVec3::from_array(self.state.model.vertices()[v]));
         let t_at = |s: f64| t_first + (t_second - t_first) * (s / length).clamp(0., 1.);
         let point_at = |s: f64| a.lerp(b, t_at(s));
