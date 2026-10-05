@@ -391,6 +391,17 @@ Re-audit of 9419b92 (2026-10-05), fixed:
   interior node onto the crossing. The assembly checker checks node order
   of edited bars. Zero-length beam pieces are skipped with a warning.
 
+First real PLAXIS run (user, 2026-10-05, скала3 and тест 5): "Cannot
+intersect while the geometry contains invalid objects" for polygons whose
+first three points were collinear (straight contour runs through junction
+vertices): PLAXIS fits the plane through the first points ("Define plane:
+First points") and called them not coplanar (0.45 m). Fix:
+`plaxis::plaxis_polygon` drops straight-line vertices (PLAXIS intersects
+and recreates junction points) and starts each ring at the corner with the
+largest first triangle. Simulating PLAXIS's check on 9 fixtures: 0
+degenerate starts, deviation from the first-points plane at most 0.7 um
+(тест 5 had 56 of 127 polygons with a collinear start before).
+
 ## Next coherent development batch
 
 - Use the editor on the Багратион v4 residuals and record what the edits

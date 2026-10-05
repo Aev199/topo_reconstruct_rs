@@ -163,6 +163,50 @@ fn signed_area(points: &[[f64; 2]]) -> f64 {
         / 2.
 }
 
+/// A polygon as PLAXIS takes it: PLAXIS fits the plane through the first
+/// points ("Define plane: First points"), so three collinear points first
+/// (a straight contour run with T-junction vertices) make a planar polygon
+/// "not coplanar" and invalid. Vertices on the straight line between their
+/// neighbours are dropped (PLAXIS intersects the geometry itself and
+/// recreates junction points), and the ring starts at the corner whose
+/// triangle with the next two points is the largest.
+pub fn plaxis_polygon(ring: Vec<[f64; 3]>) -> Vec<[f64; 3]> {
+    let p = |v: [f64; 3]| DVec3::from_array(v);
+    let mut ring = ring;
+    loop {
+        let n = ring.len();
+        if n <= 3 {
+            break;
+        }
+        // Distance of each vertex from the chord of its neighbours, relative
+        // to the chord: below 1e-9 it is a straight-line vertex.
+        let straight = (0..n).find(|&i| {
+            let (a, b, c) = (p(ring[(i + n - 1) % n]), p(ring[i]), p(ring[(i + 1) % n]));
+            let chord = c - a;
+            let len = chord.length();
+            len > 0.
+                && (b - a).cross(chord).length() / len <= 1e-9 * len.max(1.)
+                && (b - a).dot(chord) > 0.
+                && (c - b).dot(chord) > 0.
+        });
+        match straight {
+            Some(i) => {
+                ring.remove(i);
+            }
+            None => break,
+        }
+    }
+    let n = ring.len();
+    let area = |i: usize| {
+        let (a, b, c) = (p(ring[i]), p(ring[(i + 1) % n]), p(ring[(i + 2) % n]));
+        (b - a).cross(c - a).length()
+    };
+    if let Some(start) = (0..n).max_by(|&x, &y| area(x).total_cmp(&area(y))) {
+        ring.rotate_left(start);
+    }
+    ring
+}
+
 /// Constrained Delaunay triangles of a polygon with holes (fallback).
 fn triangles(contours: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
     use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
@@ -653,7 +697,7 @@ pub fn exchange(
         .map(|s| {
             let surface = &model.surfaces()[s];
             let plane = &model.planes()[surface.plane];
-            let polygons = if surface.boundaries.len() == 1 {
+            let polygons: Vec<Vec<[f64; 3]>> = if surface.boundaries.len() == 1 {
                 // Exact vertex positions of the contour.
                 vec![surface.boundaries[0]
                     .iter()
@@ -678,6 +722,7 @@ pub fn exchange(
                     .map(|piece| piece.into_iter().map(|uv| plane.lift(uv)).collect())
                     .collect()
             };
+            let polygons = polygons.into_iter().map(plaxis_polygon).collect();
             let stiffness = state.stiffness[s];
             let area = signed_area(&surface.contours[0]).abs()
                 - surface.contours[1..]
@@ -1007,5 +1052,36 @@ mod tests {
         assert!((m.i2 - 0.8 * 0.5f64.powi(3) / 12.).abs() < 1e-12);
         assert!(!m.notes.is_empty());
         assert_eq!(n.plate_materials[0].d, 0.2);
+    }
+
+    #[test]
+    fn polygons_never_start_with_collinear_points() {
+        // A wall whose contour runs through junction vertices on its edges
+        // (the PLAXIS "points are not coplanar" case).
+        let ring = vec![
+            [77.1132, -52.1233, -2.95545],
+            [77.1132, -52.1233, -1.33],
+            [77.1132, -52.1233, 6.45],
+            [79.3073, -46.6925, 6.45],
+            [79.4007, -46.4615, 6.45],
+            [79.4007, -46.4614, -1.33],
+            [79.4007, -46.4614, -2.95545],
+        ];
+        let out = plaxis_polygon(ring);
+        let p = |v: [f64; 3]| DVec3::from_array(v);
+        assert!(out.len() < 7);
+        let n = out.len();
+        for i in 0..n {
+            let (a, b, c) = (p(out[(i + n - 1) % n]), p(out[i]), p(out[(i + 1) % n]));
+            assert!(
+                (b - a).cross(c - b).length() > 1e-6,
+                "straight vertex {i} left"
+            );
+        }
+        let (a, b, c) = (p(out[0]), p(out[1]), p(out[2]));
+        assert!(
+            (b - a).cross(c - a).length() > 1.,
+            "first triangle degenerate"
+        );
     }
 }
