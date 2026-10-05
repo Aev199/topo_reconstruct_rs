@@ -402,6 +402,28 @@ largest first triangle. Simulating PLAXIS's check on 9 fixtures: 0
 degenerate starts, deviation from the first-points plane at most 0.7 um
 (тест 5 had 56 of 127 polygons with a collinear start before).
 
+Real PLAXIS round 2 (user, 2026-10-05): тест 5 imports and meshes. скала3
+(new private fixture, 13 now): a floor slab (z 7.33, 2956 elements) and 6
+more regions (4797 elements) were missing while every audit was green.
+Cause: the frame did not close (residual 0.3 mm): a merged wall family
+(26+27, nodes 25 mm off its fit, accepted by the panel tolerance) leaning
+1.6e-4 was not snapped vertical because the snap rule compared with the
+1 cm plane distance; three walls then met at one point instead of their
+common vertical edge, the edge nodes would move metres, and the regions
+were dropped (`support_intersection_or_movement_budget`). Fixes: a family
+snaps when snapping worsens its fit by at most the plane distance
+(regression test fails without it); unbuilt regions and bars are audit
+failures (`surface_not_built`, `bar_not_built`, Rust audit and session)
+and fail `check_v2_assembly.py` (it used to count their elements as
+accounted); gaps are closed once more after the later stages (generalized
+contours, junctions). The Python global audit recomputes a coplanar
+overlap on a grid of tolerance/1000: GEOS returned a 6.4 m2 phantom
+overlap between two walls touching along a line (скала3 surfaces 6/7).
+Tier C, 13 fixtures (fresh frames): скала3 85 surfaces, all regions built,
+strict audit and PLAXIS profile pass; ЖК Остров PLAXIS items gap 60 -> 44,
+short edge 27 -> 24, sharp corner 4 -> 5; all other fixtures unchanged
+(strict 12/13, v4 the same residuals).
+
 ## Next coherent development batch
 
 - Use the editor on the Багратион v4 residuals and record what the edits

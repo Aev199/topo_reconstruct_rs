@@ -444,6 +444,14 @@ def audit(data, near_distance=0.05, maximum_precision=MAXIMUM_PRECISION):
                     issues.append(dict(surfaces=pair, kind="invalid_projected_contour"))
                     continue
                 common = a.shape.intersection(other)
+                if common.area > 0:
+                    # GEOS overlay can return area outside both inputs along
+                    # nearly coincident collinear edges (a 6 m2 phantom
+                    # between two walls touching along a line): the overlap
+                    # is recomputed on a grid a thousandth of the tolerance.
+                    grid = eps / 1000.
+                    common = shapely.set_precision(a.shape, grid).intersection(
+                        shapely.set_precision(other, grid))
                 area_threshold = eps * max(min(a.shape.length, other.length), eps)
                 if common.area > area_threshold:
                     entry = dict(surfaces=pair, area=float(common.area), gap=gap)
