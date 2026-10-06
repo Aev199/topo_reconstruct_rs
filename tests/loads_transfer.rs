@@ -347,3 +347,34 @@ fn overlapping_line_loads_are_split_and_added_per_case() {
     let points: Vec<&Load> = out.iter().filter(|l| matches!(l, Load::Point { .. })).collect();
     assert_eq!(points.len(), 1);
 }
+
+#[test]
+fn a_point_load_off_the_structure_moves_onto_it_keeping_force_and_moment() {
+    use loads::{attach_points, Load};
+    let plate = vec![[0., 0., 0.], [4., 0., 0.], [4., 4., 0.], [0., 4., 0.]];
+    let beam = ([6., 0., 0.], [6., 0., 5.]);
+    let point = |at: [f64; 3], force: [f64; 3]| Load::Point { case: 1, at, force, moment: [0.; 3] };
+    let mut loads = vec![
+        point([1., 1., 0.], [0., 0., -10.]),    // on the plate: stays
+        point([2., 2., 0.05], [0., 0., -10.]),  // 5 cm above the plate
+        point([5., 2., 0.], [0., 0., -10.]),    // beside the plate, off the beam: nearest is the plate edge
+        point([6.02, 0., 2.], [3., 0., -10.]),  // 2 cm from the beam
+    ];
+    let before: Vec<(glam::DVec3, glam::DVec3)> = loads.iter().map(|l| match l {
+        Load::Point { at, force, moment, .. } => (glam::DVec3::from_array(*force), glam::DVec3::from_array(*at).cross(glam::DVec3::from_array(*force)) + glam::DVec3::from_array(*moment)),
+        _ => unreachable!(),
+    }).collect();
+    let (moved, farthest) = attach_points(&mut loads, &[plate], &[beam]);
+    assert_eq!(moved, 3);
+    assert!((farthest - 1.0).abs() < 1e-9, "{farthest}");
+    for (l, (force, moment)) in loads.iter().zip(before) {
+        let Load::Point { at, force: f, moment: m, .. } = l else { unreachable!() };
+        let after = glam::DVec3::from_array(*at).cross(glam::DVec3::from_array(*f)) + glam::DVec3::from_array(*m);
+        assert!((glam::DVec3::from_array(*f) - force).length() < 1e-12 && (after - moment).length() < 1e-9, "{l:?}");
+    }
+    // Everything lies on the structure now.
+    let Load::Point { at, .. } = &loads[1] else { unreachable!() };
+    assert!(at[2].abs() < 1e-12);
+    let Load::Point { at, .. } = &loads[2] else { unreachable!() };
+    assert!((at[0] - 4.).abs() < 1e-12);
+}

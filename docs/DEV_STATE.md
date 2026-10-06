@@ -610,6 +610,15 @@ a dense field of point loads on the first slab above the foundation.
   `max_points` (default 12, UI field) per plate and sign: 830 points, 22 uniform surface
   loads, force and moment identical to the source.
 
+- Cause 3 (second PLAXIS import): "Point is mesh-independent" — PLAXIS deletes a point
+  load that is on no plate and no beam, so its load was lost. The loads are placed at
+  source positions (centres of edge loads, pressure centres); the reconstructed geometry
+  differs from them by up to the repair tolerance (33 mm on Остров). 53 of 234 and 301 of
+  830 points were off. `loads::attach_points` (called by `add_loads` with the exported
+  plate polygons and beams) moves each point to the nearest point of a polygon or a beam
+  and keeps its moment about any point by a couple F × shift; counted in `approximated`.
+  Line loads checked the same way: none off the structure.
+
 Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:
 None` path of `transfer` gives that); (done: see above).

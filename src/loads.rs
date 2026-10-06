@@ -285,6 +285,94 @@ pub fn consolidate(loads: Vec<Load>, tolerance: f64) -> Vec<Load> {
     out
 }
 
+/// PLAXIS keeps a point load only on a plate or a beam ("mesh-independent"
+/// points are deleted). Every point load that lies off the exported
+/// structure moves to the nearest point of a plate polygon or a beam, and
+/// takes the moment of the shift (F x offset) as a couple, so force and
+/// moment about any point are unchanged. Returns the number of moved loads and
+/// the largest shift (m).
+pub fn attach_points(loads: &mut [Load], polygons: &[Vec<[f64; 3]>], segments: &[([f64; 3], [f64; 3])]) -> (usize, f64) {
+    struct Poly {
+        ring: Vec<DVec3>,
+        normal: DVec3,
+        u: DVec3,
+        v: DVec3,
+        lo: DVec3,
+        hi: DVec3,
+    }
+    let polys: Vec<Poly> = polygons
+        .iter()
+        .filter(|r| r.len() >= 3)
+        .filter_map(|r| {
+            let ring: Vec<DVec3> = r.iter().map(|&x| DVec3::from_array(x)).collect();
+            let normal: DVec3 = (1..ring.len() - 1).map(|i| (ring[i] - ring[0]).cross(ring[i + 1] - ring[0])).sum();
+            if normal.length() < 1e-12 {
+                return None;
+            }
+            let normal = normal.normalize();
+            let u = (ring[1] - ring[0]).normalize();
+            let lo = ring.iter().fold(DVec3::splat(f64::MAX), |l, p| l.min(*p));
+            let hi = ring.iter().fold(DVec3::splat(f64::MIN), |h, p| h.max(*p));
+            Some(Poly { ring, normal, u, v: normal.cross(u), lo, hi })
+        })
+        .collect();
+    let closest_on_segment = |p: DVec3, a: DVec3, b: DVec3| {
+        let d = b - a;
+        let t = if d.length_squared() > 0. { ((p - a).dot(d) / d.length_squared()).clamp(0., 1.) } else { 0. };
+        a + d * t
+    };
+    let (mut moved, mut farthest) = (0, 0.0f64);
+    for load in loads.iter_mut() {
+        let Load::Point { at, moment, force, .. } = load else { continue };
+        let p = DVec3::from_array(*at);
+        let best: std::cell::Cell<Option<(f64, DVec3)>> = std::cell::Cell::new(None);
+        let consider = |q: DVec3| {
+            let d = p.distance(q);
+            if best.get().is_none_or(|b| d < b.0) {
+                best.set(Some((d, q)));
+            }
+        };
+        for (a, b) in segments {
+            consider(closest_on_segment(p, DVec3::from_array(*a), DVec3::from_array(*b)));
+        }
+        for poly in &polys {
+            // The box of the polygon, grown by what is already as near as the best.
+            let reach = best.get().map_or(f64::MAX, |b| b.0);
+            let outside = (0..3).any(|k| p[k] < poly.lo[k] - reach || p[k] > poly.hi[k] + reach);
+            if outside {
+                continue;
+            }
+            let q = p - poly.normal * (p - poly.ring[0]).dot(poly.normal);
+            let (x, y) = ((q - poly.ring[0]).dot(poly.u), (q - poly.ring[0]).dot(poly.v));
+            let pt = |w: DVec3| ((w - poly.ring[0]).dot(poly.u), (w - poly.ring[0]).dot(poly.v));
+            let mut odd = false;
+            for i in 0..poly.ring.len() {
+                let (a, b) = (pt(poly.ring[i]), pt(poly.ring[(i + 1) % poly.ring.len()]));
+                if (a.1 > y) != (b.1 > y) && x < a.0 + (y - a.1) / (b.1 - a.1) * (b.0 - a.0) {
+                    odd = !odd;
+                }
+            }
+            if odd {
+                consider(q);
+            } else {
+                for i in 0..poly.ring.len() {
+                    consider(closest_on_segment(p, poly.ring[i], poly.ring[(i + 1) % poly.ring.len()]));
+                }
+            }
+        }
+        let Some((distance, q)) = best.get() else { continue };
+        if distance <= 1e-6 {
+            continue;
+        }
+        let shift = p - q;
+        *moment = (DVec3::from_array(*moment) + shift.cross(DVec3::from_array(*force))).to_array();
+        *at = q.to_array();
+        moved += 1;
+        farthest = farthest.max(distance);
+    }
+    (moved, farthest)
+}
+
 /// Whether a load case is the self-weight of the structure (PLAXIS applies
 /// it itself): "СВ", "СВ_...", "СОБСТВЕННЫЙ ВЕС ...", "self weight".
 pub fn is_self_weight(name: &str) -> bool {

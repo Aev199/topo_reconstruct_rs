@@ -96,6 +96,73 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
     }
+    // Point loads that lie on no plate polygon and no beam: PLAXIS calls them mesh-independent.
+    {
+        let exchange = topo_reconstruct_rs::plaxis::exchange(
+            session.state(),
+            &materials,
+            topo_reconstruct_rs::plaxis::Settings { force_factor: 9.80665, min_edge: profile.edge_collapse, stiffness: topo_reconstruct_rs::plaxis::StiffnessMode::Effective },
+            "check",
+        );
+        let on_polygon = |p: DVec3, tol: f64| exchange.plates.iter().flat_map(|pl| pl.polygons.iter()).any(|poly| {
+            let q: Vec<DVec3> = poly.iter().map(|x| DVec3::from_array(*x)).collect();
+            let n: DVec3 = (1..q.len() - 1).map(|i| (q[i] - q[0]).cross(q[i + 1] - q[0])).sum();
+            if n.length() < 1e-12 { return false; }
+            let n = n.normalize();
+            if (p - q[0]).dot(n).abs() > tol { return false; }
+            // Inside by the sum of angles / crossing number in the plane.
+            let (u, v) = { let u = (q[1] - q[0]).normalize(); (u, n.cross(u)) };
+            let pt = |x: DVec3| (((x - q[0]).dot(u)), ((x - q[0]).dot(v)));
+            let (px, py) = pt(p);
+            let mut odd = false;
+            for i in 0..q.len() {
+                let (a, b) = (pt(q[i]), pt(q[(i + 1) % q.len()]));
+                if (a.1 > py) != (b.1 > py) && px < a.0 + (py - a.1) / (b.1 - a.1) * (b.0 - a.0) { odd = !odd; }
+            }
+            if odd { return true; }
+            // On the boundary within the tolerance.
+            (0..q.len()).any(|i| {
+                let (a, b) = (q[i], q[(i + 1) % q.len()]);
+                let d = b - a;
+                let t = ((p - a).dot(d) / d.length_squared()).clamp(0., 1.);
+                (p - (a + d * t)).length() <= tol
+            })
+        });
+        let on_beam = |p: DVec3, tol: f64| exchange.beams.iter().any(|b| {
+            let (a, c) = (DVec3::from_array(b.start), DVec3::from_array(b.end));
+            let d = c - a;
+            let t = ((p - a).dot(d) / d.length_squared()).clamp(0., 1.);
+            (p - (a + d * t)).length() <= tol
+        });
+        let polygons: Vec<Vec<[f64; 3]>> = exchange.plates.iter().flat_map(|p| p.polygons.iter().cloned()).collect();
+        let segments: Vec<([f64; 3], [f64; 3])> = exchange.beams.iter().map(|b| (b.start, b.end)).collect();
+        let mut line_off = 0;
+        for l in &list {
+            if let Load::Line { start, end, .. } = l {
+                let (a, b) = (DVec3::from_array(*start), DVec3::from_array(*end));
+                if !(on_polygon(a, 1e-3) || on_beam(a, 1e-3)) || !(on_polygon(b, 1e-3) || on_beam(b, 1e-3)) {
+                    line_off += 1;
+                }
+            }
+        }
+        println!("line loads with an end off structure: {line_off}");
+        let mut list = list.clone();
+        let (moved, farthest) = loads::attach_points(&mut list, &polygons, &segments);
+        println!("attached {moved} point loads, farthest shift {farthest:.4} m");
+        let mut off = 0;
+        for l in &list {
+            if let Load::Point { case, at, force, .. } = l {
+                let p = DVec3::from_array(*at);
+                if !on_polygon(p, 1e-3) && !on_beam(p, 1e-3) {
+                    off += 1;
+                    if off <= 12 {
+                        println!("point off structure: case {case} at {at:?} force {force:?}");
+                    }
+                }
+            }
+        }
+        println!("point loads off structure: {off} of {}", counts.get("point").copied().unwrap_or(0));
+    }
     println!("counts {counts:?}, distinct lines {}, distinct points {}", places.len(), points.len());
     for c in &report.cases {
         let full = reference.as_ref().and_then(|r| r.cases.iter().find(|x| x.case == c.case)).map(|x| x.exported);

@@ -486,6 +486,15 @@ impl Service {
         } else {
             set.cases.clone()
         };
+        // PLAXIS deletes point loads that lie on no plate and no beam: move them onto the structure.
+        let polygons: Vec<Vec<[f64; 3]>> = exchange.plates.iter().flat_map(|p| p.polygons.iter().cloned()).collect();
+        let segments: Vec<([f64; 3], [f64; 3])> = exchange.beams.iter().map(|b| (b.start, b.end)).collect();
+        let mut loads = loads;
+        let (moved, farthest) = crate::loads::attach_points(&mut loads, &polygons, &segments);
+        let mut report = report;
+        if moved > 0 {
+            report.approximated.insert(format!("точечные нагрузки перенесены на ближайшую плиту или балку (до {:.0} мм, момент сохранён парой)", farthest * 1000.), moved);
+        }
         exchange.loads = loads;
         exchange.load_report = Some(report);
         Ok(())
