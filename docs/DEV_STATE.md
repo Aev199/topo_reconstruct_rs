@@ -659,6 +659,23 @@ catalogue profile are used by the PLAXIS export and by the cap slab.
 PLAXIS: bars of S1..S6 and of the profiles of the block 13 now get beam materials
 (`plaxis::add_section_beams`).
 
+### Cut-off loads shared by stiffness (2026-10-06)
+
+`loads::CutDistribution` (`cut: {distribution: "stiffness" | "nearest"}`, selector in both export
+dialogs; default stiffness). `Stiffness` = a rigid floor diaphragm at the cut level
+(`stiffness_shares`): vertical forces by the axial stiffness (column E A, wall E t per length) of a
+plane settlement w0 + aX + bY about the stiffness centre, so a wall gets a load linear along its
+length (a trapezoid `Load::Line`); horizontal forces by the lateral stiffness (cantilever with
+bending and shear, storey height = distance to the next major floor below; a wall along and across,
+a column isotropic) of a floor translation and rotation, so the torsion of eccentric wind is taken.
+Force and moment of the items are kept (unit tests; on «Для testa» cut at 45.22: weight 91 002 kN,
+wind +Y moments (1166, 4432, -4374) kN m exactly; `Nearest` lost 16 % of the Mz of the wind).
+`Nearest` stays (tributary areas + a vertical couple). Rigid-plane vertical distribution is the
+extreme of the two: wall loads 589..997 kN/m against 13..7549 kN/m by tributary areas on that model;
+the cap slab redistributes further in the model. A singular system (supports on one line) takes the
+part of the moment it can (reported). Not verified against the full model: compare settlements of the
+full and the cut model.
+
 Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:
 None` path of `transfer` gives that); (done: see above).

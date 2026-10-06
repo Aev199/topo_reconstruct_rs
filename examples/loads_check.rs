@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &output.topology.vertex_source_nodes,
         &mesh,
         &set,
-        loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination, cases: None, materials: Some(materials.clone()), cut_loads: true },
+        loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination, cases: None, materials: Some(materials.clone()), cut_loads: true, cut_distribution: Default::default() },
     );
     let reference = if cut_at.is_some() {
         Some(loads::transfer(
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             &output.topology.vertex_source_nodes,
             &mesh,
             &set,
-            loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination: None, cases: None, materials: Some(materials.clone()), cut_loads: true },
+            loads::Settings { force_factor: 9.80665, snap: profile.edge_collapse, max_groups: 40, combination: None, cases: None, materials: Some(materials.clone()), cut_loads: true, cut_distribution: Default::default() },
         ).1)
     } else { None };
     let mut exported: BTreeMap<u32, DVec3> = BTreeMap::new();

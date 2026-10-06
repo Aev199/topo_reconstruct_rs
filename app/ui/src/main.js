@@ -685,6 +685,7 @@ function chosenCut(dialog) {
   if (block.hidden) return null;
   return {
     loads: block.querySelector('.cut-loads').checked,
+    distribution: block.querySelector('.cut-distribution').value,
     cap: block.querySelector('.cut-cap').checked,
     factor: Number(block.querySelector('.cut-factor').value) || 0,
   };

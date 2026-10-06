@@ -373,6 +373,201 @@ pub fn attach_points(loads: &mut [Load], polygons: &[Vec<[f64; 3]>], segments: &
     (moved, farthest)
 }
 
+/// A wall or a column at the cut level, with what its stiffness needs (t, m).
+#[derive(Debug, Clone, Copy)]
+struct SupportK {
+    a: DVec3,
+    b: DVec3,
+    wall: bool,
+    /// Young's modulus (t/m2).
+    e: f64,
+    /// Thickness of a wall (m); area of a column (m2).
+    size: f64,
+    /// Second moment of a column about a horizontal axis (m4), isotropic.
+    inertia: f64,
+}
+
+/// What a support takes: the horizontal force (t) and the vertical load at its start and end
+/// (t/m along a wall, the force on a column in the first).
+#[derive(Debug, Clone, Copy, Default)]
+struct Share {
+    horizontal: glam::DVec2,
+    vertical: [f64; 2],
+}
+
+/// Lateral stiffness of a cantilever of height `h` with bending and shear (t/m).
+fn lateral_stiffness(e: f64, inertia: f64, shear_area: f64, h: f64) -> f64 {
+    let g = e / 2.4;
+    let flexibility = h.powi(3) / (3. * e * inertia).max(1e-300) + h / (g * shear_area).max(1e-300);
+    1. / flexibility
+}
+
+/// Solves `m x = rhs` in the least-squares sense with a ridge relative to the matrix (a singular system
+/// takes the part of the load it can); `n` is 2 or 3.
+fn solve_ridge(m: &[[f64; 3]; 3], rhs: [f64; 3], n: usize) -> [f64; 3] {
+    // A regular system exactly (Gauss elimination with pivoting); the ridge below only for a singular one.
+    let mut b = [[0.; 4]; 3];
+    let mut biggest = 0.;
+    for i in 0..n {
+        for j in 0..n {
+            b[i][j] = m[i][j];
+            biggest = f64::max(biggest, m[i][j].abs());
+        }
+        b[i][3] = rhs[i];
+    }
+    let mut regular = biggest > 0.;
+    for i in 0..n {
+        if !regular {
+            break;
+        }
+        let pivot = (i..n).max_by(|&x, &y| b[x][i].abs().total_cmp(&b[y][i].abs())).unwrap_or(i);
+        b.swap(i, pivot);
+        if b[i][i].abs() < 1e-9 * biggest {
+            regular = false;
+            break;
+        }
+        for r in 0..n {
+            if r != i {
+                let f = b[r][i] / b[i][i];
+                for j in i..=3 {
+                    b[r][j] -= f * b[i][j];
+                }
+            }
+        }
+    }
+    if regular {
+        let mut x = [0.; 3];
+        for i in 0..n {
+            x[i] = b[i][3] / b[i][i];
+        }
+        return x;
+    }
+    // Normal equations (m^T m + eps I) x = m^T rhs, by Gauss elimination.
+    let mut a = [[0.; 4]; 3];
+    let mut scale = 0.;
+    for i in 0..n {
+        for j in 0..n {
+            a[i][j] = (0..n).map(|k| m[k][i] * m[k][j]).sum();
+            scale += a[i][j].abs();
+        }
+        a[i][3] = (0..n).map(|k| m[k][i] * rhs[k]).sum();
+    }
+    for (i, row) in a.iter_mut().enumerate().take(n) {
+        row[i] += 1e-12 * scale.max(1e-300);
+    }
+    for i in 0..n {
+        let pivot = (i..n).max_by(|&x, &y| a[x][i].abs().total_cmp(&a[y][i].abs())).unwrap_or(i);
+        a.swap(i, pivot);
+        let d = a[i][i];
+        if d.abs() < 1e-300 {
+            continue;
+        }
+        for j in i..=3 {
+            a[i][j] /= d;
+        }
+        for r in 0..n {
+            if r != i {
+                let f = a[r][i];
+                for j in i..=3 {
+                    a[r][j] -= f * a[i][j];
+                }
+            }
+        }
+    }
+    [a[0][3], a[1][3], a[2][3]]
+}
+
+/// Shares the loads of what was cut off (position, force, moment) between the supports as a rigid
+/// floor at the cut level `z`: the vertical load of a support is its axial stiffness times the
+/// settlement of a plane (so a wall carries a load linear along its length), the horizontal force its
+/// lateral stiffness times the displacement of the floor (translation and rotation about the
+/// vertical axis). Force and moment of the items are kept; `Some(false)` as the second value
+/// when a part of the moment could not be taken (supports on one line).
+fn stiffness_shares(supports: &[SupportK], items: &[(DVec3, DVec3, DVec3)], z: f64, storey: f64) -> Option<(Vec<Share>, bool)> {
+    use glam::DVec2;
+    if supports.is_empty() {
+        return None;
+    }
+    let length = |s: &SupportK| s.a.distance(s.b);
+    let mid = |s: &SupportK| (s.a + s.b) / 2.;
+    // Axial stiffness: a column E A, a wall E t per unit length.
+    let kz = |s: &SupportK| if s.wall { s.e * s.size * length(s) } else { s.e * s.size };
+    let total_k: f64 = supports.iter().map(kz).sum();
+    if total_k <= 0. {
+        return None;
+    }
+    let centre = supports.iter().map(|s| mid(s) * kz(s)).sum::<DVec3>() / total_k;
+    let reference = DVec3::new(centre.x, centre.y, z);
+    let force: DVec3 = items.iter().map(|i| i.1).sum();
+    let moment: DVec3 = items.iter().map(|&(p, f, m)| (p - reference).cross(f) + m).sum();
+
+    // Vertical: plane w = w0 + a X + b Y about the stiffness centre.
+    let (mut ixx, mut iyy, mut ixy) = (0., 0., 0.);
+    for s in supports {
+        let (m, k) = (mid(s) - centre, kz(s));
+        let u = if s.wall && length(s) > 0. { (s.b - s.a) / length(s) } else { DVec3::ZERO };
+        let l2 = if s.wall { length(s).powi(2) / 12. } else { 0. };
+        ixx += k * (m.x * m.x + u.x * u.x * l2);
+        iyy += k * (m.y * m.y + u.y * u.y * l2);
+        ixy += k * (m.x * m.y + u.x * u.y * l2);
+    }
+    // Mx = a Ixy + b Iyy, My = -(a Ixx + b Ixy).
+    let plane = solve_ridge(&[[ixy, iyy, 0.], [-ixx, -ixy, 0.], [0.; 3]], [moment.x, moment.y, 0.], 2);
+    let (w0, pa, pb) = (force.z / total_k, plane[0], plane[1]);
+    let taken = DVec2::new(ixy * pa + iyy * pb, -(ixx * pa + ixy * pb));
+    let kept = (taken.x - moment.x).hypot(taken.y - moment.y) <= 1e-6 * (1. + moment.x.hypot(moment.y));
+    let settlement = |p: DVec3| w0 + pa * (p.x - centre.x) + pb * (p.y - centre.y);
+
+    // Horizontal: the floor (ux, uy, rz about the centre); a wall resists along and across it.
+    let mut kg: Vec<[f64; 3]> = vec![]; // (kxx, kxy, kyy) of every support
+    for s in supports {
+        let h = storey.max(0.5);
+        if s.wall {
+            let l = length(s).max(1e-9);
+            let u = DVec2::new((s.b.x - s.a.x) / l, (s.b.y - s.a.y) / l);
+            let n = DVec2::new(-u.y, u.x);
+            let (t, a) = (s.size, s.size * l);
+            let kp = lateral_stiffness(s.e, t * l.powi(3) / 12., a / 1.2, h);
+            let kn = lateral_stiffness(s.e, l * t.powi(3) / 12., a / 1.2, h);
+            kg.push([kp * u.x * u.x + kn * n.x * n.x, kp * u.x * u.y + kn * n.x * n.y, kp * u.y * u.y + kn * n.y * n.y]);
+        } else {
+            let k = lateral_stiffness(s.e, s.inertia, s.size / 1.2, h);
+            kg.push([k, 0., k]);
+        }
+    }
+    let mut system = [[0.; 3]; 3];
+    for (s, k) in supports.iter().zip(&kg) {
+        let m = mid(s) - centre;
+        // g = (-Y, X): u_i = (ux, uy) + rz g.
+        let g = [-m.y, m.x];
+        let kgg = [k[0] * g[0] + k[1] * g[1], k[1] * g[0] + k[2] * g[1]];
+        system[0][0] += k[0];
+        system[0][1] += k[1];
+        system[1][1] += k[2];
+        system[0][2] += kgg[0];
+        system[1][2] += kgg[1];
+        system[2][2] += g[0] * kgg[0] + g[1] * kgg[1];
+    }
+    system[1][0] = system[0][1];
+    system[2][0] = system[0][2];
+    system[2][1] = system[1][2];
+    let d = solve_ridge(&system, [force.x, force.y, moment.z], 3);
+    let mut shares = vec![];
+    for (s, k) in supports.iter().zip(&kg) {
+        let m = mid(s) - centre;
+        let (ux, uy) = (d[0] - d[2] * m.y, d[1] + d[2] * m.x);
+        let horizontal = DVec2::new(k[0] * ux + k[1] * uy, k[1] * ux + k[2] * uy);
+        let vertical = if s.wall {
+            [s.e * s.size * settlement(s.a), s.e * s.size * settlement(s.b)]
+        } else {
+            [s.e * s.size * settlement(s.a), 0.]
+        };
+        shares.push(Share { horizontal, vertical });
+    }
+    Some((shares, kept))
+}
+
+
 /// Whether a load case is the self-weight of the structure (PLAXIS applies
 /// it itself): "СВ", "СВ_...", "СОБСТВЕННЫЙ ВЕС ...", "self weight".
 pub fn is_self_weight(name: &str) -> bool {
@@ -400,6 +595,19 @@ pub fn is_dynamic(name: &str) -> bool {
 pub fn is_stage(name: &str) -> bool {
     let n = name.trim().to_lowercase();
     n.starts_with("стади") || n.starts_with("stage")
+}
+
+/// How the loads of the cut-off storeys are shared between the walls and columns at the level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CutDistribution {
+    /// A rigid floor diaphragm at the level: vertical forces by the axial stiffness of the supports
+    /// (a plane section: a wall gets a load linear along its length), horizontal ones by their lateral
+    /// stiffness with torsion.
+    #[default]
+    Stiffness,
+    /// Every force to the nearest support in plan (tributary areas); the overturning moment by a
+    /// couple of vertical forces weighted by the size of the supports.
+    Nearest,
 }
 
 /// The pseudo-case of the weight of the storeys that were cut off.
@@ -494,6 +702,8 @@ pub struct Settings {
     /// Loads of the storeys cut off are carried to the level of the cut
     /// (`false`: they are dropped).
     pub cut_loads: bool,
+    /// How the loads of the cut storeys are shared between the supports at the level.
+    pub cut_distribution: CutDistribution,
 }
 
 struct Context<'a> {
@@ -1656,14 +1866,46 @@ impl Context<'_> {
             }
         };
         let mut supports: Vec<(DVec3, DVec3, f64, bool)> = vec![];
+        let mut stiff: Vec<SupportK> = vec![];
+        let materials = self.settings.materials.as_ref();
         let (walls, columns) = crate::reconstruction::assembly::cutoff::live_supports(self.state);
         for (a, b, stiffness) in walls {
+            let (e, t) = match materials.and_then(|m| m.get(&stiffness)) {
+                Some(Material::Plate { e, thickness, .. }) => (*e, *thickness),
+                _ => (2.9e6, 0.2),
+            };
             supports.push((a, b, weight_of(stiffness, true) * a.distance(b), true));
+            stiff.push(SupportK { a, b, wall: true, e, size: t, inertia: 0. });
         }
         for (p, stiffness) in columns {
+            let (e, area, inertia) = match materials.and_then(|m| m.get(&stiffness)) {
+                Some(Material::Bar { e, width, height, .. }) => (*e, width * height, (width * height).powi(2) / 12.),
+                Some(Material::Section { .. }) => match crate::midas_stiffness::bar_spec(stiffness, materials.map(|m| &**m).unwrap_or(&Default::default()), &Default::default()) {
+                    Some(spec) => (spec.young_kn / 9.80665, spec.area.unwrap_or(0.25), spec.shape.inertia().map_or(0.25_f64.powi(2) / 12., |(x, y)| (x + y) / 2.)),
+                    None => (2.9e6, 0.25, 0.25_f64.powi(2) / 12.),
+                },
+                _ => (2.9e6, 0.25, 0.25_f64.powi(2) / 12.),
+            };
             supports.push((p, p, weight_of(stiffness, false), false));
+            stiff.push(SupportK { a: p, b: p, wall: false, e, size: area, inertia });
         }
-        supports.retain(|s| s.2 > 0.);
+        let keep: Vec<bool> = supports.iter().map(|s| s.2 > 0.).collect();
+        let mut index = 0;
+        supports.retain(|_| {
+            index += 1;
+            keep[index - 1]
+        });
+        let mut index = 0;
+        stiff.retain(|_| {
+            index += 1;
+            keep[index - 1]
+        });
+        // The storey below the level: between it and the next major floor under it (3 m when none).
+        let storey = crate::reconstruction::assembly::cutoff::floors(self.state)
+            .iter()
+            .rev()
+            .find(|f| f.z < cut.z - 0.15 && f.major)
+            .map_or(3., |f| cut.z - f.z);
         let plan = |p: DVec3| glam::DVec2::new(p.x, p.y);
         for (&case, items) in removed {
             if items.is_empty() {
@@ -1675,6 +1917,34 @@ impl Context<'_> {
             }
             for &(p, f, m) in items {
                 source.add(case, p, f * factor, m * factor);
+            }
+            if self.settings.cut_distribution == CutDistribution::Stiffness {
+                if let Some((shares, kept)) = stiffness_shares(&stiff, items, cut.z, storey) {
+                    if !kept {
+                        *report.approximated.entry("опрокидывающий момент отброшенных этажей передан не полностью: опоры на одной прямой".into()).or_default() += 1;
+                    }
+                    *report.approximated.entry("нагрузки отброшенных этажей распределены по жёсткости опор на уровне отсечения (жёсткий диск перекрытия)".into()).or_default() += 1;
+                    for (k, share) in stiff.iter().zip(&shares) {
+                        let (hx, hy) = (share.horizontal.x, share.horizontal.y);
+                        if share.horizontal.length() < 1e-12 && share.vertical[0].abs() < 1e-12 && share.vertical[1].abs() < 1e-12 {
+                            continue;
+                        }
+                        if k.wall {
+                            let l = k.a.distance(k.b);
+                            let h = DVec3::new(hx, hy, 0.) / l;
+                            loads.push(Load::Line {
+                                case,
+                                start: k.a.to_array(),
+                                end: k.b.to_array(),
+                                q_start: ((h + DVec3::new(0., 0., share.vertical[0])) * factor).to_array(),
+                                q_end: ((h + DVec3::new(0., 0., share.vertical[1])) * factor).to_array(),
+                            });
+                        } else {
+                            loads.push(Load::Point { case, at: k.a.to_array(), force: (DVec3::new(hx, hy, share.vertical[0]) * factor).to_array(), moment: [0.; 3] });
+                        }
+                    }
+                    continue;
+                }
             }
             let mut shares = vec![DVec3::ZERO; supports.len()];
             let weight_sum: f64 = supports.iter().map(|s| s.2).sum();
@@ -2333,6 +2603,71 @@ impl Context<'_> {
 
 #[cfg(test)]
 mod tests {
+    fn column(x: f64, y: f64, e: f64, area: f64) -> SupportK {
+        let a = DVec3::new(x, y, 0.);
+        SupportK { a, b: a, wall: false, e, size: area, inertia: area * area / 12. }
+    }
+
+    fn sums(supports: &[SupportK], shares: &[Share]) -> (DVec3, DVec3) {
+        // Force and moment about the origin at the level (z = 0).
+        let (mut f, mut m) = (DVec3::ZERO, DVec3::ZERO);
+        for (s, sh) in supports.iter().zip(shares) {
+            if s.wall {
+                let l = s.a.distance(s.b);
+                let (qa, qb) = (sh.vertical[0], sh.vertical[1]);
+                let h = DVec3::new(sh.horizontal.x, sh.horizontal.y, 0.);
+                let vertical = DVec3::new(0., 0., (qa + qb) / 2. * l);
+                // The trapezoid: centroid of the vertical load along the wall.
+                let t = if (qa + qb).abs() > 1e-12 { (qa + 2. * qb) / (3. * (qa + qb)) } else { 0.5 };
+                let at_v = s.a.lerp(s.b, t);
+                f += h + vertical;
+                m += ((s.a + s.b) / 2.).cross(h) + at_v.cross(vertical);
+            } else {
+                let force = DVec3::new(sh.horizontal.x, sh.horizontal.y, sh.vertical[0]);
+                f += force;
+                m += s.a.cross(force);
+            }
+        }
+        (f, m)
+    }
+
+    #[test]
+    fn a_load_at_the_stiffness_centre_is_shared_by_axial_stiffness() {
+        // Two columns 6 m apart, EA 2 : 1, a vertical load of 90 t at their stiffness centre (x = 2).
+        let supports = [column(0., 0., 3e6, 0.4), column(6., 0., 3e6, 0.2)];
+        let items = [(DVec3::new(2., 0., 0.), DVec3::new(0., 0., -90.), DVec3::ZERO)];
+        let (shares, _) = stiffness_shares(&supports, &items, 0., 3.).unwrap();
+        assert!((shares[0].vertical[0] + 60.).abs() < 1e-6 && (shares[1].vertical[0] + 30.).abs() < 1e-6, "{shares:?}");
+    }
+
+    #[test]
+    fn force_and_moment_of_the_items_are_kept_by_the_stiffness_shares() {
+        // A wall along x (6 m), a wall along y (4 m) and two columns; loads of both directions and a moment.
+        let wall = |a: [f64; 2], b: [f64; 2]| SupportK { a: DVec3::new(a[0], a[1], 0.), b: DVec3::new(b[0], b[1], 0.), wall: true, e: 3e6, size: 0.25, inertia: 0. };
+        let supports = [wall([0., 0.], [6., 0.]), wall([0., 0.], [0., 4.]), column(6., 4., 3e6, 0.3), column(3., 5., 2.5e6, 0.2)];
+        let items = [
+            (DVec3::new(1., 7., 30.), DVec3::new(10., -4., -80.), DVec3::new(0.5, 0., 0.)),
+            (DVec3::new(5., 2., 10.), DVec3::new(-3., 6., -40.), DVec3::ZERO),
+        ];
+        let (shares, kept) = stiffness_shares(&supports, &items, 0., 3.).unwrap();
+        assert!(kept);
+        let (f, m) = sums(&supports, &shares);
+        let force: DVec3 = items.iter().map(|i| i.1).sum();
+        let moment: DVec3 = items.iter().map(|&(p, f, m)| p.cross(f) + m).sum();
+        assert!((f - force).length() < 1e-6, "{f:?} {force:?}");
+        // The moment about the origin at the level: the horizontal forces act at z = 0 (levers of the items above it are in the items).
+        assert!((m - moment).length() < 1e-6, "{m:?} {moment:?}");
+    }
+
+    #[test]
+    fn supports_on_one_line_take_only_the_moment_they_can() {
+        let supports = [column(0., 0., 3e6, 0.3), column(6., 0., 3e6, 0.3)];
+        // A moment about the line of the supports cannot be taken (My is, Mx is not).
+        let items = [(DVec3::new(3., 4., 0.), DVec3::new(0., 0., -10.), DVec3::ZERO)];
+        let (_, kept) = stiffness_shares(&supports, &items, 0., 3.).unwrap();
+        assert!(!kept);
+    }
+
     #[test]
     fn point_forces_are_merged_by_position_keeping_force_and_first_moment() {
         // 100 forces on a 10 x 10 grid, -1 each, merged into at most 6 groups.

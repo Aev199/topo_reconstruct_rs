@@ -147,7 +147,7 @@ fn what_was_cut_off_rests_on_the_supports_with_force_and_overturning_moment() {
         &nodes,
         &mesh,
         &set,
-        loads::Settings { force_factor: 10., snap: 0.05, max_groups: 40, combination: None, cases: None, materials: Some(materials.clone()), cut_loads: true },
+        loads::Settings { force_factor: 10., snap: 0.05, max_groups: 40, combination: None, cases: None, materials: Some(materials.clone()), cut_loads: true, cut_distribution: Default::default() },
     );
     assert!(!set.rows.is_empty(), "no load rows parsed");
     assert!(s.state().cut.is_some());
@@ -185,7 +185,7 @@ fn what_was_cut_off_rests_on_the_supports_with_force_and_overturning_moment() {
         &nodes,
         &mesh,
         &set,
-        loads::Settings { force_factor: 10., snap: 0.05, max_groups: 40, combination: None, cases: None, materials: Some(materials), cut_loads: false },
+        loads::Settings { force_factor: 10., snap: 0.05, max_groups: 40, combination: None, cases: None, materials: Some(materials), cut_loads: false, cut_distribution: Default::default() },
     );
     assert!(list.iter().all(|l| l.case() != CUT_WEIGHT_CASE && !matches!(l, Load::Line { .. })), "{list:?}");
 }
@@ -394,4 +394,50 @@ fn a_patch_a_little_off_the_centre_still_keeps_its_moment() {
     assert!((f.z + 10. * area).abs() < 1e-5, "{f:?}");
     // M = r x F: M_x = y F = 2 (-10 A), M_y = -x F = 2.85 (10 A).
     assert!((m - DVec3::new(-20. * area, 28.5 * area, 0.)).length() < 1e-5, "{m:?}");
+}
+
+#[test]
+fn both_distributions_keep_force_and_overturning_moment_of_the_cut_off_part() {
+    use glam::DVec3;
+    use topo_reconstruct_rs::loads::{self, CutDistribution, Load};
+    let text = loaded_tower();
+    let mut s = session_of(&text);
+    s.apply(Edit::CutAbove { z: 3. }, "cut").unwrap();
+    let mesh = topo_reconstruct_rs::parsers::lira::LiraParser::mesh_from(text.as_bytes()).unwrap();
+    let set = topo_reconstruct_rs::parsers::loads::parse(text.as_bytes());
+    let moment_about = |list: &[Load], case: u32, about: DVec3| -> DVec3 {
+        list.iter().filter(|l| l.case() == case).map(|l| match l {
+            Load::Point { at, force, .. } => (DVec3::from_array(*at) - about).cross(DVec3::from_array(*force)),
+            Load::Line { start, end, q_start, q_end, .. } => {
+                // Linear load: the force at its centroid.
+                let (a, b) = (DVec3::from_array(*start), DVec3::from_array(*end));
+                let (qa, qb) = (DVec3::from_array(*q_start), DVec3::from_array(*q_end));
+                let length = a.distance(b);
+                let force = (qa + qb) / 2. * length;
+                let t = |k: usize| if (qa[k] + qb[k]).abs() > 1e-12 { (qa[k] + 2. * qb[k]) / (3. * (qa[k] + qb[k])) } else { 0.5 };
+                // Moment of each component about the point: its own centroid.
+                (0..3).map(|k| {
+                    let mut f = DVec3::ZERO;
+                    f[k] = (qa[k] + qb[k]) / 2. * length;
+                    (a.lerp(b, t(k)) - about).cross(f)
+                }).sum::<DVec3>() + DVec3::ZERO * force
+            }
+            Load::Surface { .. } => DVec3::ZERO,
+        }).sum()
+    };
+    let about = DVec3::new(3., 2., 3.);
+    for distribution in [CutDistribution::Stiffness, CutDistribution::Nearest] {
+        let (list, report) = loads::transfer(
+            s.state(),
+            &[],
+            &mesh,
+            &set,
+            loads::Settings { force_factor: 10., snap: 0.05, max_groups: 40, combination: None, cases: None, materials: None, cut_loads: true, cut_distribution: distribution },
+        );
+        // The wind (case 2): 1 tf/m2 x 18 m2 along -Y, its overturning moment about (3, 2, 3) is (270, 0, 0) kN m.
+        let m = moment_about(&list, 2, about);
+        assert!((m.x - 270.).abs() < 1e-3 && m.y.abs() < 1e-3, "{distribution:?}: {m:?}");
+        let c = report.cases.iter().find(|c| c.case == 2).unwrap();
+        assert!((DVec3::from_array(c.exported) - DVec3::from_array(c.source)).length() < 1e-6, "{distribution:?}: {c:?}");
+    }
 }

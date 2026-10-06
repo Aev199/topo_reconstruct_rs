@@ -424,7 +424,7 @@ impl Service {
             crate::plaxis::add_section_beams(&mut exchange, exchange_materials, &profiles, stiffness, force_factor);
         }
         if with_loads {
-            self.add_loads(&mut exchange, state, force_factor, combination, cases, cut.loads)?;
+            self.add_loads(&mut exchange, state, force_factor, combination, cases, cut.loads, cut.distribution)?;
         }
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         serde_json::to_writer(std::io::BufWriter::new(file), &exchange)
@@ -466,6 +466,7 @@ impl Service {
         combination: Option<crate::loads::Combination>,
         cases: Option<std::collections::BTreeSet<u32>>,
         cut_loads: bool,
+        cut_distribution: crate::loads::CutDistribution,
     ) -> Result<(), String> {
         let bytes = self.input_bytes()?;
         let mesh = crate::parsers::lira::LiraParser::mesh_from(&bytes).map_err(|e| e.to_string())?;
@@ -484,6 +485,7 @@ impl Service {
                 cases,
                 materials: self.materials.clone().map(std::sync::Arc::new),
                 cut_loads,
+                cut_distribution: cut_distribution,
             },
         );
         exchange.load_cases = if combination.is_some() {
@@ -519,6 +521,7 @@ impl Service {
         let state = cap.as_ref().map_or(self.session()?.state(), |c| &c.0);
         let exchange_materials = cap.as_ref().map_or(materials, |c| &c.1);
         let cut_loads = cut.loads;
+        let cut_distribution = cut.distribution;
         let mesh = crate::meshing::mesh_state(&gmsh, state, size, quads).map_err(|e| format!("meshing_failed: {e}"))?;
         // Cases: the chosen ones, else all but the self-weight, stages and dynamics.
         let bytes = self.input_bytes()?;
@@ -548,6 +551,7 @@ impl Service {
                 cases: Some(selected.clone()),
                 materials: self.materials.clone().map(std::sync::Arc::new),
                 cut_loads,
+                cut_distribution: cut_distribution,
             },
         );
         let on_mesh = crate::mesh_loads::transfer(&mesh, state, &loads, 0.02);
@@ -900,6 +904,8 @@ pub struct CutOptions {
     pub cap: bool,
     /// Factor of the equivalent stiffness.
     pub factor: f64,
+    /// How their loads are shared between the supports at the level.
+    pub distribution: crate::loads::CutDistribution,
 }
 
 impl CutOptions {
@@ -909,6 +915,10 @@ impl CutOptions {
             loads: get("loads").and_then(Value::as_bool).unwrap_or(true),
             cap: get("cap").and_then(Value::as_bool).unwrap_or(true),
             factor: get("factor").and_then(Value::as_f64).filter(|f| *f >= 0.).unwrap_or(1.),
+            distribution: match get("distribution").and_then(Value::as_str) {
+                Some("nearest") => crate::loads::CutDistribution::Nearest,
+                _ => crate::loads::CutDistribution::Stiffness,
+            },
         }
     }
 }

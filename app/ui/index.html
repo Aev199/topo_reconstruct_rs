@@ -69,6 +69,11 @@
       <div class="cut-options" hidden>
         <p class="hint">Модель обрезана на отметке <b class="cut-z"></b> м. Отброшенные этажи:</p>
         <label><input class="cut-loads" type="checkbox" checked> нагрузки и вес — на несущие элементы на уровне отсечения</label>
+        <label>Распределение между опорами
+          <select class="cut-distribution">
+            <option value="stiffness">по жёсткости опор (жёсткий диск перекрытия)</option>
+            <option value="nearest">на ближайшую опору в плане (грузовые площади)</option>
+          </select></label>
         <label><input class="cut-cap" type="checkbox" checked> плита-крышка с приведённой изгибной жёсткостью</label>
         <label>Коэффициент приведённой жёсткости <input class="cut-factor" type="number" step="any" min="0" value="1"></label>
       </div>
@@ -129,6 +134,11 @@
       <div class="cut-options" hidden>
         <p class="hint">Модель обрезана на отметке <b class="cut-z"></b> м. Отброшенные этажи:</p>
         <label><input class="cut-loads" type="checkbox" checked> нагрузки и вес — на несущие элементы на уровне отсечения</label>
+        <label>Распределение между опорами
+          <select class="cut-distribution">
+            <option value="stiffness">по жёсткости опор (жёсткий диск перекрытия)</option>
+            <option value="nearest">на ближайшую опору в плане (грузовые площади)</option>
+          </select></label>
         <label><input class="cut-cap" type="checkbox" checked> плита-крышка с приведённой изгибной жёсткостью</label>
         <label>Коэффициент приведённой жёсткости <input class="cut-factor" type="number" step="any" min="0" value="1"></label>
       </div>
