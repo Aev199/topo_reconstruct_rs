@@ -205,9 +205,41 @@ def outline(points):
     return frozenset(keyed)
 
 
+def load_values(load, linear):
+    """Property values of a load (`linear`: a line load of another case is linear too)."""
+    kind = load["kind"]
+    if kind == "point":
+        f, m = load["force"], load["moment"]
+        return [("Fx", f[0]), ("Fy", f[1]), ("Fz", f[2]), ("Mx", m[0]), ("My", m[1]), ("Mz", m[2])]
+    if kind == "line":
+        a, b = load["q_start"], load["q_end"]
+        values = [("qx_start", a[0]), ("qy_start", a[1]), ("qz_start", a[2])]
+        if linear:
+            values += [("qx_end", b[0]), ("qy_end", b[1]), ("qz_end", b[2])]
+        return values
+    s = load["sigma"]
+    return [("sigx", s[0]), ("sigy", s[1]), ("sigz", s[2])]
+
+
+def place(load, point):
+    """The places of a load that are objects of PLAXIS: loads of different cases at one
+    place are one object (PLAXIS refuses overlapping lines); (key, points) per place."""
+    def rounded(x):
+        return tuple(round(v, 4) for v in x)
+    kind = load["kind"]
+    if kind == "point":
+        return [(("point", rounded(load["at"])), [point(load["at"])])]
+    if kind == "line":
+        ends = sorted([rounded(load["start"]), rounded(load["end"])])
+        return [(("line", tuple(ends)), [point(load["start"]), point(load["end"])])]
+    return [(("surface", outline([point(x) for x in polygon])), [point(x) for x in polygon])
+            for polygon in load["polygons"]]
+
+
 def create_loads(g_i, data, point, keep, progress, phases, structure, polygons, warnings):
-    """Loads of the exchange file, and the phases that activate them. Every
-    failure is counted and reported (`warnings`), none stops the export."""
+    """Loads of the exchange file, and the phases that activate them. Loads of different
+    cases at one place are one object whose values are set per phase. Every failure is
+    counted and reported (`warnings`), none stops the export."""
     loads = data.get("loads") or []
     if not loads:
         return None
@@ -215,6 +247,7 @@ def create_loads(g_i, data, point, keep, progress, phases, structure, polygons, 
     refused = {}
     first_error = {}
     by_case = {}
+    shared = []          # (object, [(case, values)]) of objects used by more than one case
 
     def refuse(kind, error):
         refused[kind] = refused.get(kind, 0) + 1
@@ -224,64 +257,78 @@ def create_loads(g_i, data, point, keep, progress, phases, structure, polygons, 
         for name, value in values:
             setattr(obj, name, value)
 
+    # One entry per place: the loads of every case there.
+    places = {}
+    for load in loads:
+        if load["kind"] not in ("point", "line", "surface"):
+            continue
+        for key, points in place(load, point):
+            places.setdefault(key, (load["kind"], points, []))[2].append(load)
+
     started = time.time()
-    for n, load in enumerate(loads):
-        kind = load["kind"]
+    for n, (key, (kind, points, here)) in enumerate(places.items()):
         try:
+            linear = kind == "line" and any(l["q_start"] != l["q_end"] for l in here)
+            first = here[0]
             if kind == "point":
-                obj = last(g_i.pointload(point(load["at"])))
-                f, m = load["force"], load["moment"]
-                configure(obj, [("Fx", f[0]), ("Fy", f[1]), ("Fz", f[2]), ("Mx", m[0]), ("My", m[1]), ("Mz", m[2])])
+                obj = last(g_i.pointload(*points))
             elif kind == "line":
-                obj = last(g_i.lineload(point(load["start"]), point(load["end"])))
-                a, b = load["q_start"], load["q_end"]
-                values = [("Distribution_x", "Linear"), ("Distribution_y", "Linear"), ("Distribution_z", "Linear")]
-                configure(obj, [v for v in values if a != b])
-                configure(obj, [("qx_start", a[0]), ("qy_start", a[1]), ("qz_start", a[2])])
-                if a != b:
-                    configure(obj, [("qx_end", b[0]), ("qy_end", b[1]), ("qz_end", b[2])])
-            elif kind == "surface":
-                for polygon in load["polygons"]:
-                    points = [point(x) for x in polygon]
-                    existing = polygons.get(outline(points))
-                    try:
-                        obj = last(g_i.surfload(*([existing] if existing is not None else points)))
-                    except Exception:
-                        if existing is not None:
-                            raise
-                        obj = last(g_i.surfload(keep(last(g_i.surface(*points)))))
-                    s = load["sigma"]
-                    configure(obj, [("sigx", s[0]), ("sigy", s[1]), ("sigz", s[2])])
-                    keep(obj)
-                    by_case.setdefault(load["case"], []).append(obj)
-                    made["surface"] += 1
-                continue
+                obj = last(g_i.lineload(*points))
+                if linear:
+                    configure(obj, [("Distribution_x", "Linear"), ("Distribution_y", "Linear"), ("Distribution_z", "Linear")])
             else:
-                continue
+                existing = polygons.get(key[1])
+                try:
+                    obj = last(g_i.surfload(*([existing] if existing is not None else points)))
+                except Exception:
+                    if existing is not None:
+                        raise
+                    obj = last(g_i.surfload(keep(last(g_i.surface(*points)))))
+            values = [load_values(l, linear) for l in here]
+            configure(obj, values[0])
             keep(obj)
-            by_case.setdefault(load["case"], []).append(obj)
-            made[kind] += 1
+            cases = []
+            for l, v in zip(here, values):
+                if l["case"] not in cases:
+                    cases.append(l["case"])
+                    by_case.setdefault(l["case"], []).append(obj)
+                    made[kind] += 1
+            if len(cases) > 1 or len(here) > 1:
+                shared.append((obj, [(l["case"], v) for l, v in zip(here, values)]))
         except Exception as error:   # a command or property this PLAXIS version does not know
             refuse(kind, error)
             if sum(refused.values()) >= 20 and not sum(made.values()):
                 break                # nothing works: do not try every load
         if n % 200 == 199:
-            progress(f"loads {n + 1}/{len(loads)}, {time.time() - started:.0f} s")
+            progress(f"loads {n + 1}/{len(places)}, {time.time() - started:.0f} s")
     for kind, count in refused.items():
         warnings.append(f"PLAXIS refused {count} {kind} loads (first error: {first_error[kind]})")
-    report = dict(created=made, refused=refused, phases=[])
+    report = dict(created=made, refused=refused, phases=[], shared=len(shared), unset_phase_values=0)
     if phases and sum(made.values()):
         try:
-            report["phases"] = create_phases(g_i, data, by_case, structure, progress)
+            report["phases"] = create_phases(g_i, data, by_case, structure, progress, shared, report, warnings)
         except Exception as error:
             warnings.append(f"phases were not created ({type(error).__name__}: {error}); "
                             "the loads exist but are not activated in any phase")
+    elif shared:
+        warnings.append(f"{len(shared)} loads of several cases share one object and carry the values "
+                        "of the first case (no phases)")
     return report
 
 
-def create_phases(g_i, data, by_case, structure, progress):
+def set_in_phase(g_i, obj, name, phase, value):
+    """A property value that applies in one phase only."""
+    try:
+        g_i.set(getattr(obj, name), phase, value)
+        return True
+    except Exception:
+        return False
+
+
+def create_phases(g_i, data, by_case, structure, progress, shared=(), report=None, warnings=None):
     """Staged construction: a base phase with the structure, a phase per load
-    case derived from it with that case's loads."""
+    case derived from it with that case's loads; objects used by several cases
+    get each case's values in its phase."""
     g_i.gotostages()
     base = last(g_i.phase(g_i.InitialPhase))
     try:
@@ -292,6 +339,7 @@ def create_phases(g_i, data, by_case, structure, progress):
         g_i.activate(obj, base)
     names = {c[0]: c[1] for c in data.get("load_cases", [])}
     created = []
+    failed = 0
     for case in sorted(by_case):
         phase = last(g_i.phase(base))
         label = f"{case} {names.get(case, '')}".strip()
@@ -303,6 +351,20 @@ def create_phases(g_i, data, by_case, structure, progress):
             g_i.activate(obj, phase)
         created.append(label)
         progress(f"phase {label}: {len(by_case[case])} loads")
+        for obj, per_case in shared:
+            total = {}
+            for c, values in per_case:
+                if c == case:
+                    for name, value in values:
+                        total[name] = total.get(name, 0.0) + value
+            for name, value in total.items():
+                if not set_in_phase(g_i, obj, name, phase, value):
+                    failed += 1
+    if failed and report is not None:
+        report["unset_phase_values"] = failed
+    if failed and warnings is not None:
+        warnings.append(f"{failed} per-phase load values could not be set: loads shared by several "
+                        "cases carry the values of the first case in every phase")
     return created
 
 
@@ -353,6 +415,14 @@ class Recorder:
         return command
 
 
+class _Property:
+    def __init__(self, owner, key):
+        self.text = f"{owner}.{key}"
+
+    def __str__(self):
+        return self.text
+
+
 class _Object:
     def __init__(self, recorder, name):
         object.__setattr__(self, "_recorder", recorder)
@@ -360,6 +430,11 @@ class _Object:
 
     def __repr__(self):
         return self._name
+
+    def __getattr__(self, key):
+        if key.startswith("_"):
+            raise AttributeError(key)
+        return _Property(self._name, key)
 
     def setproperties(self, *args):
         names = args[0::2]

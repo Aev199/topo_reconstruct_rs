@@ -621,6 +621,7 @@ function chosenCombination() {
     simplify: true,
     center_tolerance: (Number($('plx-center').value) || 0) / 100,
     min_fraction: (Number($('plx-fraction').value) || 0) / 100,
+    max_points: Math.max(1, Math.round(Number($('plx-points').value) || 12)),
   };
 }
 

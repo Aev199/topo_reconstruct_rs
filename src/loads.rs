@@ -177,6 +177,114 @@ impl Report {
     }
 }
 
+/// One load per place and case: line loads of all cases are split at each
+/// other's ends where they overlap on a line (PLAXIS refuses overlapping
+/// lines) and the loads of one case on the same segment are added (linear
+/// distributions add up to a linear one); equal points and equal surface
+/// outlines of one case are added too. Force and moment are unchanged.
+pub fn consolidate(loads: Vec<Load>, tolerance: f64) -> Vec<Load> {
+    let mut out: Vec<Load> = vec![];
+    let mut lines: Vec<(u32, DVec3, DVec3, DVec3, DVec3)> = vec![];
+    let mut points: BTreeMap<(u32, [i64; 3]), ([f64; 3], DVec3, DVec3)> = BTreeMap::new();
+    let mut surfaces: BTreeMap<(u32, usize, Vec<[i64; 3]>), (Vec<Vec<[f64; 3]>>, DVec3)> = BTreeMap::new();
+    let quant = |p: DVec3| [0, 1, 2].map(|k| (p[k] / 1e-4).round() as i64);
+    for load in loads {
+        match load {
+            Load::Line { case, start, end, q_start, q_end } => {
+                let (a, b) = (DVec3::from_array(start), DVec3::from_array(end));
+                let (qa, qb) = (DVec3::from_array(q_start), DVec3::from_array(q_end));
+                if a.distance(b) < 1e-9 {
+                    out.push(Load::Line { case, start, end, q_start, q_end });
+                    continue;
+                }
+                // Oriented along the lexicographically positive direction.
+                let d = b - a;
+                let positive = d.x > 1e-12 || (d.x.abs() <= 1e-12 && (d.y > 1e-12 || (d.y.abs() <= 1e-12 && d.z > 0.)));
+                lines.push(if positive { (case, a, b, qa, qb) } else { (case, b, a, qb, qa) });
+            }
+            Load::Point { case, at, force, moment } => {
+                let e = points.entry((case, quant(DVec3::from_array(at)))).or_insert((at, DVec3::ZERO, DVec3::ZERO));
+                e.1 += DVec3::from_array(force);
+                e.2 += DVec3::from_array(moment);
+            }
+            Load::Surface { case, surface, polygons, sigma } => {
+                let key: Vec<[i64; 3]> = polygons.iter().flatten().map(|&p| quant(DVec3::from_array(p))).collect();
+                let e = surfaces.entry((case, surface, key)).or_insert((polygons, DVec3::ZERO));
+                e.1 += DVec3::from_array(sigma);
+            }
+        }
+    }
+    // Lines on one infinite line: the direction to 1e-4, the offset to 1 mm.
+    let mut groups: BTreeMap<([i64; 3], [i64; 3]), Vec<usize>> = BTreeMap::new();
+    for (i, l) in lines.iter().enumerate() {
+        let u = (l.2 - l.1).normalize();
+        let offset = l.1 - u * l.1.dot(u);
+        groups
+            .entry(([0, 1, 2].map(|k| (u[k] / 1e-4).round() as i64), [0, 1, 2].map(|k| (offset[k] / 1e-3).round() as i64)))
+            .or_default()
+            .push(i);
+    }
+    for members in groups.values() {
+        let base = lines[members[0]].1;
+        let u = (lines[members[0]].2 - base).normalize();
+        // (t0, t1, line index), t along u.
+        let mut spans: Vec<(f64, f64, usize)> = members
+            .iter()
+            .map(|&i| ((lines[i].1 - base).dot(u), (lines[i].2 - base).dot(u), i))
+            .map(|(t0, t1, i)| (t0.min(t1), t0.max(t1), i))
+            .collect();
+        spans.sort_by(|x, y| x.0.total_cmp(&y.0));
+        let mut start = 0;
+        while start < spans.len() {
+            // A chain: lines overlapping one after another.
+            let mut end = start + 1;
+            let mut reach = spans[start].1;
+            while end < spans.len() && spans[end].0 < reach - tolerance {
+                reach = reach.max(spans[end].1);
+                end += 1;
+            }
+            let chain = &spans[start..end];
+            let mut cuts: Vec<f64> = chain.iter().flat_map(|s| [s.0, s.1]).collect();
+            cuts.sort_by(f64::total_cmp);
+            let mut merged: Vec<f64> = vec![];
+            for c in cuts {
+                if merged.last().is_none_or(|&l| c - l > tolerance) {
+                    merged.push(c);
+                }
+            }
+            for w in merged.windows(2) {
+                let (s0, s1) = (w[0], w[1]);
+                let mut sums: BTreeMap<u32, (DVec3, DVec3)> = BTreeMap::new();
+                for &(t0, t1, i) in chain {
+                    if t0 > s0 + tolerance || t1 < s1 - tolerance {
+                        continue;
+                    }
+                    let (case, a, b, qa, qb) = lines[i];
+                    // The load at position t of this line (its own ends extended by the snap).
+                    let along = |t: f64| qa.lerp(qb, ((t - (a - base).dot(u)) / ((b - a).dot(u))).clamp(0., 1.));
+                    let e = sums.entry(case).or_default();
+                    e.0 += along(s0);
+                    e.1 += along(s1);
+                }
+                for (case, (qa, qb)) in sums {
+                    if qa.length() < 1e-12 && qb.length() < 1e-12 {
+                        continue;
+                    }
+                    out.push(Load::Line { case, start: (base + u * s0).to_array(), end: (base + u * s1).to_array(), q_start: qa.to_array(), q_end: qb.to_array() });
+                }
+            }
+            start = end;
+        }
+    }
+    for ((case, _), (at, force, moment)) in points {
+        out.push(Load::Point { case, at, force: force.to_array(), moment: moment.to_array() });
+    }
+    for ((case, surface, _), (polygons, sigma)) in surfaces {
+        out.push(Load::Surface { case, surface, polygons, sigma: sigma.to_array() });
+    }
+    out
+}
+
 /// Whether a load case is the self-weight of the structure (PLAXIS applies
 /// it itself): "СВ", "СВ_...", "СОБСТВЕННЫЙ ВЕС ...", "self weight".
 pub fn is_self_weight(name: &str) -> bool {
@@ -222,12 +330,51 @@ pub struct Simplify {
     pub center_tolerance: f64,
     /// Smallest loaded part of a plate or bar for a uniform load.
     pub min_fraction: f64,
+    /// Most point loads one plate gets per sign of its load: more are merged
+    /// by position (force and moment kept) so the model stays light.
+    pub max_points: usize,
 }
 
 impl Default for Simplify {
     fn default() -> Self {
-        Simplify { center_tolerance: 0.15, min_fraction: 0.3 }
+        Simplify { center_tolerance: 0.15, min_fraction: 0.3, max_points: 12 }
     }
+}
+
+/// Splits point forces (position, force) into at most `k` groups of near
+/// positions by bisection along the widest extent at the median of |F|.
+fn cluster(items: &[(DVec3, DVec3)], k: usize) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = vec![(0..items.len()).collect()];
+    while groups.len() < k.max(1) {
+        // The group with the most force that can still be split.
+        let Some((g, _)) = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.len() > 1)
+            .map(|(g, m)| (g, m.iter().map(|&i| items[i].1.length()).sum::<f64>()))
+            .max_by(|x, y| x.1.total_cmp(&y.1))
+        else {
+            break;
+        };
+        let mut members = groups.swap_remove(g);
+        let (lo, hi) = members.iter().fold((DVec3::splat(f64::MAX), DVec3::splat(f64::MIN)), |(l, h), &i| (l.min(items[i].0), h.max(items[i].0)));
+        let extent = hi - lo;
+        let axis = if extent.x >= extent.y && extent.x >= extent.z { 0 } else if extent.y >= extent.z { 1 } else { 2 };
+        members.sort_by(|&a, &b| items[a].0[axis].total_cmp(&items[b].0[axis]));
+        let total: f64 = members.iter().map(|&i| items[i].1.length()).sum();
+        let (mut run, mut cut) = (0., 1);
+        for (n, &i) in members.iter().enumerate() {
+            run += items[i].1.length();
+            if run >= total / 2. {
+                cut = (n + 1).clamp(1, members.len() - 1);
+                break;
+            }
+        }
+        let right = members.split_off(cut);
+        groups.push(members);
+        groups.push(right);
+    }
+    groups
 }
 
 /// Load cases combined into one case with a factor each.
@@ -984,6 +1131,10 @@ impl Context<'_> {
             }
         }
 
+        // ---- one object per place: PLAXIS refuses overlapping lines
+        let tolerance = (self.settings.snap * 0.2).clamp(1e-6, 0.01);
+        let loads = consolidate(loads, tolerance);
+
         // ---- reports per case
         let mut exported = Tally { origin, by_case: BTreeMap::new() };
         let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
@@ -1297,19 +1448,33 @@ impl Context<'_> {
                     let r = find(&mut parent, k);
                     parts.entry(r).or_default().push(members[k]);
                 }
+                // Points: one per connected part; a part whose centre of pressure is outside the
+                // plate (an L, a hole) is split into its elements; more points than
+                // `max_points` are merged by position.
+                let mut pool: Vec<(DVec3, DVec3)> = vec![];
                 for part in parts.values() {
                     let f: DVec3 = part.iter().map(|&i| items[i].1 * items[i].2).sum();
                     let ws: f64 = part.iter().map(|&i| items[i].1.length() * items[i].2).sum();
                     let at = part.iter().map(|&i| items[i].3 * (items[i].1.length() * items[i].2)).sum::<DVec3>() / ws;
                     if inside(at) {
-                        loads.push(Load::Point { case, at: at.to_array(), force: (f * factor).to_array(), moment: [0.; 3] });
+                        pool.push((at, f));
                     } else {
-                        // The centre of pressure is outside the plate (an L, a hole): every element
-                        // takes its own force, so the moment stays.
-                        for &i in part {
-                            loads.push(Load::Point { case, at: items[i].3.to_array(), force: ((items[i].1 * items[i].2) * factor).to_array(), moment: [0.; 3] });
-                        }
+                        pool.extend(part.iter().map(|&i| (items[i].3, items[i].1 * items[i].2)));
                     }
+                }
+                let groups = if pool.len() > simplify.max_points { cluster(&pool, simplify.max_points) } else { (0..pool.len()).map(|i| vec![i]).collect() };
+                if groups.len() < pool.len() {
+                    *report.approximated.entry("точечные нагрузки на пластину объединены по положению (равнодействующая сохранена)".into()).or_default() += 1;
+                }
+                for members in groups {
+                    let f: DVec3 = members.iter().map(|&i| pool[i].1).sum();
+                    let ws: f64 = members.iter().map(|&i| pool[i].1.length()).sum();
+                    let mut at = members.iter().map(|&i| pool[i].0 * pool[i].1.length()).sum::<DVec3>() / ws.max(1e-300);
+                    if !inside(at) {
+                        // The centre of the group is off the plate: the member nearest to it.
+                        at = members.iter().map(|&i| pool[i].0).min_by(|x, y| x.distance(at).total_cmp(&y.distance(at))).unwrap_or(at);
+                    }
+                    loads.push(Load::Point { case, at: at.to_array(), force: (f * factor).to_array(), moment: [0.; 3] });
                 }
                 *report.approximated.entry("давление на часть пластины заменено точечными силами".into()).or_default() += 1;
             }
@@ -2064,6 +2229,24 @@ impl Context<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn point_forces_are_merged_by_position_keeping_force_and_first_moment() {
+        // 100 forces on a 10 x 10 grid, -1 each, merged into at most 6 groups.
+        let items: Vec<(DVec3, DVec3)> = (0..100).map(|i| (DVec3::new((i % 10) as f64, (i / 10) as f64, 0.), DVec3::new(0., 0., -1.))).collect();
+        let groups = cluster(&items, 6);
+        assert!(groups.len() <= 6 && groups.len() > 1, "{}", groups.len());
+        let covered: usize = groups.iter().map(Vec::len).sum();
+        assert_eq!(covered, 100);
+        let (mut force, mut moment) = (DVec3::ZERO, DVec3::ZERO);
+        for g in &groups {
+            let f: DVec3 = g.iter().map(|&i| items[i].1).sum();
+            let at = g.iter().map(|&i| items[i].0 * items[i].1.length()).sum::<DVec3>() / g.iter().map(|&i| items[i].1.length()).sum::<f64>();
+            force += f;
+            moment += at.cross(f);
+        }
+        let exact: DVec3 = items.iter().map(|x| x.0.cross(x.1)).sum();
+        assert!((force.z + 100.).abs() < 1e-9 && (moment - exact).length() < 1e-9, "{force:?} {moment:?} {exact:?}");
+    }
     #[test]
     fn the_resultant_of_a_concave_surface_load_counts_its_true_area() {
         // An L: 3 x 3 minus 2 x 2 = 5 m2 under 2 kN/m2, wound either way.

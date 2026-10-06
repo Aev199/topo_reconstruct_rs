@@ -316,3 +316,34 @@ fn the_centre_of_an_oblique_quad_is_its_centre_of_area() {
         assert!(report.problems(loads::FORCE_TOLERANCE, loads::MOMENT_TOLERANCE).is_empty());
     }
 }
+
+#[test]
+fn overlapping_line_loads_are_split_and_added_per_case() {
+    use loads::{consolidate, Load};
+    let line = |case, x0: f64, x1: f64, q: f64| Load::Line { case, start: [x0, 0., 0.], end: [x1, 0., 0.], q_start: [0., 0., q], q_end: [0., 0., q] };
+    // Case 1: 0..4 at -10 and 2..6 at -5 (overlap 2..4); case 2: 0..4 at -1, drawn backwards.
+    let mut reversed = line(2, 0., 4., -1.);
+    if let Load::Line { start, end, .. } = &mut reversed {
+        std::mem::swap(start, end);
+    }
+    let input = vec![line(1, 0., 4., -10.), line(1, 2., 6., -5.), reversed, Load::Point { case: 1, at: [1., 1., 1.], force: [0., 0., -2.], moment: [0.; 3] }, Load::Point { case: 1, at: [1., 1., 1.], force: [0., 0., -3.], moment: [0.; 3] }];
+    let force = |list: &[Load], case: u32| resultant(list, case);
+    let (f1, f2) = (force(&input, 1), force(&input, 2));
+    let out = consolidate(input, 1e-6);
+    assert!((force(&out, 1) - f1).length() < 1e-9 && (force(&out, 2) - f2).length() < 1e-9);
+    // No two lines of the output overlap: each pair is equal or disjoint along the axis.
+    let spans: Vec<(f64, f64, u32)> = out.iter().filter_map(|l| match l { Load::Line { case, start, end, .. } => Some((start[0].min(end[0]), start[0].max(end[0]), *case)), _ => None }).collect();
+    for a in &spans {
+        for b in &spans {
+            let overlap = a.1.min(b.1) - a.0.max(b.0);
+            let same = (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9;
+            assert!(overlap <= 1e-9 || same, "{spans:?}");
+        }
+    }
+    // Case 1 has the segments 0..2, 2..4, 4..6; the overlap carries both.
+    let mid = out.iter().find_map(|l| match l { Load::Line { case: 1, start, end, q_start, .. } if (start[0] - 2.).abs() < 1e-9 && (end[0] - 4.).abs() < 1e-9 => Some(q_start[2]), _ => None }).unwrap();
+    assert!((mid + 15.).abs() < 1e-9, "{mid}");
+    // The two equal points are one.
+    let points: Vec<&Load> = out.iter().filter(|l| matches!(l, Load::Point { .. })).collect();
+    assert_eq!(points.len(), 1);
+}

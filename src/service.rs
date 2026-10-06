@@ -868,6 +868,7 @@ fn combination_from(value: Option<&Value>) -> Result<Option<crate::loads::Combin
     let simplify = value.get("simplify").and_then(Value::as_bool).unwrap_or(true).then(|| crate::loads::Simplify {
         center_tolerance: value.get("center_tolerance").and_then(Value::as_f64).unwrap_or(defaults.center_tolerance),
         min_fraction: value.get("min_fraction").and_then(Value::as_f64).unwrap_or(defaults.min_fraction),
+        max_points: value.get("max_points").and_then(Value::as_u64).map_or(defaults.max_points, |n| (n as usize).max(1)),
     });
     Ok(Some(crate::loads::Combination { factors, simplify }))
 }

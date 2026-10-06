@@ -591,6 +591,25 @@ an engineering approximation to be calibrated by the user.
 - Known approximation: trapezoidal pressure on a plate replaced by its mean
   (counted in `approximated`; its source tally is the same mean).
 
+### First real PLAXIS import (Остров, cut) (2026-10-06)
+
+User report: very slow transfer and `Lines overlap: Line_112..435` at gotostages/gotomesh,
+a dense field of point loads on the first slab above the foundation.
+- Cause 1: line loads of different cases (and of the combination, which only relabels
+  the cases of the loads made while reading) lay on the same lines as separate objects.
+  Now `loads::consolidate` (end of `transfer`): lines of all cases are split at each
+  other's ends where they overlap on a line and added per case and segment; equal
+  points and equal surface outlines of one case are added. Force and moment are
+  unchanged (unit test). `plaxis_export.py` makes one object per place, whatever the
+  number of cases, and sets each case's values in its phase with
+  `g_i.set(obj.prop, phase, value)` (unverified against a real PLAXIS: a failure is
+  reported as `unset_phase_values` and a warning, the first case's values stay).
+- Cause 2: in the combination a plate whose centre of pressure is outside it (courtyards,
+  openings) got one point load per element: 32 089 points on Остров. Now the points of a
+  plate are merged by position (bisection, force and first moment kept) to at most
+  `max_points` (default 12, UI field) per plate and sign: 830 points, 22 uniform surface
+  loads, force and moment identical to the source.
+
 Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:
 None` path of `transfer` gives that); (done: see above).

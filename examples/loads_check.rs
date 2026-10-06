@@ -79,6 +79,24 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
     println!("by kind: {by_kind:?}");
+    // How many loads of each kind, and how many distinct line / point places.
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut places: std::collections::BTreeSet<String> = Default::default();
+    let mut points: std::collections::BTreeSet<String> = Default::default();
+    for l in &list {
+        match l {
+            Load::Surface { .. } => *counts.entry("surface").or_default() += 1,
+            Load::Line { start, end, .. } => {
+                *counts.entry("line").or_default() += 1;
+                places.insert(format!("{:.3?}{:.3?}", start, end));
+            }
+            Load::Point { at, .. } => {
+                *counts.entry("point").or_default() += 1;
+                points.insert(format!("{at:.3?}"));
+            }
+        }
+    }
+    println!("counts {counts:?}, distinct lines {}, distinct points {}", places.len(), points.len());
     for c in &report.cases {
         let full = reference.as_ref().and_then(|r| r.cases.iter().find(|x| x.case == c.case)).map(|x| x.exported);
         println!("case {} {:?}: source {:?} exported {:?} uncut {:?}", c.case, c.name, c.source, c.exported, full);

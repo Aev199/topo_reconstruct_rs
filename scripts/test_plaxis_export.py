@@ -68,11 +68,16 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(r["loads"]["created"], {"point": 1, "line": 2, "surface": 2})
         self.assertIn("pointload (2.0 1.0 0.0)", g.commands)
         self.assertIn("set PointLoad_1.Fz -10", g.commands)
-        # A uniform line load sets the start values only; a linear one the end values too.
+        # Two cases load one place: one object, linear because one case is, with the values of
+        # each case set in its phase.
+        self.assertEqual(sum(c.startswith("lineload") for c in g.commands), 1)
+        self.assertIn("set LineLoad_1.Distribution_z 'Linear'", g.commands)
         self.assertIn("set LineLoad_1.qz_start -5", g.commands)
-        self.assertNotIn("set LineLoad_1.qz_end -5", g.commands)
-        self.assertIn("set LineLoad_2.qz_end -3", g.commands)
-        self.assertIn("set LineLoad_2.Distribution_z 'Linear'", g.commands)
+        self.assertIn("set LineLoad_1.qz_start Phase_3 -1.0", g.commands)
+        self.assertIn("set LineLoad_1.qz_end Phase_3 -3.0", g.commands)
+        self.assertIn("set LineLoad_1.qz_end Phase_2 -5.0", g.commands)
+        self.assertEqual(r["loads"]["shared"], 1)
+        self.assertEqual(r["loads"]["unset_phase_values"], 0)
         # A load polygon equal to a plate polygon (any start, any direction) loads that polygon.
         self.assertIn("surfload Polygon_1", g.commands)
         self.assertIn("set SurfaceLoad_1.sigz -2", g.commands)
@@ -83,6 +88,8 @@ class LoaderTests(unittest.TestCase):
         self.assertIn("activate Plate_1 Phase_1", g.commands)
         self.assertIn("activate Beam_1 Phase_1", g.commands)
         self.assertIn("activate PointLoad_1 Phase_2", g.commands)
+        self.assertIn("activate LineLoad_1 Phase_2", g.commands)
+        self.assertIn("activate LineLoad_1 Phase_3", g.commands)
         self.assertIn("activate SurfaceLoad_1 Phase_3", g.commands)
         self.assertIn("set Phase_2.Identification '1 СВ'", g.commands)
 
@@ -96,12 +103,18 @@ class LoaderTests(unittest.TestCase):
         g = Recorder(reject_commands={"lineload"})
         r = build(g, LOADS, progress=lambda _: None)
         self.assertEqual(r["loads"]["created"], {"point": 1, "line": 0, "surface": 2})
-        self.assertEqual(r["loads"]["refused"], {"line": 2})
-        self.assertTrue(any("refused 2 line loads" in w for w in r["warnings"]))
+        self.assertEqual(r["loads"]["refused"], {"line": 1})
+        self.assertTrue(any("refused 1 line loads" in w for w in r["warnings"]))
         g = Recorder(reject_commands={"phase"})
         r = build(g, LOADS, progress=lambda _: None)
         self.assertEqual(r["loads"]["phases"], [])
         self.assertTrue(any("phases were not created" in w for w in r["warnings"]))
+
+    def test_unset_phase_values_are_reported(self):
+        g = Recorder(reject_commands={"set"})
+        r = build(g, LOADS, progress=lambda _: None)
+        self.assertGreater(r["loads"]["unset_phase_values"], 0)
+        self.assertTrue(any("per-phase load values" in w for w in r["warnings"]))
 
     def test_refused_orientation_is_reported(self):
         g = Recorder(reject={"AxisFunction"})
