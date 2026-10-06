@@ -847,7 +847,19 @@ fn exchange_with(
                                     eiy / e / nominal.1,
                                     eiz / e / nominal.2
                                 ));
-                                (ef / e, eiy / e, eiz / e)
+                                // PLAXIS needs positive moments of inertia: a zero EI of LIRA
+                                // (no bending in that plane) becomes a millionth of the nominal one.
+                                let floor = |i: f64, nominal: f64, name: &str, notes: &mut Vec<String>| {
+                                    if i > 0. {
+                                        i
+                                    } else {
+                                        notes.push(format!("{name} = 0 in LIRA: PLAXIS needs a positive value, a millionth of the nominal one is used"));
+                                        nominal * 1e-6
+                                    }
+                                };
+                                let iy = floor(eiy / e, nominal.1, "EIy", &mut notes);
+                                let iz = floor(eiz / e, nominal.2, "EIz", &mut notes);
+                                (ef / e, iy, iz)
                             }
                             (StiffnessMode::Nominal, Some(_)) => {
                                 notes.push("nominal b x h stiffness; the LIRA type gives other EF/EI".into());

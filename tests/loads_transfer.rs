@@ -165,3 +165,102 @@ fn a_small_patch_becomes_a_point_load_at_its_centre() {
     assert!((DVec3::from_array(*at) - DVec3::new(0.5, 0.5, 0.)).length() < 1e-9, "{at:?}");
     assert!((DVec3::from_array(*force) - DVec3::new(0., 0., -20.)).length() < 1e-9, "{force:?}");
 }
+
+/// The moment of a case about the origin and its force, source and exported (the report).
+fn case_of(report: &loads::Report, case: u32) -> &loads::CaseReport {
+    report.cases.iter().find(|c| c.case == case).unwrap_or_else(|| panic!("case {case}: {:?}", report.cases))
+}
+
+fn near(a: [f64; 3], b: [f64; 3], tolerance: f64) -> bool {
+    (DVec3::from_array(a) - DVec3::from_array(b)).length() <= tolerance
+}
+
+/// Pressures of opposite signs on the halves of a plate (a couple): the combination must
+/// keep the moment, not drop the pair because its force is zero.
+#[test]
+fn a_couple_of_pressures_survives_the_combination() {
+    let text = source(|p| p, |_, _| true).replace("( 7/\n1 2 0 / 2 3 0 / 3 1 2 4 /", "( 7/\n1 2 0 / 2 -2 0 / 3 1 2 4 /");
+    let (list, report) = run_with(&text, "couple", combination(&[(1, 1.)]));
+    let c = case_of(&report, 0);
+    assert!(DVec3::from_array(c.source).length() < 1e-6, "{c:?}");
+    assert!(!list.is_empty(), "the couple was dropped");
+    // 2 tf/m2 x 12 m2 down on the left, up on the right: 240 kN at x = 1.5 and 4.5, My = 720 kN m.
+    assert!(near(c.exported_moment, c.source_moment, 1e-6 * c.moment_scale), "{c:?}");
+    assert!(DVec3::from_array(c.source_moment).length() > 700., "{c:?}");
+    // The exported loads alone give the same moment about the origin of the report.
+    let origin = DVec3::from_array(report.origin);
+    let mut moment = DVec3::ZERO;
+    for l in &list {
+        match l {
+            Load::Point { at, force, .. } => moment += (DVec3::from_array(*at) - origin).cross(DVec3::from_array(*force)),
+            Load::Surface { .. } | Load::Line { .. } => panic!("a couple is not a distributed load: {l:?}"),
+        }
+    }
+    assert!(near(moment.to_array(), c.source_moment, 1e-6 * c.moment_scale), "{moment:?} {c:?}");
+}
+
+/// A load of one sign with a smaller one of the other (net force kept, moment sign kept).
+#[test]
+fn unequal_pressures_of_both_signs_keep_force_and_moment() {
+    let text = source(|p| p, |_, _| true).replace("( 7/\n1 2 0 / 2 3 0 / 3 1 2 4 /", "( 7/\n1 2 0 / 2 -1 0 / 3 1 2 4 /");
+    let (_, report) = run_with(&text, "unequal", combination(&[(1, 1.)]));
+    let c = case_of(&report, 0);
+    assert!(near(c.exported, c.source, 1e-6 * DVec3::from_array(c.source).length()), "{c:?}");
+    assert!(near(c.exported_moment, c.source_moment, 1e-6 * c.moment_scale), "{c:?}");
+}
+
+/// The same square element numbered in tensor order and in perimeter order, with the edge
+/// load given by the local node numbers of each: the same load on the same edge.
+#[test]
+fn an_edge_load_follows_the_local_node_numbers_of_the_element() {
+    let build = |elements: &str, line: &str| {
+        format!(
+            "( 0/ 1; E/ 2; 5/\n39;\n1: C ;\n/\n)\n( 1/\n{elements})\n( 3/\n1 GEI 0.305915 0.17 0.2 RO 0.254929 /\n)\n\
+             ( 4/\n0 0 0 /\n1 0 0 /\n0 1 0 /\n1 1 0 /\n)\n( 6/\n{line})\n( 7/\n1 1 3 4 /\n)\n"
+        )
+    };
+    // Nodes 1 (0,0), 2 (1,0), 3 (0,1), 4 (1,1). Tensor order: 1 2 3 4 (an edge 1-3 is the left side);
+    // perimeter order: 1 2 4 3 (the left side is the edge 1-4... local nodes 1 and 4).
+    let tensor = build("41 1 1 2 3 4 /\n", "1 19 3 1 1 /\n");
+    let perimeter = build("41 1 1 2 4 3 /\n", "1 19 3 1 1 /\n");
+    // Edge from local node 1 to local node 3 (tensor) = (0,0)-(0,1); in the perimeter list the
+    // local node 3 is node 4 = (1,1): the diagonal. The equivalent perimeter row is "1 to 4".
+    let perimeter_equivalent = perimeter.replace("( 7/\n1 1 3 4 /", "( 7/\n1 1 4 4 /");
+    let (a, ra) = run_with(&tensor, "edge-tensor", None);
+    let (b, rb) = run_with(&perimeter_equivalent, "edge-perimeter", None);
+    let (fa, fb) = (resultant(&a, 1), resultant(&b, 1));
+    // 4 tf/m on 1 m, positive against the axis: 40 kN down.
+    assert!((fa - DVec3::new(0., 0., -40.)).length() < 1e-9, "{fa:?}");
+    assert!((fb - DVec3::new(0., 0., -40.)).length() < 1e-9, "{fb:?}");
+    let (ca, cb) = (case_of(&ra, 1), case_of(&rb, 1));
+    assert!(near(ca.exported_moment, ca.source_moment, 1e-6 * ca.moment_scale.max(1.)), "{ca:?}");
+    assert!(near(cb.exported_moment, cb.source_moment, 1e-6 * cb.moment_scale.max(1.)), "{cb:?}");
+    // Both put the load on the same line (the left side x = 0).
+    for list in [&a, &b] {
+        let Load::Line { start, end, .. } = &list[0] else { panic!("{list:?}") };
+        assert!(start[0].abs() < 1e-9 && end[0].abs() < 1e-9, "{start:?} {end:?}");
+    }
+}
+
+#[test]
+fn a_report_names_lost_force_and_lost_moment() {
+    use topo_reconstruct_rs::loads::{compare_resultants, CaseReport, Report, FORCE_TOLERANCE, MOMENT_TOLERANCE};
+    let case = |exported: [f64; 3], exported_moment: [f64; 3]| CaseReport {
+        case: 1,
+        name: "X".into(),
+        loads: 1,
+        source: [0., 0., -100.],
+        exported,
+        source_moment: [0., 50., 0.],
+        exported_moment,
+        moment_scale: 200.,
+        not_in_geometry: [0.; 3],
+    };
+    let report = |c| Report { origin: [0.; 3], cases: vec![c], ..Default::default() };
+    assert!(report(case([0., 0., -100.], [0., 50., 0.])).problems(FORCE_TOLERANCE, MOMENT_TOLERANCE).is_empty());
+    // Force kept, moment lost (a point load moved to the element centre).
+    assert_eq!(report(case([0., 0., -100.], [0., 20., 0.])).problems(FORCE_TOLERANCE, MOMENT_TOLERANCE).len(), 1);
+    // Everything exported as zero while the source is not.
+    assert_eq!(report(case([0.; 3], [0.; 3])).problems(FORCE_TOLERANCE, MOMENT_TOLERANCE).len(), 1);
+    assert!(compare_resultants(([0.; 3], [0.; 3]), ([0.; 3], [0.; 3]), 0., 0.02, 0.05).is_none());
+}

@@ -18,8 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// the cut on which a removed part stood.
 #[derive(Debug, Clone, Serialize, serde::Deserialize, PartialEq)]
 pub struct Support {
-    pub a: [f64; 3],
-    pub b: [f64; 3],
+    /// Vertices of the geometry (the support follows edits that move or
+    /// merge them): the ends of a wall's line, one vertex twice for a column.
+    pub a: usize,
+    pub b: usize,
     /// LIRA stiffness number of the wall or column.
     pub stiffness: u32,
 }
@@ -111,6 +113,7 @@ impl State {
         // Vertices within the shortest edge of the level are on it (a floor's
         // vertices differ by millimetres); an edge crossing farther gets a vertex.
         let minimum = self.model.minimum_edge();
+        let share = (self.model.precision() * 10.).max(1e-6);
         let tol = minimum.max(self.model.precision() * 10.).max(1e-6);
         let mut model = self.model.clone();
         let height = |model: &Model, v: usize| model.vertices()[v][2] - z;
@@ -174,7 +177,7 @@ impl State {
                         for u in ring {
                             let [a, b] = model.edges()[u.edge];
                             if label(&model, a) == 0 && label(&model, b) == 0 {
-                                walls.push(Support { a: model.vertices()[a], b: model.vertices()[b], stiffness: self.stiffness[s] });
+                                walls.push(Support { a, b, stiffness: self.stiffness[s] });
                             }
                         }
                     }
@@ -194,12 +197,8 @@ impl State {
             }
         }
         // Support lines found twice (a chord and the edge of a wall above) once.
-        let mut seen: BTreeSet<[i64; 7]> = BTreeSet::new();
-        walls.retain(|w| {
-            let q = |x: f64| (x * 1e6).round() as i64;
-            let (a, b) = if w.a <= w.b { (w.a, w.b) } else { (w.b, w.a) };
-            seen.insert([q(a[0]), q(a[1]), q(a[2]), q(b[0]), q(b[1]), q(b[2]), w.stiffness as i64])
-        });
+        let mut seen: BTreeSet<[usize; 3]> = BTreeSet::new();
+        walls.retain(|w| seen.insert([w.a.min(w.b), w.a.max(w.b), w.stiffness as usize]));
 
         // New faces first, then the old surfaces go.
         let mut new_data: Vec<(u32, usize)> = vec![];
@@ -249,8 +248,8 @@ impl State {
                 removed_bars.push(RemovedBar { reason: "cut".into(), source_axis: axis.source_axis, removed: true, source_elements: elements });
                 for (k, l) in [(0, l0), (1, l1)] {
                     if l == 0 {
-                        let p = model.vertices()[axis.endpoints[k]];
-                        columns.push(Support { a: p, b: p, stiffness: stiffness_at(k as f64) });
+                        let v = axis.endpoints[k];
+                        columns.push(Support { a: v, b: v, stiffness: stiffness_at(k as f64) });
                     }
                 }
                 continue;
@@ -269,7 +268,13 @@ impl State {
                 None => {
                     let mut p = p0 + (p1 - p0) * tc;
                     p.z = z;
-                    (tc, model.add_vertex(p.to_array()).map_err(|e| format!("cut_{e:?}"))?)
+                    // A vertex of the model already there (the split of a wall edge the bar runs
+                    // along, the bar of another storey) is the node: the topology stays shared.
+                    let shared = (0..model.vertices().len()).find(|&v| DVec3::from_array(model.vertices()[v]).distance(p) <= share);
+                    match shared {
+                        Some(v) => (tc, v),
+                        None => (tc, model.add_vertex(p.to_array()).map_err(|e| format!("cut_{e:?}"))?),
+                    }
                 }
             };
             let (lo, hi, ends) = if l0 < 0 { (0., tc, [e0, vertex]) } else { (tc, 1., [vertex, e1]) };
@@ -296,7 +301,7 @@ impl State {
                 })
                 .collect();
             let above_end = if l0 < 0 { 1. } else { 0. };
-            columns.push(Support { a: model.vertices()[vertex], b: model.vertices()[vertex], stiffness: stiffness_at(above_end) });
+            columns.push(Support { a: vertex, b: vertex, stiffness: stiffness_at(above_end) });
             axes.push(Axis { source_axis: axis.source_axis, endpoints: ends, anchors, spans });
         }
 
@@ -326,7 +331,7 @@ fn clip(
     z: f64,
     tol: f64,
     label: &dyn Fn(&Model, usize) -> i8,
-) -> Result<(Vec<Piece>, Vec<([f64; 3], [f64; 3])>), String> {
+) -> Result<(Vec<Piece>, Vec<(usize, usize)>), String> {
     let surface = model.surfaces()[s].clone();
     let plane = &model.planes()[surface.plane];
     let uv = |v: usize| DVec2::from_array(plane.project(model.vertices()[v]));
@@ -493,7 +498,61 @@ fn clip(
             }
         }
     }
-    let chord_lines = chords.iter().map(|[a, b]| (model.vertices()[*a], model.vertices()[*b])).collect();
+    let chord_lines = chords.iter().map(|[a, b]| (*a, *b)).collect();
     let _ = (z, tol);
     Ok((out, chord_lines))
+}
+
+/// The supports of the cut that still exist: a wall's line needs an edge of a
+/// surface along it, a column a bar node at its vertex. Positions follow the
+/// vertices (edits move them). Lines: (start, end, stiffness); columns:
+/// (point, stiffness).
+#[allow(clippy::type_complexity)]
+pub fn live_supports(state: &State) -> (Vec<(DVec3, DVec3, u32)>, Vec<(DVec3, u32)>) {
+    let Some(cut) = state.cut.as_ref() else { return (vec![], vec![]) };
+    let model = &state.model;
+    let vertices = model.vertices();
+    let tol = (model.precision() * 10.).max(1e-6);
+    let mut lines = vec![];
+    let used: Vec<usize> = (0..model.surfaces().len()).flat_map(|s| model.surface_edges(s).collect::<Vec<_>>()).collect();
+    for w in &cut.walls {
+        let (Some(a), Some(b)) = (vertices.get(w.a), vertices.get(w.b)) else { continue };
+        let (a, b) = (DVec3::from_array(*a), DVec3::from_array(*b));
+        let d = b - a;
+        if d.length() < 1e-9 {
+            continue;
+        }
+        let on = |p: DVec3| {
+            let t = (p - a).dot(d) / d.length_squared();
+            (-1e-9..=1. + 1e-9).contains(&t) && (p - a - d * t).length() <= tol
+        };
+        if used.iter().any(|&e| model.edges()[e].iter().all(|&v| on(DVec3::from_array(vertices[v])))) {
+            lines.push((a, b, w.stiffness));
+        }
+    }
+    let mut points = vec![];
+    for c in &cut.columns {
+        let Some(p) = vertices.get(c.a) else { continue };
+        if state.axes.iter().any(|axis| axis.endpoints.contains(&c.a) || axis.anchors.iter().any(|n| n.vertex == c.a)) {
+            points.push((DVec3::from_array(*p), c.stiffness));
+        }
+    }
+    (lines, points)
+}
+
+impl State {
+    /// A vertex merged into another one: the supports of the cut follow.
+    pub(super) fn remap_cut_vertex(&mut self, drop: usize, keep: usize) {
+        if let Some(cut) = self.cut.as_mut() {
+            for s in cut.walls.iter_mut().chain(cut.columns.iter_mut()) {
+                if s.a == drop {
+                    s.a = keep;
+                }
+                if s.b == drop {
+                    s.b = keep;
+                }
+            }
+            cut.walls.retain(|w| w.a != w.b);
+        }
+    }
 }

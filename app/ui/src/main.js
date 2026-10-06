@@ -549,13 +549,19 @@ function loadsSummary(exported) {
   if (!report) return '';
   const norm = (v) => Math.hypot(...v);
   let worst = 0;
+  let worstMoment = 0;
   for (const c of report.cases) {
     const base = norm(c.source);
     if (base > 1) worst = Math.max(worst, norm(c.source.map((x, i) => x - c.exported[i])) / base);
+    if (c.moment_scale > 1e-9) worstMoment = Math.max(worstMoment, norm(c.source_moment.map((x, i) => x - c.exported_moment[i])) / c.moment_scale);
   }
   const skipped = Object.entries(report.skipped).map(([what, n]) => `${what}: ${n}`).join('; ');
-  return `, нагрузок ${exported.loads} в ${report.cases.length} загружениях, расхождение равнодействующих до ${(worst * 100).toFixed(1)}%`
-    + (skipped ? `, не перенесено — ${skipped}` : '');
+  return `, нагрузок ${exported.loads} в ${report.cases.length} загружениях, расхождение сил до ${(worst * 100).toFixed(1)}%, моментов до ${(worstMoment * 100).toFixed(1)}%`
+    + (skipped ? `, не перенесено — ${skipped}` : '') + problemsText(exported.load_problems);
+}
+/// Lost force or moment that nothing explains: shown as an error, not as "done".
+function problemsText(problems) {
+  return problems && problems.length ? ` · НЕ ГОТОВО, потеря нагрузки: ${problems.join('; ')}` : '';
 }
 function loadWarnings(r) {
   const l = r.loads;
@@ -646,7 +652,7 @@ $('export-plaxis').onclick = async () => {
     + `балок ${exported.beams}, материалов ${exported.plate_materials}+${exported.beam_materials}${missing}${notes}`;
   const loadsText = loadsSummary(exported);
   if (choice === 'file') {
-    status(`Файл обмена сохранён: ${path} (${text}${loadsText}). Загрузчик: ${exported.script}`);
+    status(`Файл обмена сохранён: ${path} (${text}${loadsText}). Загрузчик: ${exported.script}`, !!exported.load_problems?.length);
     return;
   }
   const result = await busy('Построение модели в PLAXIS…', () => call('run_plaxis', {
@@ -662,7 +668,7 @@ $('export-plaxis').onclick = async () => {
     const r = result.report;
     const oriented = r.rectangular_beams ? `, ориентировано прямоугольных балок ${r.oriented_beams}/${r.rectangular_beams}` : '';
     status(`PLAXIS: создано плит ${r.plates ?? '?'}, балок ${r.beams ?? '?'}, материалов ${r.plate_materials ?? '?'}+${r.beam_materials ?? '?'}${oriented} за ${r.seconds ?? '?'} с (${text}${loadsText})${loadWarnings(r)}`,
-      r.rectangular_beams > r.oriented_beams || !!loadWarnings(r));
+      r.rectangular_beams > r.oriented_beams || !!loadWarnings(r) || !!exported.load_problems?.length);
   }
 };
 
@@ -752,15 +758,17 @@ $('export-midas').onclick = async () => {
   if (!result) return;
   const r = result.report;
   let worst = 0;
+  let worstMoment = 0;
   for (const c of result.cases) {
     const base = Math.hypot(...c.geometry);
     if (base > 1) worst = Math.max(worst, Math.hypot(...c.geometry.map((x, i) => x - c.mesh[i])) / base);
+    if (c.moment_scale > 1e-9) worstMoment = Math.max(worstMoment, Math.hypot(...c.geometry_moment.map((x, i) => x - c.mesh_moment[i])) / c.moment_scale);
   }
   const skipped = Object.entries(result.skipped).map(([what, n]) => `${what}: ${n}`).join('; ');
   status(`MIDAS: ${path} — узлов ${r.nodes}, стержней ${r.bars}, пластин ${r.plates} (треугольников ${result.triangles}, четырёхугольников ${result.quads}), `
-    + `загружений ${r.load_cases}, расхождение равнодействующих сетка/геометрия до ${(worst * 100).toFixed(1)}%`
-    + (skipped ? `, не перенесено — ${skipped}` : '') + (r.warnings.length ? `; ${r.warnings.join('; ')}` : ''),
-    r.warnings.length > 0);
+    + `загружений ${r.load_cases}, расхождение сетка/геометрия: сил до ${(worst * 100).toFixed(1)}%, моментов до ${(worstMoment * 100).toFixed(1)}%`
+    + (skipped ? `, не перенесено — ${skipped}` : '') + (r.warnings.length ? `; ${r.warnings.join('; ')}` : '') + problemsText(result.load_problems),
+    r.warnings.length > 0 || result.load_problems.length > 0);
 };
 
 $('undo').onclick = () => busy('Отмена…', async () => { await call('undo'); await refresh(); status('Правка отменена'); });

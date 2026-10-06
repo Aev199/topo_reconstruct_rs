@@ -203,7 +203,7 @@ pub fn write_mxt(mesh: &Mesh, loads: &MeshLoads, exchange: &Exchange, cases: &[(
         .keys()
         .copied()
         .filter(|c| {
-            loads.pressures.iter().any(|p| p.0 == *c) || loads.bar_loads.iter().any(|b| b.0 == *c) || loads.nodal.keys().any(|k| k.0 == *c)
+            loads.pressures.iter().any(|p| p.0 == *c) || loads.bar_loads.iter().any(|b| b.case == *c) || loads.nodal.keys().any(|k| k.0 == *c)
         })
         .collect();
     report.load_cases = written.len();
@@ -231,23 +231,23 @@ pub fn write_mxt(mesh: &Mesh, loads: &MeshLoads, exchange: &Exchange, cases: &[(
             }
             text += "\n";
         }
-        let mut beam_lines: Vec<(usize, usize, f64)> = vec![];
-        for &(c, bar, q) in &loads.bar_loads {
-            if c != case {
+        let mut beam_lines: Vec<(usize, usize, [f64; 2], [f64; 2])> = vec![];
+        for l in &loads.bar_loads {
+            if l.case != case {
                 continue;
             }
-            let Some(id) = bar_id[bar] else { continue };
-            for (k, v) in q.iter().enumerate() {
-                if v.abs() > 1e-12 {
-                    beam_lines.push((id, k, *v));
+            let Some(id) = bar_id[l.bar] else { continue };
+            for k in 0..3 {
+                if l.q[0][k].abs() > 1e-12 || l.q[1][k].abs() > 1e-12 {
+                    beam_lines.push((id, k, l.t, [l.q[0][k], l.q[1][k]]));
                 }
             }
         }
-        beam_lines.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        beam_lines.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2[0].total_cmp(&b.2[0])));
         if !beam_lines.is_empty() {
             text += "*BEAMLOAD    ; Element Beam Loads\n";
-            for (id, k, v) in beam_lines {
-                text += &format!("{id:>6}, BEAM   , UNILOAD, {}, NO , NO, aDir[1], , , , 0, {v:.3}, 1, {v:.3}, 0, 0, 0, 0, , NO, 0, 0, NO,\n", GLOBAL[k]);
+            for (id, k, t, q) in beam_lines {
+                text += &format!("{id:>6}, BEAM   , UNILOAD, {}, NO , NO, aDir[1], , , , {:.4}, {:.4}, {:.4}, {:.4}, 0, 0, 0, 0, , NO, 0, 0, NO,\n", GLOBAL[k], t[0], q[0], t[1], q[1]);
             }
             text += "\n";
         }
@@ -309,7 +309,7 @@ mod tests {
         };
         let mut loads = MeshLoads::default();
         loads.pressures.push((1, 0, [0., 0., -5.]));
-        loads.bar_loads.push((2, 0, [0., 2., 0.]));
+        loads.bar_loads.push(crate::mesh_loads::BarLoad { case: 2, bar: 0, t: [0., 1.], q: [[0., 2., 0.], [0., 2., 0.]] });
         loads.nodal.insert((2, 1), [1., 0., -10., 0., 0., 0.]);
         let cases = vec![(1, "ПОЛЫ".to_string()), (2, "СНЕГ".to_string()), (3, "ПУСТО".to_string())];
         let (text, report) = write_mxt(&mesh, &loads, &exchange(), &cases);
@@ -318,7 +318,7 @@ mod tests {
         assert!(text.contains("*STLDCASE    ; Static Load Cases\n   POLY, D,\n   SNEG, D,\n"), "{text}");
         assert!(text.contains("*USE-STLD, POLY\n\n*PRESSURE    ; Pressure Loads\n     2, PRES, PLATE, FACE, GZ, 0, 0, 0, NO, -5.0000, 0, 0, 0, 0,\n"), "{text}");
         assert!(text.contains("*CONLOAD    ; Nodal Loads\n     2, 1.000, 0.000, -10.000, 0.000, 0.000, 0.000,\n"), "{text}");
-        assert!(text.contains("     1, BEAM   , UNILOAD, GY, NO , NO, aDir[1], , , , 0, 2.000, 1, 2.000, 0, 0, 0, 0, , NO, 0, 0, NO,"), "{text}");
+        assert!(text.contains("     1, BEAM   , UNILOAD, GY, NO , NO, aDir[1], , , , 0.0000, 2.0000, 1.0000, 2.0000, 0, 0, 0, 0, , NO, 0, 0, NO,"), "{text}");
         assert!(text.contains("*THICKNESS    ; Thickness\n    2, VALUE, YES, 0.200, 0, NO, 0, 0, Plate_0.2"), "{text}");
         assert!(!text.contains("PUSTO"));
     }

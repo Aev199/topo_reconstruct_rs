@@ -115,7 +115,8 @@ impl LiraParser {
                         height: after(&words, "S0", 3).filter(|v| *v > 0.)? / 100.,
                         nu: after(&words, "Mu", 1),
                         density,
-                        stiffness: (numeric.len() >= 4 && numeric[..3].iter().all(|v| *v > 0.))
+                        // EF > 0; a bending stiffness of 0 is a real value (no bending in that plane).
+                        stiffness: (numeric.len() >= 4 && numeric[0] > 0. && numeric[1] >= 0. && numeric[2] >= 0.)
                             .then(|| [numeric[0], numeric[1], numeric[2], numeric[3]]),
                     }
                 } else {
@@ -504,6 +505,12 @@ mod tests {
                 height: 0.9
             }
         );
+    }
+    #[test]
+    fn a_zero_bending_stiffness_of_a_bar_is_read_as_a_value() {
+        let materials = LiraParser::materials_from(b"( 3/ 2 3e+006 100 0 50 / 0 S0 3e+006 40 90/ )");
+        let Some(Material::Bar { stiffness, .. }) = materials.get(&2) else { panic!("{materials:?}") };
+        assert_eq!(*stiffness, Some([3e6, 100., 0., 50.]));
     }
     #[test]
     fn malformed_tokens_and_references_fail_instead_of_shifting_geometry() {

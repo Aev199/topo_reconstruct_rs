@@ -544,6 +544,31 @@ in `export_plaxis` and `export_midas`; UI button «Этажи…» and options b
 in both export dialogs. Not verified in PLAXIS or MIDAS; the equivalence is
 an engineering approximation to be calibrated by the user.
 
+### Audit of 073700f: fixes (2026-10-06)
+
+- Loads: bar edge loads follow the element's local node numbers (L1); a
+  combination of pressures of both signs is kept as force + couple (L2,
+  `sign_groups`); crossing wall/column loads and weight are clipped by the cut
+  and supports are vertex ids, so they follow edits (C2, C4, `live_supports`);
+  the moment of removed loads is kept by a least-squares couple about the
+  supports (C3); modular ratio is linear in the column inertia (C5).
+- Cut: new vertices through `Model::split_edge` and shared-vertex reuse, no
+  coincident unshared vertices (C1, test `a_cut_leaves_no_coincident_vertices`);
+  vertex renumbering after cuts keeps `connected` consistent (G1, unit test
+  `renumber_pairs`; no end-to-end repro available).
+- Mesh loads: exact area fraction instead of centre tests; a patch well off the
+  centre of a large element goes to the nodes by its centroid (keeps moment);
+  partial bar loads clip the piece on the line of the load (N1); point loads
+  use barycentric weights (N3); tests in `tests/cutoff.rs`.
+- EI = 0 of a bar type is read as a value and floored with a note (M1).
+- The new check found a regression at once: `load_resultant` for surface loads summed |fan triangles|, overcounting concave contours 4-5x (скала3, тест 5); now signed (unit test with an L-shape). After the fix: Для testa/скала3 forces within 0.3 %, тест 5 within 2.4 % (СВ 0.6 %, полезная 1.2 2.4 % are flagged by `problems`).
+- Honest check: every case reports force and moment (source → geometry → mesh,
+  `Report::problems`, tolerances 2 % force / 5 % moment of the moment scale);
+  `export_plaxis` and `export_midas` return `load_problems`, the UI shows an
+  error status «НЕ ГОТОВО» instead of success when any is non-empty.
+- Still unverified: real import into PLAXIS 3D 2022 and MIDAS Civil, comparison
+  with an independent reference model (user side).
+
 Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:
 None` path of `transfer` gives that); (done: see above).

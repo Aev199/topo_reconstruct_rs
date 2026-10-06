@@ -111,13 +111,12 @@ fn the_cut_keeps_a_valid_lower_part_and_what_the_upper_part_rested_on() {
     }).sum();
     // Two slabs of 24 and the wall of 6 x 3.
     assert!((area - (48. + 18.)).abs() < 1e-6, "{area}");
-    let cut = state.cut.as_ref().unwrap();
-    assert_eq!(cut.walls.len(), 1, "{cut:?}");
-    let w = &cut.walls[0];
-    let length = ((w.a[0] - w.b[0]).powi(2) + (w.a[1] - w.b[1]).powi(2)).sqrt();
-    assert!((length - 6.).abs() < 1e-6 && (w.a[2] - 3.).abs() < 1e-9, "{w:?}");
-    assert_eq!(cut.columns.len(), 1, "{cut:?}");
-    assert!((cut.columns[0].a[0] - 3.).abs() < 1e-9 && (cut.columns[0].a[2] - 3.).abs() < 1e-9);
+    let (walls, columns) = topo_reconstruct_rs::reconstruction::assembly::cutoff::live_supports(state);
+    assert_eq!(walls.len(), 1, "{:?}", state.cut);
+    let (a, b, _) = walls[0];
+    assert!((a.distance(b) - 6.).abs() < 1e-6 && (a.z - 3.).abs() < 1e-9, "{a:?} {b:?}");
+    assert_eq!(columns.len(), 1, "{:?}", state.cut);
+    assert!((columns[0].0.x - 3.).abs() < 1e-9 && (columns[0].0.z - 3.).abs() < 1e-9);
     // The column below is whole, the one above is gone.
     assert_eq!(state.axes.len(), 1);
     // The geometry is still valid.
@@ -218,4 +217,107 @@ fn the_cap_slab_gets_the_bending_stiffness_of_what_stood_on_it() {
     let (_, _, doubled) = with_cap(s.state(), &materials, 8.).unwrap();
     assert!((doubled.equivalent_thickness / report.equivalent_thickness - 2.).abs() < 1e-6);
     assert!(with_cap(s.state(), &materials, 0.).is_none());
+}
+
+#[test]
+fn a_cut_leaves_no_coincident_vertices() {
+    // The cut level is shared by the slab, the wall panels and the column.
+    let mut s = session();
+    for z in [3., 4.5] {
+        s.apply(Edit::CutAbove { z }, "cut").unwrap();
+        let v = s.state().model.vertices().to_vec();
+        for i in 0..v.len() {
+            for j in 0..i {
+                let d = (0..3).map(|k| (v[i][k] - v[j][k]).powi(2)).sum::<f64>().sqrt();
+                assert!(d > 1e-6, "vertices {j} and {i} coincide at {:?} (cut at {z})", v[i]);
+            }
+        }
+        s.undo().unwrap();
+    }
+}
+
+/// The slab at z = 0 (surface index) of the tower, with a one-element mesh of its corners.
+fn slab_mesh(s: &Session) -> (topo_reconstruct_rs::meshing::Mesh, usize) {
+    use topo_reconstruct_rs::meshing::{Mesh, Shell};
+    let model = &s.state().model;
+    let surface = (0..model.surfaces().len())
+        .find(|&i| model.surface_edges(i).flat_map(|e| model.edges()[e]).all(|v| model.vertices()[v][2].abs() < 1e-9))
+        .expect("the slab at z = 0");
+    let mesh = Mesh {
+        nodes: vec![[0., 0., 0.], [6., 0., 0.], [6., 4., 0.], [0., 4., 0.]],
+        vertex_nodes: vec![],
+        shells: vec![Shell { nodes: vec![0, 1, 2, 3], surface, stiffness: 1 }],
+        bars: vec![],
+    };
+    (mesh, surface)
+}
+
+#[test]
+fn a_patch_inside_one_big_element_keeps_force_and_moment_on_the_mesh() {
+    use glam::DVec3;
+    use topo_reconstruct_rs::loads::Load;
+    use topo_reconstruct_rs::mesh_loads;
+    let s = session();
+    let (mesh, surface) = slab_mesh(&s);
+    // 1 m2 at (5, 1) under 10 kN/m2, and a point load at (4.5, 1).
+    let loads = vec![
+        Load::Surface { case: 1, surface, polygons: vec![vec![[4.5, 0.5, 0.], [5.5, 0.5, 0.], [5.5, 1.5, 0.], [4.5, 1.5, 0.]]], sigma: [0., 0., -10.] },
+        Load::Point { case: 2, at: [4.5, 1., 0.], force: [0., 0., -10.], moment: [0.; 3] },
+    ];
+    let on_mesh = mesh_loads::transfer(&mesh, s.state(), &loads, 0.02);
+    assert!(on_mesh.lost.is_empty(), "{:?}", on_mesh.lost);
+    let about = on_mesh.resultants_about(&mesh, DVec3::ZERO);
+    let (force, moment, scale) = about[&1];
+    assert!((force - DVec3::new(0., 0., -10.)).length() < 1e-6, "{force:?}");
+    assert!((moment - DVec3::new(-10., 50., 0.)).length() < 0.05 * scale, "{moment:?} {scale}");
+    // Barycentric distribution of a point load keeps its moment.
+    let (force, moment, _) = about[&2];
+    assert!((force - DVec3::new(0., 0., -10.)).length() < 1e-6, "{force:?}");
+    assert!((moment - DVec3::new(-10., 45., 0.)).length() < 1e-6, "{moment:?}");
+}
+
+#[test]
+fn a_partial_bar_load_is_not_spread_over_the_whole_bar() {
+    use glam::DVec3;
+    use topo_reconstruct_rs::loads::Load;
+    use topo_reconstruct_rs::meshing::{BarPiece, Mesh};
+    use topo_reconstruct_rs::mesh_loads;
+    let s = session();
+    let state = s.state();
+    // The column through (3, 2): one bar piece over the whole axis.
+    let axis = (0..state.axes.len())
+        .find(|&i| {
+            let [a, b] = state.axes[i].endpoints.map(|v| state.model.vertices()[v]);
+            (a[0] - 3.).abs() < 1e-9 && (b[0] - 3.).abs() < 1e-9
+        })
+        .expect("the column");
+    let [a, b] = state.axes[axis].endpoints.map(|v| state.model.vertices()[v]);
+    let mesh = Mesh {
+        nodes: vec![a, b],
+        vertex_nodes: vec![],
+        shells: vec![],
+        bars: vec![BarPiece { nodes: [0, 1], axis, stiffness: 2, t: [0., 1.] }],
+    };
+    let length = DVec3::from_array(a).distance(DVec3::from_array(b));
+    let (z0, z1) = (a[2] + 0.25 * (b[2] - a[2]), a[2] + 0.75 * (b[2] - a[2]));
+    let loads = vec![Load::Line { case: 1, start: [3., 2., z0], end: [3., 2., z1], q_start: [0., 0., -10.], q_end: [0., 0., -10.] }];
+    let on_mesh = mesh_loads::transfer(&mesh, state, &loads, 0.02);
+    let (force, moment, scale) = on_mesh.resultants_about(&mesh, DVec3::new(3., 2., a[2].min(b[2])))[&1];
+    // Half the length under 10 kN/m.
+    assert!((force - DVec3::new(0., 0., -5. * length)).length() < 1e-6, "{force:?}");
+    assert!(moment.length() < 1e-6 * scale.max(1.), "{moment:?}");
+}
+
+#[test]
+fn supports_follow_the_live_geometry_after_edits() {
+    use topo_reconstruct_rs::reconstruction::assembly::cutoff::live_supports;
+    let mut s = session();
+    s.apply(Edit::CutAbove { z: 3. }, "cut").unwrap();
+    assert_eq!(live_supports(s.state()).1.len(), 1);
+    // The column is deleted: nothing rests on a point any more.
+    let bars: Vec<usize> = (0..s.state().axes.len()).collect();
+    s.apply(Edit::DeleteBars { bars }, "delete").unwrap();
+    assert!(live_supports(s.state()).1.is_empty(), "{:?}", live_supports(s.state()));
+    // The wall is still there.
+    assert_eq!(live_supports(s.state()).0.len(), 1);
 }

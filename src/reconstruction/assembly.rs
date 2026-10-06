@@ -1679,7 +1679,7 @@ fn assemble_impl(
     let (_, _, fixed) = protected(&model, &axis_assembly);
     timer.lap("bar_end_merges");
     // Pairs of surfaces tied by links of the analysis model.
-    let connected: BTreeSet<[usize; 2]> = match features {
+    let mut connected: BTreeSet<[usize; 2]> = match features {
         Some(features) if !features.connections.is_empty() => {
             let nodes: std::collections::HashMap<u32, &Vec<u32>> =
                 mesh.elements.iter().map(|e| (e.id, &e.nodes)).collect();
@@ -1909,6 +1909,9 @@ fn assemble_impl(
                 simplified_holes.retain(|h| h.source_elements != ids);
             }
             let index = model.remove_surfaces(&covered);
+            // Pairs of surfaces tied by the analysis model follow the renumbering
+            // (the gaps between them are closed later by these indices).
+            connected = renumber_pairs(&connected, &index);
             surface_renumbering = if surface_renumbering.is_empty() {
                 index.clone()
             } else {
@@ -2169,8 +2172,32 @@ fn assemble_impl(
     })
 }
 
+/// Pairs of surfaces after surfaces were removed (`index`: the new number of
+/// each old surface, `None` for a removed one); a pair with a removed surface goes.
+fn renumber_pairs(pairs: &BTreeSet<[usize; 2]>, index: &[Option<usize>]) -> BTreeSet<[usize; 2]> {
+    pairs
+        .iter()
+        .filter_map(|&[a, b]| {
+            let (a, b) = (index.get(a).copied().flatten()?, index.get(b).copied().flatten()?);
+            Some([a.min(b), a.max(b)])
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn linked_pairs_follow_the_removal_of_a_surface() {
+        // Surfaces 0..3: surface 0 is removed; the pair of 1 and 2 becomes 0 and 1,
+        // whatever the order of the removed and the linked ones.
+        let pairs = std::collections::BTreeSet::from([[1, 2], [0, 2], [2, 3]]);
+        let index = [None, Some(0), Some(1), Some(2)];
+        assert_eq!(super::renumber_pairs(&pairs, &index), std::collections::BTreeSet::from([[0, 1], [1, 2]]));
+        // The removed surface last: the others keep their numbers.
+        let index = [Some(0), Some(1), Some(2), None];
+        assert_eq!(super::renumber_pairs(&pairs, &index), std::collections::BTreeSet::from([[1, 2], [0, 2]]));
+    }
+
     use super::*;
 
     #[test]

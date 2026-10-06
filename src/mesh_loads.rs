@@ -1,24 +1,36 @@
 //! Loads of the LIRA model carried onto a Gmsh mesh: every load case stays a
-//! case, a pressure goes to the shell elements whose centres are inside its
-//! contour (the contour is that of the source), line loads to the bar
-//! elements along them (or, along a plate edge, to its boundary nodes), point
-//! loads to the nodes of the element they act on. The resultant of every case
-//! is kept; the report compares it with that of the loads on the geometry.
+//! case, a pressure goes to the shell elements by the exact part of each
+//! element inside its contour (the contour is that of the source), line
+//! loads to the bar elements along them (clipped to the elements they
+//! cover; along a plate edge, to its nodes), point loads to the nodes of the
+//! element they act on (by barycentric weights, so force and moment are
+//! kept). The force and the moment of every case are kept; the report
+//! compares them with those of the loads on the geometry.
 use crate::loads::Load;
 use crate::meshing::Mesh;
 use crate::reconstruction::assembly::edit::State;
-use geo::{Area, BooleanOps, Coord, LineString, MultiPolygon, Polygon};
+use geo::{Centroid, Area, BooleanOps, Coord, LineString, MultiPolygon, Polygon};
 use glam::{DVec2, DVec3};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
+/// A linear load on the part `t` (fractions of the element from its first node) of a bar element.
+#[derive(Debug, Clone, Serialize)]
+pub struct BarLoad {
+    pub case: u32,
+    pub bar: usize,
+    pub t: [f64; 2],
+    /// kN/m (global) at the two ends of the part.
+    pub q: [[f64; 3]; 2],
+}
+
 /// Forces in kN, global axes.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct MeshLoads {
-    /// (case, shell, kN/m2 vector).
+    /// (case, shell, kN/m2 vector): the pressure acts on the whole element, scaled by
+    /// the part of it inside the contour.
     pub pressures: Vec<(u32, usize, [f64; 3])>,
-    /// (case, bar piece, uniform kN/m vector).
-    pub bar_loads: Vec<(u32, usize, [f64; 3])>,
+    pub bar_loads: Vec<BarLoad>,
     /// (case, node) -> force and moment.
     pub nodal: BTreeMap<(u32, usize), [f64; 6]>,
     /// Loads that found no element (point loads far from the mesh, pressure
@@ -29,15 +41,41 @@ pub struct MeshLoads {
 impl MeshLoads {
     /// Resultant force per case (kN).
     pub fn resultants(&self, mesh: &Mesh) -> BTreeMap<u32, DVec3> {
-        let mut out: BTreeMap<u32, DVec3> = BTreeMap::new();
+        self.resultants_about(mesh, DVec3::ZERO).into_iter().map(|(c, v)| (c, v.0)).collect()
+    }
+
+    /// Force, moment about `origin` and the scale of the moment (the sum of |F| |r|) per case.
+    pub fn resultants_about(&self, mesh: &Mesh, origin: DVec3) -> BTreeMap<u32, (DVec3, DVec3, f64)> {
+        let mut out: BTreeMap<u32, (DVec3, DVec3, f64)> = BTreeMap::new();
+        fn add(out: &mut BTreeMap<u32, (DVec3, DVec3, f64)>, origin: DVec3, case: u32, at: DVec3, f: DVec3, m: DVec3) {
+            let r = at - origin;
+            let e = out.entry(case).or_default();
+            e.0 += f;
+            e.1 += r.cross(f) + m;
+            e.2 += f.length() * r.length() + m.length();
+        }
         for &(case, shell, p) in &self.pressures {
-            *out.entry(case).or_default() += DVec3::from_array(p) * shell_area(mesh, shell);
+            let (area, centre) = shell_area_centroid(mesh, shell);
+            add(&mut out, origin, case, centre, DVec3::from_array(p) * area, DVec3::ZERO);
         }
-        for &(case, bar, q) in &self.bar_loads {
-            *out.entry(case).or_default() += DVec3::from_array(q) * bar_length(mesh, bar);
+        for l in &self.bar_loads {
+            let [a, b] = mesh.bars[l.bar].nodes;
+            let (pa, pb) = (point(mesh, a), point(mesh, b));
+            let (s, e) = (pa.lerp(pb, l.t[0]), pa.lerp(pb, l.t[1]));
+            let (qa, qb) = (DVec3::from_array(l.q[0]), DVec3::from_array(l.q[1]));
+            let length = s.distance(e);
+            // A linear load: force and moment from its two end values.
+            let (d, qd) = (e - s, qb - qa);
+            let (ra, rs) = (s - origin, length);
+            let force = (qa + qb) / 2. * rs;
+            let moment = (ra.cross(qa) + (ra.cross(qd) + d.cross(qa)) / 2. + d.cross(qd) / 3.) * rs;
+            let en = out.entry(l.case).or_default();
+            en.0 += force;
+            en.1 += moment;
+            en.2 += (qa.length() + qb.length()) / 2. * rs * ((s + e) / 2. - origin).length();
         }
-        for (&(case, _), f) in &self.nodal {
-            *out.entry(case).or_default() += DVec3::new(f[0], f[1], f[2]);
+        for (&(case, node), f) in &self.nodal {
+            add(&mut out, origin, case, point(mesh, node), DVec3::new(f[0], f[1], f[2]), DVec3::new(f[3], f[4], f[5]));
         }
         out
     }
@@ -47,11 +85,20 @@ fn point(mesh: &Mesh, n: usize) -> DVec3 {
     DVec3::from_array(mesh.nodes[n])
 }
 
-pub fn shell_area(mesh: &Mesh, shell: usize) -> f64 {
+/// Area and centroid of a shell element (a quad as a fan of triangles).
+pub fn shell_area_centroid(mesh: &Mesh, shell: usize) -> (f64, DVec3) {
     let p: Vec<DVec3> = mesh.shells[shell].nodes.iter().map(|&n| point(mesh, n)).collect();
-    (1..p.len() - 1)
-        .map(|i| (p[i] - p[0]).cross(p[i + 1] - p[0]).length() / 2.)
-        .sum()
+    let (mut area, mut first) = (0., DVec3::ZERO);
+    for i in 1..p.len() - 1 {
+        let t = (p[i] - p[0]).cross(p[i + 1] - p[0]).length() / 2.;
+        area += t;
+        first += (p[0] + p[i] + p[i + 1]) / 3. * t;
+    }
+    if area > 0. { (area, first / area) } else { (0., p[0]) }
+}
+
+pub fn shell_area(mesh: &Mesh, shell: usize) -> f64 {
+    shell_area_centroid(mesh, shell).0
 }
 
 pub fn bar_length(mesh: &Mesh, bar: usize) -> f64 {
@@ -71,6 +118,13 @@ fn inside(polygon: &[DVec2], q: DVec2) -> bool {
 }
 
 /// Distance of `p` from the segment `a`-`b` and the parameter of its foot.
+/// Distance of `p` from the infinite line through `a`, `b`, and the position of its foot along it (0 at `a`, 1 at `b`).
+fn line_distance(p: DVec3, a: DVec3, b: DVec3) -> (f64, f64) {
+    let d = b - a;
+    let t = (p - a).dot(d) / d.length_squared();
+    ((p - (a + d * t)).length(), t)
+}
+
 fn segment_distance(p: DVec3, a: DVec3, b: DVec3) -> (f64, f64) {
     let d = b - a;
     let t = if d.length_squared() > 0. { ((p - a).dot(d) / d.length_squared()).clamp(0., 1.) } else { 0. };
@@ -82,6 +136,83 @@ fn add_force(out: &mut MeshLoads, case: u32, node: usize, f: DVec3, m: DVec3) {
     for k in 0..3 {
         entry[k] += f[k];
         entry[k + 3] += m[k];
+    }
+}
+
+/// Shell elements by the cells of a grid (a point load finds its element).
+struct ShellIndex {
+    cell: f64,
+    cells: std::collections::HashMap<[i64; 3], Vec<usize>>,
+}
+
+impl ShellIndex {
+    fn new(mesh: &Mesh) -> Self {
+        let mut total = 0.;
+        for s in &mesh.shells {
+            let (a, b) = (point(mesh, s.nodes[0]), point(mesh, s.nodes[1]));
+            total += a.distance(b);
+        }
+        let cell = if mesh.shells.is_empty() { 1. } else { (total / mesh.shells.len() as f64 * 2.).max(1e-3) };
+        let mut cells: std::collections::HashMap<[i64; 3], Vec<usize>> = Default::default();
+        for (i, s) in mesh.shells.iter().enumerate() {
+            let p: Vec<DVec3> = s.nodes.iter().map(|&n| point(mesh, n)).collect();
+            let lo = p.iter().fold(DVec3::splat(f64::MAX), |l, q| l.min(*q));
+            let hi = p.iter().fold(DVec3::splat(f64::MIN), |h, q| h.max(*q));
+            let (a, b) = (Self::key(cell, lo), Self::key(cell, hi));
+            for x in a[0]..=b[0] {
+                for y in a[1]..=b[1] {
+                    for z in a[2]..=b[2] {
+                        cells.entry([x, y, z]).or_default().push(i);
+                    }
+                }
+            }
+        }
+        ShellIndex { cell, cells }
+    }
+
+    fn key(cell: f64, p: DVec3) -> [i64; 3] {
+        [0, 1, 2].map(|k| (p[k] / cell).floor() as i64)
+    }
+
+    /// The nodes and barycentric weights of `p` in the shell element it lies on
+    /// (within `tolerance` of the element's plane), else `None`.
+    fn locate(&self, mesh: &Mesh, p: DVec3, tolerance: f64) -> Option<Vec<(usize, f64)>> {
+        let mut best: Option<(f64, Vec<(usize, f64)>)> = None;
+        for &s in self.cells.get(&Self::key(self.cell, p)).into_iter().flatten() {
+            let nodes = &mesh.shells[s].nodes;
+            // Triangles of the element (a quad: two).
+            let triangles: Vec<[usize; 3]> = if nodes.len() == 3 { vec![[0, 1, 2]] } else { vec![[0, 1, 2], [0, 2, 3]] };
+            for t in triangles {
+                let (a, b, c) = (point(mesh, nodes[t[0]]), point(mesh, nodes[t[1]]), point(mesh, nodes[t[2]]));
+                let n = (b - a).cross(c - a);
+                if n.length() < 1e-12 {
+                    continue;
+                }
+                let n = n.normalize();
+                let distance = (p - a).dot(n).abs();
+                if distance > tolerance {
+                    continue;
+                }
+                let q = p - n * (p - a).dot(n);
+                // Barycentric coordinates in the triangle.
+                let (v0, v1, v2) = (b - a, c - a, q - a);
+                let (d00, d01, d11, d20, d21) = (v0.dot(v0), v0.dot(v1), v1.dot(v1), v2.dot(v0), v2.dot(v1));
+                let det = d00 * d11 - d01 * d01;
+                if det.abs() < 1e-18 {
+                    continue;
+                }
+                let l1 = (d11 * d20 - d01 * d21) / det;
+                let l2 = (d00 * d21 - d01 * d20) / det;
+                let l0 = 1. - l1 - l2;
+                if l0 >= -1e-9 && l1 >= -1e-9 && l2 >= -1e-9 && best.as_ref().is_none_or(|x| distance < x.0) {
+                    best = Some((distance, vec![(nodes[t[0]], l0.max(0.)), (nodes[t[1]], l1.max(0.)), (nodes[t[2]], l2.max(0.))]));
+                }
+            }
+        }
+        best.map(|(_, w)| {
+            let sum: f64 = w.iter().map(|x| x.1).sum();
+            w.into_iter().map(|(n, l)| (n, l / sum)).collect()
+        })
     }
 }
 
@@ -98,7 +229,6 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
         let c = shell.nodes.iter().map(|&n| point(mesh, n)).sum::<DVec3>() / shell.nodes.len() as f64;
         shells_of.entry(shell.surface).or_default().push((i, DVec2::from_array(plane.project(c.to_array()))));
     }
-    // Bars and shell edges by node, for finding the elements along a line.
     let mut edges_on_boundary: Vec<[usize; 2]> = vec![];
     {
         let mut count: BTreeMap<(usize, usize), usize> = BTreeMap::new();
@@ -114,6 +244,7 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
         let set: std::collections::BTreeSet<usize> = mesh.shells.iter().flat_map(|s| s.nodes.iter().copied()).collect();
         set.into_iter().collect()
     };
+    let index = ShellIndex::new(mesh);
     for load in loads {
         match load {
             Load::Surface { case, surface, polygons, sigma } => {
@@ -122,35 +253,63 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                     .iter()
                     .map(|p| p.iter().map(|&x| DVec2::from_array(plane.project(x))).collect())
                     .collect();
-                let mut found = false;
+                let boxes: Vec<(DVec2, DVec2)> = rings
+                    .iter()
+                    .map(|r| r.iter().fold((DVec2::splat(f64::MAX), DVec2::splat(f64::MIN)), |(l, h), p| (l.min(*p), h.max(*p))))
+                    .collect();
                 let region = MultiPolygon::new(
                     rings
                         .iter()
                         .map(|r| Polygon::new(LineString::from(r.iter().map(|p| Coord { x: p.x, y: p.y }).collect::<Vec<_>>()), vec![]))
                         .collect(),
                 );
+                let mut found = false;
                 for &(shell, c) in shells_of.get(surface).map(Vec::as_slice).unwrap_or(&[]) {
                     let corners: Vec<DVec2> = mesh.shells[shell]
                         .nodes
                         .iter()
                         .map(|&n| DVec2::from_array(plane.project(mesh.nodes[n])))
                         .collect();
+                    // Elements whose box touches no contour box are outside.
+                    let (lo, hi) = corners.iter().fold((DVec2::splat(f64::MAX), DVec2::splat(f64::MIN)), |(l, h), p| (l.min(*p), h.max(*p)));
+                    if boxes.iter().all(|b| hi.x < b.0.x || lo.x > b.1.x || hi.y < b.0.y || lo.y > b.1.y) {
+                        continue;
+                    }
                     let flags: Vec<bool> = corners.iter().map(|q| rings.iter().any(|r| inside(r, *q))).collect();
                     let centre_in = rings.iter().any(|r| inside(r, c));
-                    // Whole inside, or the part of the element in the contour.
+                    // Whole inside (the pieces of the contour tile the region), else the exact part.
+                    let mut nodal = false;
                     let fraction = if flags.iter().all(|f| *f) && centre_in {
                         1.
-                    } else if !centre_in && flags.iter().all(|f| !*f) {
-                        // Outside (a sliver of the contour poking into the element is ignored).
-                        0.
                     } else {
                         let element = Polygon::new(LineString::from(corners.iter().map(|p| Coord { x: p.x, y: p.y }).collect::<Vec<_>>()), vec![]);
                         let area = element.unsigned_area();
-                        if area > 0. { (element.intersection(&region).unsigned_area() / area).clamp(0., 1.) } else { 0. }
+                        let covered = element.intersection(&region);
+                        let fraction = if area > 0. { (covered.unsigned_area() / area).clamp(0., 1.) } else { 0. };
+                        // A constant pressure acts at the element centre: when the covered
+                        // part lies well off it (a small patch in a large element), the load
+                        // goes to the nodes by the position of its centroid, which keeps the
+                        // moment too.
+                        if fraction > 1e-9 && fraction < 1. {
+                            if let Some(centroid) = covered.centroid() {
+                                let diagonal = (hi - lo).length();
+                                if (DVec2::new(centroid.x(), centroid.y()) - c).length() > 0.1 * diagonal {
+                                    let at = DVec3::from_array(plane.lift([centroid.x(), centroid.y()]));
+                                    if let Some(weights) = index.locate(mesh, at, tolerance.max(1e-6)) {
+                                        let force = DVec3::from_array(*sigma) * covered.unsigned_area();
+                                        for (n, w) in weights {
+                                            add_force(&mut out, *case, n, force * w, DVec3::ZERO);
+                                        }
+                                        nodal = true;
+                                        found = true;
+                                    }
+                                }
+                            }
+                        }
+                        fraction
                     };
-                    if fraction > 1e-6 {
-                        let p = DVec3::from_array(*sigma) * fraction;
-                        out.pressures.push((*case, shell, p.to_array()));
+                    if fraction > 1e-9 && !nodal {
+                        out.pressures.push((*case, shell, (DVec3::from_array(*sigma) * fraction).to_array()));
                         found = true;
                     }
                 }
@@ -169,17 +328,34 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                 let (a, b) = (DVec3::from_array(*start), DVec3::from_array(*end));
                 let (qa, qb) = (DVec3::from_array(*q_start), DVec3::from_array(*q_end));
                 let length = a.distance(b);
+                if length < 1e-12 {
+                    continue;
+                }
                 let mut bars = 0;
                 for (i, piece) in mesh.bars.iter().enumerate() {
                     let (p, q) = (point(mesh, piece.nodes[0]), point(mesh, piece.nodes[1]));
-                    let (da, ta) = segment_distance(p, a, b);
-                    let (db, tb) = segment_distance(q, a, b);
-                    if da <= tolerance && db <= tolerance && ((ta - tb).abs() * length) > tolerance {
-                        // Uniform on the piece, with the value at its middle.
-                        let t = (ta + tb) / 2.;
-                        out.bar_loads.push((*case, i, (qa + (qb - qa) * t).to_array()));
-                        bars += 1;
+                    // The piece lies on the line of the load (it may be longer or shorter than the load).
+                    let (da, ta) = line_distance(p, a, b);
+                    let (db, tb) = line_distance(q, a, b);
+                    if da > tolerance || db > tolerance {
+                        continue;
                     }
+                    // The piece on the load line (unclamped, so the part beyond the line is cut).
+                    let line = b - a;
+                    let t_of = |x: DVec3| (x - a).dot(line) / line.length_squared();
+                    let (t0, t1) = (t_of(p), t_of(q));
+                    let _ = (ta, tb);
+                    let (lo, hi) = (t0.min(t1).max(0.), t0.max(t1).min(1.));
+                    if (hi - lo) * length < 1e-9 || (t1 - t0).abs() < 1e-12 {
+                        continue;
+                    }
+                    // Fractions of the piece (from its first node) of the covered part.
+                    let u = |t: f64| (t - t0) / (t1 - t0);
+                    let value = |t: f64| qa.lerp(qb, t);
+                    let ends = [(u(lo), value(lo)), (u(hi), value(hi))];
+                    let [first, second] = if ends[0].0 <= ends[1].0 { ends } else { [ends[1], ends[0]] };
+                    out.bar_loads.push(BarLoad { case: *case, bar: i, t: [first.0.clamp(0., 1.), second.0.clamp(0., 1.)], q: [first.1.to_array(), second.1.to_array()] });
+                    bars += 1;
                 }
                 if bars > 0 {
                     continue;
@@ -222,7 +398,6 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                     shares.push((w[1].1, f / 2.));
                 }
                 let total: DVec3 = shares.iter().map(|s| s.1).sum();
-                // The chain may not span the whole line: keep the resultant.
                 let scale = if total.length() > 1e-12 { resultant.length() / total.length() } else { 1. };
                 for (n, f) in shares {
                     add_force(&mut out, *case, n, f * scale, DVec3::ZERO);
@@ -241,16 +416,24 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                 }
                 if let Some((_, i, t)) = best {
                     let [a, b] = mesh.bars[i].nodes;
+                    // Weights (1 - t, t) keep the force and its first moment on the bar.
                     add_force(&mut out, *case, a, f * (1. - t), m * (1. - t));
                     add_force(&mut out, *case, b, f * t, m * t);
                     continue;
                 }
-                // The nearest node (a point load is placed at a node of the geometry or on a plate).
+                // On a shell element: the weights of the triangle around it keep force and moment.
+                if let Some(weights) = index.locate(mesh, p, tolerance.max(1e-6)) {
+                    for (n, w) in weights {
+                        add_force(&mut out, *case, n, f * w, m * w);
+                    }
+                    continue;
+                }
+                // Off the mesh: the nearest node, with the moment of the offset.
                 let nearest = (0..mesh.nodes.len())
                     .map(|n| (point(mesh, n).distance(p), n))
                     .min_by(|x, y| x.0.total_cmp(&y.0));
                 match nearest {
-                    Some((d, n)) if d <= tolerance.max(1e-9) * 1000. => add_force(&mut out, *case, n, f, m),
+                    Some((d, n)) if d <= tolerance.max(1e-9) * 1000. => add_force(&mut out, *case, n, f, m + (p - point(mesh, n)).cross(f)),
                     _ => *out.lost.entry(*case).or_default() = (DVec3::from_array(out.lost.get(case).copied().unwrap_or_default()) + f).to_array(),
                 }
             }

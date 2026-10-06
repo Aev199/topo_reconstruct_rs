@@ -75,6 +75,11 @@ pub struct CaseReport {
     /// exported ones.
     pub source: [f64; 3],
     pub exported: [f64; 3],
+    /// Moment (kN m) of the same loads about `Report::origin`, and the
+    /// scale of that moment (the sum of |F| |r|) it is compared with.
+    pub source_moment: [f64; 3],
+    pub exported_moment: [f64; 3],
+    pub moment_scale: f64,
     /// Resultant (kN) of plate loads on elements that are not in the
     /// reconstructed geometry (absorbed, removed or deleted), not counted in
     /// `source`.
@@ -83,11 +88,61 @@ pub struct CaseReport {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Report {
+    /// The point the moments are taken about.
+    pub origin: [f64; 3],
     pub cases: Vec<CaseReport>,
     /// What was not transferred, with the number of load rows.
     pub skipped: BTreeMap<String, usize>,
     /// What was transferred approximately.
     pub approximated: BTreeMap<String, usize>,
+}
+
+/// Tolerances of the load check: relative to the resultant force, and to the
+/// scale (the sum of |F| |r|) of the moment.
+pub const FORCE_TOLERANCE: f64 = 0.02;
+pub const MOMENT_TOLERANCE: f64 = 0.05;
+
+/// Compares a resultant (force, moment) with the reference one; `None` when
+/// they agree, else a description of what was lost.
+pub fn compare_resultants(
+    reference: ([f64; 3], [f64; 3]),
+    got: ([f64; 3], [f64; 3]),
+    moment_scale: f64,
+    force_tol: f64,
+    moment_tol: f64,
+) -> Option<String> {
+    let norm = |v: [f64; 3]| DVec3::from_array(v).length();
+    let diff = |a: [f64; 3], b: [f64; 3]| (DVec3::from_array(a) - DVec3::from_array(b)).length();
+    let mut out = Vec::new();
+    let force_base = norm(reference.0).max(norm(got.0));
+    let dforce = diff(reference.0, got.0);
+    if dforce > 1e-3 && dforce > force_tol * force_base {
+        out.push(format!("сила {:.1} → {:.1} кН", norm(reference.0), norm(got.0)));
+    }
+    let dmoment = diff(reference.1, got.1);
+    if dmoment > 1e-3 && dmoment > moment_tol * moment_scale.max(1e-9) {
+        out.push(format!("момент {:.1} → {:.1} кН·м", norm(reference.1), norm(got.1)));
+    }
+    (!out.is_empty()).then(|| out.join(", "))
+}
+
+impl Report {
+    /// Cases whose force or moment was lost between the source and the
+    /// exported loads, or that rest on elements missing from the geometry;
+    /// one line each. Empty when everything is accounted for.
+    pub fn problems(&self, force_tol: f64, moment_tol: f64) -> Vec<String> {
+        let mut out = Vec::new();
+        for c in &self.cases {
+            if let Some(what) = compare_resultants((c.source, c.source_moment), (c.exported, c.exported_moment), c.moment_scale, force_tol, moment_tol) {
+                out.push(format!("загружение {} «{}»: {what}", c.case, c.name));
+            }
+            let missing = DVec3::from_array(c.not_in_geometry).length();
+            if missing > 1e-3 && missing > force_tol * DVec3::from_array(c.source).length() {
+                out.push(format!("загружение {} «{}»: {:.1} кН приложено к элементам, которых нет в геометрии", c.case, c.name, missing));
+            }
+        }
+        out
+    }
 }
 
 /// Whether a load case is the self-weight of the structure (PLAXIS applies
@@ -240,12 +295,12 @@ fn shell_ring_nodes(p: &[DVec3], nodes: &[u32]) -> Vec<(u32, DVec3)> {
 
 /// Local axes of a shell element: X1 from its first to its second node, Z1
 /// the normal by the right-hand rule of the perimeter order.
-fn shell_axes(ring: &[DVec3]) -> Option<[DVec3; 3]> {
+fn shell_axes(ring: &[DVec3], listed: &[DVec3]) -> Option<[DVec3; 3]> {
     let newell: DVec3 = (0..ring.len())
         .map(|i| ring[i].cross(ring[(i + 1) % ring.len()]))
         .sum();
     let z = newell.try_normalize()?;
-    let x = (ring[1] - ring[0]).try_normalize()?;
+    let x = (listed[1] - listed[0]).try_normalize()?;
     let y = z.cross(x).try_normalize()?;
     Some([y.cross(z), y, z])
 }
@@ -279,6 +334,194 @@ fn unit(direction: u8) -> Option<DVec3> {
 /// (taken as global).
 fn frame(code: u16) -> u16 {
     code / 10
+}
+
+/// Resultant force, moment about `origin` and the scale of the moment
+/// (the sum of |F| |r|) of loads, per case.
+#[derive(Debug, Clone, Default)]
+struct Tally {
+    origin: DVec3,
+    by_case: BTreeMap<u32, (DVec3, DVec3, f64)>,
+}
+
+impl Tally {
+    fn add(&mut self, case: u32, at: DVec3, force: DVec3, moment: DVec3) {
+        let r = at - self.origin;
+        let e = self.by_case.entry(case).or_default();
+        e.0 += force;
+        e.1 += r.cross(force) + moment;
+        e.2 += force.length() * r.length() + moment.length();
+    }
+
+    /// A linear line load `qa` to `qb` (force per length) along `a`-`b`.
+    fn add_line(&mut self, case: u32, a: DVec3, b: DVec3, qa: DVec3, qb: DVec3) {
+        let (force, moment, scale) = line_resultant(a - self.origin, b - self.origin, qa, qb);
+        let e = self.by_case.entry(case).or_default();
+        e.0 += force;
+        e.1 += moment;
+        e.2 += scale;
+    }
+
+    fn scaled_into(&self, weights: &dyn Fn(u32) -> f64, case: u32) -> Tally {
+        let mut out = Tally { origin: self.origin, by_case: BTreeMap::new() };
+        for (&c, v) in &self.by_case {
+            let w = weights(c);
+            let e = out.by_case.entry(case).or_default();
+            e.0 += v.0 * w;
+            e.1 += v.1 * w;
+            e.2 += v.2 * w.abs();
+        }
+        out
+    }
+}
+
+/// Force, moment about the origin (the points are relative to it) and
+/// the scale of the moment of a linear line load.
+fn line_resultant(a: DVec3, b: DVec3, qa: DVec3, qb: DVec3) -> (DVec3, DVec3, f64) {
+    let (d, e) = (b - a, qb - qa);
+    let length = d.length();
+    let force = (qa + qb) / 2. * length;
+    let moment = (a.cross(qa) + (a.cross(e) + d.cross(qa)) / 2. + d.cross(e) / 3.) * length;
+    let scale = (qa.length() + qb.length()) / 2. * length * ((a + b) / 2.).length();
+    (force, moment, scale)
+}
+
+/// Force and moment about `origin` of an exported load.
+fn load_resultant(load: &Load, origin: DVec3) -> (DVec3, DVec3, f64) {
+    match load {
+        Load::Point { at, force, moment, .. } => {
+            let (f, m, r) = (DVec3::from_array(*force), DVec3::from_array(*moment), DVec3::from_array(*at) - origin);
+            (f, r.cross(f) + m, f.length() * r.length() + m.length())
+        }
+        Load::Line { start, end, q_start, q_end, .. } => line_resultant(
+            DVec3::from_array(*start) - origin,
+            DVec3::from_array(*end) - origin,
+            DVec3::from_array(*q_start),
+            DVec3::from_array(*q_end),
+        ),
+        Load::Surface { polygons, sigma, .. } => {
+            let sigma = DVec3::from_array(*sigma);
+            // Area and its first moment from the signed fan triangles of each ring (the
+            // contours may be concave, so the triangles are signed along the ring normal).
+            let (mut area, mut first) = (0., DVec3::ZERO);
+            for polygon in polygons {
+                let p: Vec<DVec3> = polygon.iter().map(|&x| DVec3::from_array(x) - origin).collect();
+                if p.len() < 3 {
+                    continue;
+                }
+                let normal: DVec3 = (1..p.len() - 1).map(|i| (p[i] - p[0]).cross(p[i + 1] - p[0])).sum();
+                if normal.length() < 1e-18 {
+                    continue;
+                }
+                let normal = normal.normalize();
+                for i in 1..p.len() - 1 {
+                    let t = (p[i] - p[0]).cross(p[i + 1] - p[0]).dot(normal) / 2.;
+                    area += t;
+                    first += (p[0] + p[i] + p[i + 1]) / 3. * t;
+                }
+            }
+            (sigma * area, first.cross(sigma), sigma.length() * first.length())
+        }
+    }
+}
+
+/// A polygon ring clipped by the plane z = level: the part below
+/// (`below`) or above it (Sutherland-Hodgman).
+fn clip_ring(ring: &[DVec3], level: f64, below: bool) -> Vec<DVec3> {
+    let inside = |p: DVec3| if below { p.z <= level } else { p.z >= level };
+    let mut out = vec![];
+    for i in 0..ring.len() {
+        let (p, q) = (ring[i], ring[(i + 1) % ring.len()]);
+        match (inside(p), inside(q)) {
+            (true, true) => out.push(q),
+            (true, false) | (false, true) => {
+                let t = (level - p.z) / (q.z - p.z);
+                out.push(p + (q - p) * t);
+                if inside(q) {
+                    out.push(q);
+                }
+            }
+            (false, false) => {}
+        }
+    }
+    out
+}
+
+/// A linear load `qa` to `qb` (force per length, along one direction) on
+/// the part `ta`..`tb` of a bar of `length` as parts of one sign: (position
+/// of the centre, force). A trapezoid whose ends differ in sign is cut at
+/// its zero into two triangles.
+fn trapezoid_parts(ta: f64, tb: f64, qa: DVec3, qb: DVec3, length: f64) -> Vec<(f64, DVec3)> {
+    let d = if qa.length() >= qb.length() { qa } else { qb };
+    if d.length() < 1e-300 {
+        return vec![];
+    }
+    let d = d.normalize();
+    let (a, b) = (qa.dot(d), qb.dot(d));
+    let span = (tb - ta) * length;
+    if a * b >= 0. {
+        let (ma, mb) = (a.abs(), b.abs());
+        let t = if ma + mb > 1e-300 { ta + (tb - ta) * (ma + 2. * mb) / (3. * (ma + mb)) } else { (ta + tb) / 2. };
+        return vec![(t, d * ((a + b) / 2. * span))];
+    }
+    let u = a / (a - b);
+    let tc = ta + (tb - ta) * u;
+    vec![
+        (ta + (tc - ta) / 3., d * (a / 2. * u * span)),
+        (tc + (tb - tc) * 2. / 3., d * (b / 2. * (1. - u) * span)),
+    ]
+}
+
+/// Forces with their positions along a line, grouped by sign along the
+/// direction of the resultant (of the largest force when it cancels): one
+/// group when the loads are of one sign (or the other sign is negligible),
+/// else the groups as (force, position of its centre by |F|).
+fn sign_groups(parts: &[(DVec3, f64)]) -> Vec<(DVec3, f64)> {
+    let indexed: Vec<(DVec3, usize)> = parts.iter().enumerate().map(|(i, p)| (p.0, i)).collect();
+    sign_group_members(&indexed)
+        .into_iter()
+        .map(|members| {
+            let f: DVec3 = members.iter().map(|&i| parts[i].0).sum();
+            let w: f64 = members.iter().map(|&i| parts[i].0.length()).sum();
+            let t = members.iter().map(|&i| parts[i].0.length() * parts[i].1).sum::<f64>() / w.max(1e-300);
+            (f, t)
+        })
+        .collect()
+}
+
+/// Members (their second field) grouped by the sign of their force along
+/// the direction of the total (of the largest when the total cancels); one
+/// group when the minority is under 2 % of the total magnitude.
+fn sign_group_members(forces: &[(DVec3, usize)]) -> Vec<Vec<usize>> {
+    let total_abs: f64 = forces.iter().map(|f| f.0.length()).sum();
+    if total_abs < 1e-300 {
+        return vec![];
+    }
+    let sum: DVec3 = forces.iter().map(|f| f.0).sum();
+    let reference = if sum.length() > 1e-9 * total_abs {
+        sum
+    } else {
+        forces.iter().max_by(|a, b| a.0.length().total_cmp(&b.0.length())).map_or(DVec3::X, |f| f.0)
+    }
+    .normalize();
+    let (mut positive, mut negative) = (vec![], vec![]);
+    let (mut wp, mut wn) = (0., 0.);
+    for (f, i) in forces {
+        if f.length() < 1e-300 {
+            continue;
+        }
+        if f.dot(reference) >= 0. {
+            positive.push(*i);
+            wp += f.length();
+        } else {
+            negative.push(*i);
+            wn += f.length();
+        }
+    }
+    if wp.min(wn) < 0.02 * total_abs {
+        return vec![positive.into_iter().chain(negative).collect()];
+    }
+    vec![positive, negative]
 }
 
 /// Sign of force loads. A positive value in a LIRA file acts against the
@@ -379,7 +622,15 @@ impl Context<'_> {
         let factor = self.settings.force_factor;
         let mut report = Report::default();
         let mut loads: Vec<Load> = vec![];
-        let mut source: BTreeMap<u32, DVec3> = BTreeMap::new();
+        let origin = {
+            let v = self.state.model.vertices();
+            let (lo, hi) = v.iter().fold(([f64::MAX; 3], [f64::MIN; 3]), |(lo, hi), p| {
+                ([0, 1, 2].map(|k| lo[k].min(p[k])), [0, 1, 2].map(|k| hi[k].max(p[k])))
+            });
+            if v.is_empty() { DVec3::ZERO } else { (DVec3::from_array(lo) + DVec3::from_array(hi)) / 2. }
+        };
+        report.origin = origin.to_array();
+        let mut source = Tally { origin, by_case: BTreeMap::new() };
         // Pressures per case and shell element (tf/m2).
         let mut pressure: BTreeMap<u32, HashMap<u32, Pressure>> = BTreeMap::new();
         let mut node_loads: BTreeMap<(u32, u32), (DVec3, DVec3)> = BTreeMap::new();
@@ -394,7 +645,7 @@ impl Context<'_> {
         let mut removed: BTreeMap<u32, Vec<(DVec3, DVec3, DVec3)>> = BTreeMap::new();
         let cut = self.state.cut.as_ref();
         let above = |p: DVec3| cut.is_some_and(|c| p.z > c.z + 1e-6);
-        let mut shell_geometry: HashMap<u32, Option<(Vec<DVec3>, [DVec3; 3], f64)>> = HashMap::new();
+        let mut shell_geometry: HashMap<u32, Option<(Vec<DVec3>, [DVec3; 3], f64, Vec<DVec3>)>> = HashMap::new();
 
         for row in &self.set.rows {
             if self.settings.cases.as_ref().is_some_and(|c| !c.contains(&row.case)) {
@@ -414,16 +665,17 @@ impl Context<'_> {
             match e.elem_type {
                 41 | 42 | 44 => {
                     let geometry = shell_geometry.entry(e.id).or_insert_with(|| {
-                        let ring = shell_ring(&positions(self.mesh, e)?);
-                        let axes = shell_axes(&ring)?;
+                        let raw = positions(self.mesh, e)?;
+                        let ring = shell_ring(&raw);
+                        let axes = shell_axes(&ring, &raw)?;
                         let area = polygon_area(&ring);
-                        Some((ring, axes, area))
+                        Some((ring, axes, area, raw))
                     });
-                    let Some((p, axes, area)) = geometry.clone() else {
+                    let Some((p, axes, area, raw)) = geometry.clone() else {
                         skip(&mut report, "пластина с вырожденной геометрией");
                         continue;
                     };
-                    self.shell_row(row, params, &p, &axes, area, &mut pressure, &mut edge_lines, &mut stamps, &mut report);
+                    self.shell_row(row, params, &p, &raw, &axes, area, &mut pressure, &mut edge_lines, &mut stamps, &mut report);
                 }
                 10 => self.bar_row(row, params, e, &mut bar_uniform, &mut bar_lines, &mut loads, &mut source, &mut removed, &mut report),
                 other => skip(&mut report, format!("нагрузка на элемент типа {other}")),
@@ -433,29 +685,51 @@ impl Context<'_> {
         self.spread_stamps(&stamps, &mut pressure, &mut report);
         if cut.is_some() {
             // What was cut off: plate pressures, edge lines and node loads above the level.
+            // An element across the level stays (its part below is in the geometry, the
+            // loads on that part are carried by `kept_fraction`) and sends the part above.
+            let level = cut.map_or(0., |c| c.z);
             for (&case, elements) in pressure.iter_mut() {
-                let gone: Vec<u32> = elements
-                    .keys()
-                    .copied()
-                    .filter(|&e| element(self.mesh, e).and_then(|el| positions(self.mesh, el)).is_some_and(|p| above(p.iter().sum::<DVec3>() / p.len() as f64)))
-                    .collect();
-                for e in gone {
-                    let vector = elements.remove(&e).map(|p| p.vector).unwrap_or_default();
-                    if let Some(p) = element(self.mesh, e).and_then(|el| positions(self.mesh, el)) {
-                        let area = polygon_area(&shell_ring(&p));
-                        removed.entry(case).or_default().push((p.iter().sum::<DVec3>() / p.len() as f64, vector * area, DVec3::ZERO));
+                let mut gone: Vec<u32> = vec![];
+                for (&e, p) in elements.iter() {
+                    let Some(nodes) = element(self.mesh, e).and_then(|el| positions(self.mesh, el)) else { continue };
+                    let ring = shell_ring(&nodes);
+                    let (lo, hi) = ring.iter().fold((f64::MAX, f64::MIN), |(l, h), q| (l.min(q.z), h.max(q.z)));
+                    if hi <= level + 1e-6 {
+                        continue;
                     }
+                    let whole = lo >= level - 1e-6;
+                    let part = if whole { ring.clone() } else { clip_ring(&ring, level, false) };
+                    let area = polygon_area(&part);
+                    if area > 0. {
+                        removed.entry(case).or_default().push((part.iter().sum::<DVec3>() / part.len() as f64, p.vector * area, DVec3::ZERO));
+                    }
+                    if whole {
+                        gone.push(e);
+                    }
+                }
+                for e in gone {
+                    elements.remove(&e);
                 }
             }
             for (&case, list) in edge_lines.iter_mut() {
-                list.retain(|&(a, b, qa, qb)| {
-                    if above((a + b) / 2.) {
+                let mut kept = vec![];
+                for &(a, b, qa, qb) in list.iter() {
+                    let (lo, hi) = (a.z.min(b.z), a.z.max(b.z));
+                    if hi <= level + 1e-6 {
+                        kept.push((a, b, qa, qb));
+                    } else if lo >= level - 1e-6 {
                         removed.entry(case).or_default().push(((a + b) / 2., (qa + qb) / 2. * (b - a).length(), DVec3::ZERO));
-                        false
                     } else {
-                        true
+                        // Across the level: cut the line there.
+                        let t = (level - a.z) / (b.z - a.z);
+                        let (c, qc) = (a.lerp(b, t), qa.lerp(qb, t));
+                        let (below, above) = if a.z < b.z { ((a, c, qa, qc), (c, b, qc, qb)) } else { ((c, b, qc, qb), (a, c, qa, qc)) };
+                        kept.push(below);
+                        let (u, v, qu, qv) = above;
+                        removed.entry(case).or_default().push(((u + v) / 2., (qu + qv) / 2. * (v - u).length(), DVec3::ZERO));
                     }
-                });
+                }
+                *list = kept;
             }
             let gone: Vec<(u32, u32)> = node_loads.keys().copied().filter(|&(_, n)| self.mesh.nodes.get(&n).is_some_and(|&p| above(p))).collect();
             for key in gone {
@@ -542,11 +816,7 @@ impl Context<'_> {
                     other => other,
                 })
                 .collect();
-            let mut merged_source: BTreeMap<u32, DVec3> = BTreeMap::new();
-            for (&case, &v) in &source {
-                *merged_source.entry(COMBINATION).or_default() += v * weight(case);
-            }
-            source = merged_source;
+            source = source.scaled_into(&weight, COMBINATION);
             let mut merged_lost: BTreeMap<u32, DVec3> = BTreeMap::new();
             for (&case, &v) in &lost {
                 *merged_lost.entry(COMBINATION).or_default() += v * weight(case);
@@ -566,7 +836,7 @@ impl Context<'_> {
                 force: (force * factor).to_array(),
                 moment: (moment * factor).to_array(),
             });
-            *source.entry(case).or_default() += force * factor;
+            source.add(case, at, force * factor, moment * factor);
         }
 
         // ---- bars: uniform loads of whole elements, merged along their axis
@@ -577,9 +847,6 @@ impl Context<'_> {
             };
             let (ta, tb) = (t0.min(t1), t0.max(t1));
             bar_lines.entry((case, axis)).or_default().push((ta, tb, q, q));
-            if let Some(el) = element(self.mesh, e).and_then(|el| positions(self.mesh, el)) {
-                *source.entry(case).or_default() += q * (el[1] - el[0]).length() * factor;
-            }
         }
         for (&(case, axis), segments) in &mut bar_lines {
             let [a, b] = self.state.axes[axis].endpoints.map(|v| DVec3::from_array(self.state.model.vertices()[v]));
@@ -620,7 +887,7 @@ impl Context<'_> {
         for (&case, edges) in &edge_lines {
             let mut merged: Vec<(DVec3, DVec3, DVec3, DVec3)> = vec![];
             for &(a, b, qa, qb) in edges {
-                *source.entry(case).or_default() += (qa + qb) / 2. * (b - a).length() * factor;
+                source.add_line(case, a, b, qa * factor, qb * factor);
                 // Consecutive collinear edges of one value make one line.
                 if let Some(last) = merged.iter_mut().find(|l| {
                     (l.1 - a).length() <= 1e-6
@@ -660,43 +927,38 @@ impl Context<'_> {
         }
 
         // ---- reports per case
-        let mut exported: BTreeMap<u32, DVec3> = BTreeMap::new();
+        let mut exported = Tally { origin, by_case: BTreeMap::new() };
         let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
         for load in &loads {
             let case = load.case();
             *counts.entry(case).or_default() += 1;
-            let sum = match load {
-                Load::Point { force, .. } => DVec3::from_array(*force),
-                Load::Line { start, end, q_start, q_end, .. } => {
-                    let length = DVec3::from_array(*start).distance(DVec3::from_array(*end));
-                    (DVec3::from_array(*q_start) + DVec3::from_array(*q_end)) / 2. * length
-                }
-                Load::Surface { polygons, sigma, .. } => {
-                    let area: f64 = polygons
-                        .iter()
-                        .map(|p| polygon_area(&p.iter().map(|&x| DVec3::from_array(x)).collect::<Vec<_>>()))
-                        .sum();
-                    DVec3::from_array(*sigma) * area
-                }
-            };
-            *exported.entry(case).or_default() += sum;
+            let (f, m, scale) = load_resultant(load, origin);
+            let e = exported.by_case.entry(case).or_default();
+            e.0 += f;
+            e.1 += m;
+            e.2 += scale;
         }
         let cut_name = "Вес отброшенных этажей".to_string();
         let mut names: BTreeMap<u32, &String> = self.set.cases.iter().map(|(n, s)| (*n, s)).collect();
         names.insert(CUT_WEIGHT_CASE, &cut_name);
         let cases: std::collections::BTreeSet<u32> = counts
             .keys()
-            .chain(source.keys())
+            .chain(source.by_case.keys())
             .chain(lost.keys())
             .copied()
             .collect();
         for case in cases {
+            let (sf, sm, ss) = source.by_case.get(&case).copied().unwrap_or_default();
+            let (ef, em, es) = exported.by_case.get(&case).copied().unwrap_or_default();
             report.cases.push(CaseReport {
                 case,
                 name: names.get(&case).map(|s| s.to_string()).unwrap_or_default(),
                 loads: counts.get(&case).copied().unwrap_or(0),
-                source: source.get(&case).copied().unwrap_or_default().to_array(),
-                exported: exported.get(&case).copied().unwrap_or_default().to_array(),
+                source: sf.to_array(),
+                exported: ef.to_array(),
+                source_moment: sm.to_array(),
+                exported_moment: em.to_array(),
+                moment_scale: ss.max(es),
                 not_in_geometry: lost.get(&case).copied().unwrap_or_default().to_array(),
             });
         }
@@ -707,11 +969,12 @@ impl Context<'_> {
         self.settings.combination.as_ref().and_then(|c| c.simplify)
     }
 
-    /// The loads of one bar axis (segments `(ta, tb, qa, qb)`, kN/m after
-    /// the force factor) as a uniform load over the whole bar when their
-    /// resultant acts near its middle and covers enough of it, else as point
-    /// loads at the centres of the segments: no new points on the bar and
-    /// the resultant is kept.
+    /// The loads of one bar axis (segments `(ta, tb, qa, qb)`, force per
+    /// length) as a uniform load over the whole bar when their resultant acts
+    /// near its middle and covers enough of it, else as point loads at the
+    /// centres of the parts: no new points on the bar, the resultant and its
+    /// moment kept. Loads of both signs (a couple) are never added up: each
+    /// sign is a point load of its own.
     #[allow(clippy::too_many_arguments)]
     fn simplified_bar(
         &self,
@@ -725,26 +988,32 @@ impl Context<'_> {
     ) {
         let factor = self.settings.force_factor;
         let length = a.distance(b);
-        let mut force = DVec3::ZERO;
-        let mut moment_arm = 0.;
-        let mut weight = 0.;
-        let mut covered = 0.;
-        let mut pieces = vec![];
-        for &(ta, tb, qa, qb) in segments {
-            let f = (qa + qb) / 2. * (tb - ta) * length;
-            // The centre of a trapezoid by the magnitudes of its ends.
-            let (ma, mb) = (qa.length(), qb.length());
-            let t = if ma + mb > 1e-15 { ta + (tb - ta) * (ma + 2. * mb) / (3. * (ma + mb)) } else { (ta + tb) / 2. };
-            force += f;
-            moment_arm += f.length() * t;
-            weight += f.length();
-            covered += tb - ta;
-            pieces.push((f, t));
-        }
-        if weight < 1e-15 || length < 1e-9 {
+        if length < 1e-9 {
             return;
         }
-        let center = moment_arm / weight;
+        let mut parts: Vec<(f64, DVec3)> = vec![];
+        let mut covered = 0.;
+        for &(ta, tb, qa, qb) in segments {
+            parts.extend(trapezoid_parts(ta, tb, qa, qb, length));
+            covered += tb - ta;
+        }
+        let total: f64 = parts.iter().map(|p| p.1.length()).sum();
+        if total < 1e-15 {
+            return;
+        }
+        let groups = sign_groups(&parts.iter().map(|p| (p.1, p.0)).collect::<Vec<_>>());
+        let point = |loads: &mut Vec<Load>, t: f64, f: DVec3| {
+            loads.push(Load::Point { case, at: a.lerp(b, t).to_array(), force: (f * factor).to_array(), moment: [0.; 3] });
+        };
+        if groups.len() > 1 {
+            for (f, t) in groups {
+                point(loads, t, f);
+            }
+            *report.approximated.entry("нагрузка на стержень с разными знаками заменена точечными силами по знакам".into()).or_default() += 1;
+            return;
+        }
+        let force: DVec3 = parts.iter().map(|p| p.1).sum();
+        let center = parts.iter().map(|p| p.1.length() * p.0).sum::<f64>() / total;
         if covered.min(1.) >= simplify.min_fraction && (center - 0.5).abs() <= simplify.center_tolerance {
             loads.push(Load::Line {
                 case,
@@ -757,21 +1026,18 @@ impl Context<'_> {
                 *report.approximated.entry("нагрузка на стержень приведена к равномерной по всей длине".into()).or_default() += 1;
             }
         } else {
-            for (f, t) in pieces {
-                loads.push(Load::Point {
-                    case,
-                    at: a.lerp(b, t).to_array(),
-                    force: (f * factor).to_array(),
-                    moment: [0.; 3],
-                });
+            for (t, f) in parts {
+                point(loads, t, f);
             }
             *report.approximated.entry("нагрузка на часть стержня заменена точечными силами".into()).or_default() += 1;
         }
     }
 
     /// Line loads along plate edges: kept as lines between model vertices
-    /// when both ends lie on one (no new points in the geometry), else the
-    /// resultant is applied at the centre of the load.
+    /// when both ends lie on one (no new points in the geometry; the load is
+    /// scaled when snapping changes the length, so the force stays), else
+    /// point loads at the centres of the load (a load of both signs: one per
+    /// sign).
     fn simplified_edges(
         &self,
         case: u32,
@@ -810,6 +1076,9 @@ impl Context<'_> {
         for &(a, b, qa, qb) in lines {
             if let (Some(sa), Some(sb)) = (nearest(a), nearest(b)) {
                 if sa.distance(sb) > 1e-9 {
+                    // The force of the line is kept when snapping changes its length.
+                    let k = a.distance(b) / sa.distance(sb);
+                    let (qa, qb) = (qa * k, qb * k);
                     let key = |p: DVec3| [0, 1, 2].map(|k| (p[k] * 1e6).round() as i64);
                     let (ka, kb) = (key(sa), key(sb));
                     let (k, flip) = if ka <= kb { ([ka[0], ka[1], ka[2], kb[0], kb[1], kb[2]], false) } else { ([kb[0], kb[1], kb[2], ka[0], ka[1], ka[2]], true) };
@@ -820,16 +1089,13 @@ impl Context<'_> {
                     continue;
                 }
             }
-            // Not between vertices: the resultant at the centre of the load.
+            // Not between vertices: point loads at the centres of the load.
             let length = a.distance(b);
-            let (ma, mb) = (qa.length(), qb.length());
-            let t = if ma + mb > 1e-15 { (ma + 2. * mb) / (3. * (ma + mb)) } else { 0.5 };
-            loads.push(Load::Point {
-                case,
-                at: a.lerp(b, t).to_array(),
-                force: (((qa + qb) / 2. * length) * factor).to_array(),
-                moment: [0.; 3],
-            });
+            let parts = trapezoid_parts(0., 1., qa, qb, length);
+            let groups = sign_groups(&parts.iter().map(|p| (p.1, p.0)).collect::<Vec<_>>());
+            for (f, t) in groups {
+                loads.push(Load::Point { case, at: a.lerp(b, t).to_array(), force: (f * factor).to_array(), moment: [0.; 3] });
+            }
             *report.approximated.entry("нагрузка по кромке плиты вне вершин модели заменена точечной силой".into()).or_default() += 1;
         }
         for (start, end, q0, q1) in by_line.into_values() {
@@ -846,8 +1112,9 @@ impl Context<'_> {
     /// Plate pressures of the combination, one load per plate: uniform over
     /// the whole plate when enough of it is loaded and the centre of
     /// pressure is near its centre, else point loads at the centres of
-    /// pressure of the connected loaded parts. No new contours; the
-    /// resultant of every plate is kept.
+    /// pressure of the connected loaded parts. Pressures of both signs (a
+    /// couple) make a point load per sign: their sum would lose the moment.
+    /// No new contours; force and moment of every plate are kept.
     #[allow(clippy::too_many_arguments)]
     fn simplified_surface_loads(
         &self,
@@ -855,7 +1122,7 @@ impl Context<'_> {
         elements: &HashMap<u32, Pressure>,
         simplify: Simplify,
         loads: &mut Vec<Load>,
-        source: &mut BTreeMap<u32, DVec3>,
+        source: &mut Tally,
         lost: &mut BTreeMap<u32, DVec3>,
         report: &mut Report,
     ) {
@@ -877,18 +1144,20 @@ impl Context<'_> {
             if pressure.vector.length() < 1e-15 {
                 continue;
             }
-            *source.entry(case).or_default() += pressure.vector * area * factor;
-            by_surface.entry(s).or_default().push((e, pressure.vector, area, centre));
+            // Only the part of an element below the cut is in the geometry.
+            let kept = self.kept_fraction(e);
+            source.add(case, centre, pressure.vector * area * kept * factor, DVec3::ZERO);
+            by_surface.entry(s).or_default().push((e, pressure.vector, area * kept, centre));
         }
         for (s, items) in by_surface {
-            let force: DVec3 = items.iter().map(|x| x.1 * x.2).sum();
             let polygons = surface_polygons(model, s, self.settings.snap).0;
             let pieces: Vec<Vec<DVec3>> = polygons
                 .iter()
                 .map(|p| p.iter().map(|&x| DVec3::from_array(x)).collect())
                 .collect();
             let surface_area: f64 = pieces.iter().map(|p| polygon_area(p)).sum();
-            if surface_area <= 0. || force.length() < 1e-15 {
+            let total_abs: f64 = items.iter().map(|x| x.1.length() * x.2).sum();
+            if surface_area <= 0. || total_abs < 1e-15 {
                 continue;
             }
             // Centre of the plate: area-weighted centres of the fans of its pieces.
@@ -900,63 +1169,6 @@ impl Context<'_> {
                 }
             }
             let plate_centre = centre_sum / surface_area;
-            let direction = force.normalize();
-            let weights: Vec<f64> = items.iter().map(|x| (x.1.dot(direction)).max(0.) * x.2).collect();
-            let weight_sum: f64 = weights.iter().sum();
-            let pressure_centre = if weight_sum > 1e-15 {
-                items.iter().zip(&weights).map(|(x, w)| x.3 * *w).sum::<DVec3>() / weight_sum
-            } else {
-                plate_centre
-            };
-            let loaded: f64 = items.iter().map(|x| x.2).sum();
-            let uniform = loaded / surface_area >= simplify.min_fraction
-                && pressure_centre.distance(plate_centre) <= simplify.center_tolerance * surface_area.sqrt();
-            if uniform {
-                loads.push(Load::Surface {
-                    case,
-                    surface: s,
-                    polygons,
-                    sigma: (force / surface_area * factor).to_array(),
-                });
-                if items.len() > 1 {
-                    *report.approximated.entry("давление на пластину приведено к равномерному по всей пластине".into()).or_default() += 1;
-                }
-                continue;
-            }
-            // Point loads: one per connected loaded part (elements sharing nodes).
-            let mut parent: Vec<usize> = (0..items.len()).collect();
-            fn find(parent: &mut [usize], i: usize) -> usize {
-                let mut r = i;
-                while parent[r] != r {
-                    r = parent[r];
-                }
-                let mut j = i;
-                while parent[j] != r {
-                    let next = parent[j];
-                    parent[j] = r;
-                    j = next;
-                }
-                r
-            }
-            let mut owner: HashMap<u32, usize> = HashMap::new();
-            for (i, x) in items.iter().enumerate() {
-                for &n in element(self.mesh, x.0).map(|el| el.nodes.as_slice()).unwrap_or(&[]) {
-                    match owner.get(&n) {
-                        Some(&j) => {
-                            let (a, b) = (find(&mut parent, i), find(&mut parent, j));
-                            parent[a] = b;
-                        }
-                        None => {
-                            owner.insert(n, i);
-                        }
-                    }
-                }
-            }
-            let mut parts: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-            for i in 0..items.len() {
-                let r = find(&mut parent, i);
-                parts.entry(r).or_default().push(i);
-            }
             let plane = &model.planes()[model.surfaces()[s].plane];
             let inside = |p: DVec3| -> bool {
                 let q = DVec2::from_array(plane.project(p.to_array()));
@@ -972,32 +1184,88 @@ impl Context<'_> {
                     odd
                 })
             };
-            for members in parts.values() {
-                let f: DVec3 = members.iter().map(|&i| items[i].1 * items[i].2).sum();
-                let w: Vec<f64> = members.iter().map(|&i| items[i].1.dot(direction).max(0.) * items[i].2).collect();
-                let ws: f64 = w.iter().sum();
-                let mut at = if ws > 1e-15 {
-                    members.iter().zip(&w).map(|(&i, w)| items[i].3 * *w).sum::<DVec3>() / ws
-                } else {
-                    items[members[0]].3
-                };
-                if !inside(at) {
-                    // Outside the plate (an L, a hole): the nearest loaded element centre.
-                    at = members
-                        .iter()
-                        .map(|&i| items[i].3)
-                        .min_by(|x, y| x.distance(at).total_cmp(&y.distance(at)))
-                        .unwrap_or(at);
+            // Groups of one sign (along the direction of the resultant).
+            let signed: Vec<(DVec3, usize)> = items.iter().enumerate().map(|(i, x)| (x.1 * x.2, i)).collect();
+            let groups = sign_group_members(&signed);
+            let mixed = groups.len() > 1;
+            for members in groups {
+                let force: DVec3 = members.iter().map(|&i| items[i].1 * items[i].2).sum();
+                let weight: f64 = members.iter().map(|&i| items[i].1.length() * items[i].2).sum();
+                let pressure_centre = members.iter().map(|&i| items[i].3 * (items[i].1.length() * items[i].2)).sum::<DVec3>() / weight;
+                let loaded: f64 = members.iter().map(|&i| items[i].2).sum();
+                let uniform = !mixed
+                    && loaded / surface_area >= simplify.min_fraction
+                    && pressure_centre.distance(plate_centre) <= simplify.center_tolerance * surface_area.sqrt();
+                if uniform {
+                    loads.push(Load::Surface { case, surface: s, polygons: polygons.clone(), sigma: (force / surface_area * factor).to_array() });
+                    if items.len() > 1 {
+                        *report.approximated.entry("давление на пластину приведено к равномерному по всей пластине".into()).or_default() += 1;
+                    }
+                    continue;
                 }
-                loads.push(Load::Point {
-                    case,
-                    at: at.to_array(),
-                    force: (f * factor).to_array(),
-                    moment: [0.; 3],
-                });
+                // Point loads: one per connected loaded part (elements sharing nodes).
+                let mut parent: Vec<usize> = (0..members.len()).collect();
+                fn find(parent: &mut [usize], i: usize) -> usize {
+                    let mut r = i;
+                    while parent[r] != r {
+                        r = parent[r];
+                    }
+                    let mut j = i;
+                    while parent[j] != r {
+                        let next = parent[j];
+                        parent[j] = r;
+                        j = next;
+                    }
+                    r
+                }
+                let mut owner: HashMap<u32, usize> = HashMap::new();
+                for (k, &i) in members.iter().enumerate() {
+                    for &n in element(self.mesh, items[i].0).map(|el| el.nodes.as_slice()).unwrap_or(&[]) {
+                        match owner.get(&n) {
+                            Some(&j) => {
+                                let (a, b) = (find(&mut parent, k), find(&mut parent, j));
+                                parent[a] = b;
+                            }
+                            None => {
+                                owner.insert(n, k);
+                            }
+                        }
+                    }
+                }
+                let mut parts: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+                for k in 0..members.len() {
+                    let r = find(&mut parent, k);
+                    parts.entry(r).or_default().push(members[k]);
+                }
+                for part in parts.values() {
+                    let f: DVec3 = part.iter().map(|&i| items[i].1 * items[i].2).sum();
+                    let ws: f64 = part.iter().map(|&i| items[i].1.length() * items[i].2).sum();
+                    let at = part.iter().map(|&i| items[i].3 * (items[i].1.length() * items[i].2)).sum::<DVec3>() / ws;
+                    if inside(at) {
+                        loads.push(Load::Point { case, at: at.to_array(), force: (f * factor).to_array(), moment: [0.; 3] });
+                    } else {
+                        // The centre of pressure is outside the plate (an L, a hole): every element
+                        // takes its own force, so the moment stays.
+                        for &i in part {
+                            loads.push(Load::Point { case, at: items[i].3.to_array(), force: ((items[i].1 * items[i].2) * factor).to_array(), moment: [0.; 3] });
+                        }
+                    }
+                }
+                *report.approximated.entry("давление на часть пластины заменено точечными силами".into()).or_default() += 1;
             }
-            *report.approximated.entry("давление на часть пластины заменено точечными силами".into()).or_default() += 1;
         }
+    }
+
+    /// The part of a source element below the level of the cut (1 without a cut).
+    fn kept_fraction(&self, e: u32) -> f64 {
+        let Some(cut) = self.state.cut.as_ref() else { return 1. };
+        let Some(p) = element(self.mesh, e).and_then(|el| positions(self.mesh, el)) else { return 1. };
+        let ring = shell_ring(&p);
+        let full = polygon_area(&ring);
+        if full <= 0. {
+            return 1.;
+        }
+        polygon_area(&clip_ring(&ring, cut.z, true)) / full
     }
 
     /// The weight of the elements above the cut (tf, downwards), at their
@@ -1008,14 +1276,27 @@ impl Context<'_> {
         let mut items = vec![];
         for e in &self.mesh.elements {
             let Some(p) = positions(self.mesh, e) else { continue };
-            let centre = p.iter().sum::<DVec3>() / p.len() as f64;
-            if centre.z <= cut.z + 1e-6 {
+            let (lo, hi) = p.iter().fold((f64::MAX, f64::MIN), |(l, h), q| (l.min(q.z), h.max(q.z)));
+            if hi <= cut.z + 1e-6 {
                 continue;
             }
-            let weight = match (e.is_shell(), e.is_bar(), materials.get(&e.stiff_id)) {
-                (true, _, Some(Material::Plate { thickness, density: Some(rho), .. })) => rho * thickness * polygon_area(&shell_ring(&p)),
-                (_, true, Some(Material::Bar { density: Some(ro), .. })) => ro * (p[1] - p[0]).length(),
-                _ => continue,
+            let material = materials.get(&e.stiff_id);
+            // The part above the level: the whole element or what the level leaves above it.
+            let (centre, weight) = if e.is_shell() {
+                let Some(Material::Plate { thickness, density: Some(rho), .. }) = material else { continue };
+                let ring = shell_ring(&p);
+                let part = if lo >= cut.z - 1e-6 { ring } else { clip_ring(&ring, cut.z, false) };
+                if part.len() < 3 {
+                    continue;
+                }
+                (part.iter().sum::<DVec3>() / part.len() as f64, rho * thickness * polygon_area(&part))
+            } else if e.is_bar() {
+                let Some(Material::Bar { density: Some(ro), .. }) = material else { continue };
+                let (a, b) = if p[0].z <= p[1].z { (p[0], p[1]) } else { (p[1], p[0]) };
+                let start = if a.z >= cut.z - 1e-6 { a } else { a.lerp(b, (cut.z - a.z) / (b.z - a.z)) };
+                ((start + b) / 2., ro * start.distance(b))
+            } else {
+                continue;
             };
             items.push((centre, DVec3::new(0., 0., -weight), DVec3::ZERO));
         }
@@ -1031,7 +1312,7 @@ impl Context<'_> {
         &self,
         removed: &BTreeMap<u32, Vec<(DVec3, DVec3, DVec3)>>,
         loads: &mut Vec<Load>,
-        source: &mut BTreeMap<u32, DVec3>,
+        source: &mut Tally,
         report: &mut Report,
     ) {
         let Some(cut) = self.state.cut.as_ref().filter(|_| self.settings.cut_loads) else { return };
@@ -1045,13 +1326,12 @@ impl Context<'_> {
             }
         };
         let mut supports: Vec<(DVec3, DVec3, f64, bool)> = vec![];
-        for w in &cut.walls {
-            let (a, b) = (DVec3::from_array(w.a), DVec3::from_array(w.b));
-            supports.push((a, b, weight_of(w.stiffness, true) * a.distance(b), true));
+        let (walls, columns) = crate::reconstruction::assembly::cutoff::live_supports(self.state);
+        for (a, b, stiffness) in walls {
+            supports.push((a, b, weight_of(stiffness, true) * a.distance(b), true));
         }
-        for c in &cut.columns {
-            let p = DVec3::from_array(c.a);
-            supports.push((p, p, weight_of(c.stiffness, false), false));
+        for (p, stiffness) in columns {
+            supports.push((p, p, weight_of(stiffness, false), false));
         }
         supports.retain(|s| s.2 > 0.);
         let plan = |p: DVec3| glam::DVec2::new(p.x, p.y);
@@ -1063,8 +1343,9 @@ impl Context<'_> {
                 *report.skipped.entry("нагрузки отброшенных этажей: нет несущих элементов на уровне отсечения".into()).or_default() += items.len();
                 continue;
             }
-            let total: DVec3 = items.iter().map(|x| x.1).sum();
-            *source.entry(case).or_default() += total * factor;
+            for &(p, f, m) in items {
+                source.add(case, p, f * factor, m * factor);
+            }
             let mut shares = vec![DVec3::ZERO; supports.len()];
             let weight_sum: f64 = supports.iter().map(|s| s.2).sum();
             let centre = supports.iter().map(|s| (s.0 + s.1) / 2. * s.2).sum::<DVec3>() / weight_sum;
@@ -1226,6 +1507,8 @@ impl Context<'_> {
         row: &LoadRow,
         params: &[f64],
         p: &[DVec3],
+        // The nodes as the element lists them: local node numbers of edge loads refer to them.
+        listed: &[DVec3],
         axes: &[DVec3; 3],
         area: f64,
         pressure: &mut BTreeMap<u32, HashMap<u32, Pressure>>,
@@ -1296,10 +1579,10 @@ impl Context<'_> {
                     return skip(report, "нагрузка по линии без параметров");
                 };
                 let (ia, ib) = (a as usize, b as usize);
-                if ia == 0 || ib == 0 || ia > p.len() || ib > p.len() || ia == ib {
+                if ia == 0 || ib == 0 || ia > listed.len() || ib > listed.len() || ia == ib {
                     return skip(report, "нагрузка по линии с неверными узлами");
                 }
-                let (pa, pb) = (p[ia - 1], p[ib - 1]);
+                let (pa, pb) = (listed[ia - 1], listed[ib - 1]);
                 let (qa, qb) = if base == 9 {
                     (params.get(2).copied().unwrap_or(0.), params.get(2).copied().unwrap_or(0.))
                 } else {
@@ -1322,7 +1605,7 @@ impl Context<'_> {
         uniform: &mut BTreeMap<(u32, u32), DVec3>,
         lines: &mut BTreeMap<(u32, usize), Vec<(f64, f64, DVec3, DVec3)>>,
         loads: &mut Vec<Load>,
-        source: &mut BTreeMap<u32, DVec3>,
+        source: &mut Tally,
         removed: &mut BTreeMap<u32, Vec<(DVec3, DVec3, DVec3)>>,
         report: &mut Report,
     ) {
@@ -1353,46 +1636,106 @@ impl Context<'_> {
             unit(row.direction).unwrap()
         };
         let dir = if moment { dir } else { dir * FORCE_SIGN };
-        // A bar cut off with the upper storeys: its load goes to the supports.
-        if self.state.cut.as_ref().is_some_and(|c| (p[0] + p[1]).z / 2. > c.z + 1e-6) {
-            let along = axes[0];
-            let projected = |d: DVec3| if fr == 2 { d * (1. - along.dot(d).powi(2)).max(0.).sqrt() } else { d };
+        // The part of the element above the cut (its loads go to the supports at
+        // the level), as an interval of the element: the whole, a part, none.
+        let cut_z = self.state.cut.as_ref().map(|c| c.z);
+        let (z0, z1) = (p[0].z, p[1].z);
+        let upper: Option<(f64, f64)> = cut_z.and_then(|zc| {
+            let (lo, hi) = (z0.min(z1), z0.max(z1));
+            if hi <= zc + 1e-6 {
+                None
+            } else if lo >= zc - 1e-6 {
+                Some((0., length))
+            } else {
+                let sc = length * (zc - z0) / (z1 - z0);
+                Some(if z1 > z0 { (sc, length) } else { (0., sc) })
+            }
+        });
+        let lower: Option<(f64, f64)> = match upper {
+            None => Some((0., length)),
+            Some((0., l)) if l >= length => None,
+            Some((0., sc)) => Some((sc, length)),
+            Some((sc, _)) => Some((0., sc)),
+        };
+        let crossing = upper.is_some() && lower.is_some();
+        let along = axes[0];
+        let projected = |d: DVec3| if fr == 2 { d * (1. - along.dot(d).powi(2)).max(0.).sqrt() } else { d };
+        let at_s = |s: f64| p[0] + along * s.clamp(0., length);
+        // A linear load on [x0, x1] of the element clipped to an interval.
+        let clip = |a1: f64, q1: DVec3, a2: f64, q2: DVec3, (lo, hi): (f64, f64)| -> Option<(f64, DVec3, f64, DVec3)> {
+            let ((a1, q1), (a2, q2)) = if a1 <= a2 { ((a1, q1), (a2, q2)) } else { ((a2, q2), (a1, q1)) };
+            let (x0, x1) = (a1.max(lo), a2.min(hi));
+            if x1 - x0 < 1e-12 || a2 - a1 < 1e-12 {
+                return None;
+            }
+            let at = |x: f64| q1 + (q2 - q1) * ((x - a1) / (a2 - a1));
+            Some((x0, at(x0), x1, at(x1)))
+        };
+        if let Some(interval) = upper {
             if moment {
                 return skip(report, "момент на стержень, отброшенный вместе с верхними этажами");
             }
-            let entry = match base {
-                5 => params.first().zip(params.get(1)).map(|(&v, &a)| (p[0] + along * a.clamp(0., length), dir * v)),
-                6 => params.first().map(|&v| ((p[0] + p[1]) / 2., projected(dir) * v * length)),
-                7 => match (params.first(), params.get(1), params.get(2), params.get(3)) {
-                    (Some(&p1), Some(&a1), Some(&p2), Some(&a2)) => {
-                        Some((p[0] + along * ((a1 + a2) / 2.).clamp(0., length), projected(dir) * ((p1 + p2) / 2.) * (a2 - a1).abs()))
-                    }
-                    _ => None,
-                },
-                _ => None,
+            let mut send = |x0: f64, q0: DVec3, x1: f64, q1: DVec3| {
+                for (t, f) in trapezoid_parts(x0 / length, x1 / length, q0, q1, length) {
+                    removed.entry(row.case).or_default().push((p[0] + (p[1] - p[0]) * t, f, DVec3::ZERO));
+                }
             };
-            match entry {
-                Some((at, force)) => removed.entry(row.case).or_default().push((at, force, DVec3::ZERO)),
-                None => skip(report, format!("нагрузка на стержень, код {code}")),
+            match base {
+                5 => {
+                    if let (Some(&v), Some(&s)) = (params.first(), params.get(1)) {
+                        let s = s.clamp(0., length);
+                        if s >= interval.0 - 1e-12 && s <= interval.1 + 1e-12 {
+                            removed.entry(row.case).or_default().push((at_s(s), dir * v, DVec3::ZERO));
+                        }
+                    }
+                }
+                6 => {
+                    if let Some(&v) = params.first() {
+                        send(interval.0, projected(dir) * v, interval.1, projected(dir) * v);
+                    }
+                }
+                7 => {
+                    if let (Some(&p1), Some(&a1), Some(&p2), Some(&a2)) = (params.first(), params.get(1), params.get(2), params.get(3)) {
+                        if let Some((x0, q0, x1, q1)) = clip(a1, projected(dir) * p1, a2, projected(dir) * p2, interval) {
+                            send(x0, q0, x1, q1);
+                        }
+                    }
+                }
+                _ => {
+                    return skip(report, format!("нагрузка на стержень, код {code}"));
+                }
             }
-            return;
+            if lower.is_none() {
+                return;
+            }
         }
         let Some(&(axis, t_first, t_second)) = self.bar_of_element.get(&e.id) else {
             return skip(report, "нагрузка на стержень, которого нет в геометрии");
         };
         let [a, b] = self.state.axes[axis].endpoints.map(|v| DVec3::from_array(self.state.model.vertices()[v]));
-        let t_at = |s: f64| t_first + (t_second - t_first) * (s / length).clamp(0., 1.);
+        // Position along the axis of a source point: by the span of the element, or,
+        // for an element cut by the level (its span is shorter), by projection.
+        let t_at = |s: f64| {
+            if crossing {
+                let d = b - a;
+                ((at_s(s) - a).dot(d) / d.length_squared()).clamp(0., 1.)
+            } else {
+                t_first + (t_second - t_first) * (s / length).clamp(0., 1.)
+            }
+        };
         let point_at = |s: f64| a.lerp(b, t_at(s));
-        let along = axes[0];
-        let projected = |d: DVec3| if fr == 2 { d * (1. - along.dot(d).powi(2)).max(0.).sqrt() } else { d };
+        let (lower_lo, lower_hi) = lower.unwrap_or((0., length));
         match base {
             5 => {
                 let (Some(&value), Some(&s)) = (params.first(), params.get(1)) else {
                     return skip(report, "нагрузка без параметров");
                 };
+                if crossing && (s < lower_lo - 1e-12 || s > lower_hi + 1e-12) {
+                    return; // above the cut: sent to the supports
+                }
                 let v = dir * value * factor;
                 if !moment {
-                    *source.entry(row.case).or_default() += v;
+                    source.add(row.case, at_s(s), v, DVec3::ZERO);
                 }
                 loads.push(Load::Point {
                     case: row.case,
@@ -1408,7 +1751,9 @@ impl Context<'_> {
                 let Some(&value) = params.first() else {
                     return skip(report, "нагрузка без параметров");
                 };
-                *uniform.entry((row.case, e.id)).or_default() += projected(dir) * value;
+                let q = projected(dir) * value;
+                *uniform.entry((row.case, e.id)).or_default() += q;
+                source.add_line(row.case, at_s(lower_lo), at_s(lower_hi), q * factor, q * factor);
             }
             7 => {
                 if moment {
@@ -1419,17 +1764,19 @@ impl Context<'_> {
                 else {
                     return skip(report, "нагрузка без параметров");
                 };
-                let (ta, tb) = (t_at(a1), t_at(a2));
-                let (qa, qb) = (projected(dir) * p1, projected(dir) * p2);
+                let Some((x0, q0, x1, q1)) = clip(a1, projected(dir) * p1, a2, projected(dir) * p2, (lower_lo, lower_hi)) else {
+                    return;
+                };
+                let (ta, tb) = (t_at(x0), t_at(x1));
                 if (ta - tb).abs() < 1e-9 {
                     return skip(report, "трапеция нулевой длины");
                 }
                 // Source resultant, counted here (it is not uniform).
-                *source.entry(row.case).or_default() += (qa + qb) / 2. * (a2 - a1).abs() * factor;
+                source.add_line(row.case, at_s(x0), at_s(x1), q0 * factor, q1 * factor);
                 if ta < tb {
-                    lines.entry((row.case, axis)).or_default().push((ta, tb, qa, qb));
+                    lines.entry((row.case, axis)).or_default().push((ta, tb, q0, q1));
                 } else {
-                    lines.entry((row.case, axis)).or_default().push((tb, ta, qb, qa));
+                    lines.entry((row.case, axis)).or_default().push((tb, ta, q1, q0));
                 }
             }
             _ => skip(report, format!("нагрузка на стержень, код {code}")),
@@ -1442,7 +1789,7 @@ impl Context<'_> {
         case: u32,
         elements: &HashMap<u32, Pressure>,
         loads: &mut Vec<Load>,
-        source: &mut BTreeMap<u32, DVec3>,
+        source: &mut Tally,
         lost: &mut BTreeMap<u32, DVec3>,
         report: &mut Report,
     ) {
@@ -1460,10 +1807,10 @@ impl Context<'_> {
                 *lost.entry(case).or_default() += pressure.vector * area * factor;
                 continue;
             };
-            let area = element(self.mesh, e)
-                .and_then(|el| positions(self.mesh, el))
-                .map_or(0., |p| polygon_area(&shell_ring(&p)));
-            *source.entry(case).or_default() += pressure.vector * area * factor;
+            let positions = element(self.mesh, e).and_then(|el| positions(self.mesh, el));
+            let area = positions.as_ref().map_or(0., |p| polygon_area(&shell_ring(p))) * self.kept_fraction(e);
+            let centre = positions.as_ref().map_or(DVec3::ZERO, |p| p.iter().sum::<DVec3>() / p.len() as f64);
+            source.add(case, centre, pressure.vector * area * factor, DVec3::ZERO);
             by_surface.entry(s).or_default().push((e, pressure.vector, area));
         }
         for (s, mut items) in by_surface {
@@ -1658,6 +2005,18 @@ impl Context<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_resultant_of_a_concave_surface_load_counts_its_true_area() {
+        // An L: 3 x 3 minus 2 x 2 = 5 m2 under 2 kN/m2, wound either way.
+        let l = [[0., 0., 0.], [3., 0., 0.], [3., 1., 0.], [1., 1., 0.], [1., 3., 0.], [0., 3., 0.]];
+        for ring in [l.to_vec(), l.iter().rev().copied().collect::<Vec<_>>()] {
+            let load = Load::Surface { case: 1, surface: 0, polygons: vec![ring], sigma: [0., 0., -2.] };
+            let (force, moment, _) = load_resultant(&load, DVec3::ZERO);
+            assert!((force.z + 10.).abs() < 1e-9, "{force:?}");
+            // First moment of the L: 4.5 + 1 = 5.5 m3 in both axes; M = r x F.
+            assert!((moment - DVec3::new(-11., 11., 0.)).length() < 1e-9, "{moment:?}");
+        }
+    }
     use super::*;
 
     #[test]

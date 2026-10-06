@@ -188,6 +188,7 @@ impl State {
             .iter()
             .map(|&(v, s)| (if v == drop { keep } else { v }, s))
             .collect();
+        self.remap_cut_vertex(drop, keep);
         self.refresh();
         Ok(format!("merged, moved {movement:.4}"))
     }
@@ -310,6 +311,7 @@ impl State {
             .iter()
             .map(|&(v, s)| (if v == drop { keep } else { v }, s))
             .collect();
+        self.remap_cut_vertex(drop, keep);
         for c in &collapsed {
             self.removed_bars.push(RemovedBar {
                 reason: "collapsed".into(),

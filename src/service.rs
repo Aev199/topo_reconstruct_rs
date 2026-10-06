@@ -442,6 +442,7 @@ impl Service {
             "loads": exchange.loads.len(),
             "load_cases": exchange.load_report.as_ref().map(|r| r.cases.len()).unwrap_or(0),
             "load_report": exchange.load_report,
+            "load_problems": exchange.load_report.as_ref().map(|r| r.problems(crate::loads::FORCE_TOLERANCE, crate::loads::MOMENT_TOLERANCE)).unwrap_or_default(),
             "cap": cap.as_ref().map(|c| &c.2),
             "material_notes": exchange.plate_materials.iter().map(|m| (m.name.clone(), m.notes.clone()))
                 .chain(exchange.beam_materials.iter().map(|m| (m.name.clone(), m.notes.clone())))
@@ -557,13 +558,26 @@ impl Service {
         }
         let (text, report) = crate::midas::write_mxt(&mesh, &on_mesh, &exchange, &cases);
         std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))?;
+        // Force and moment of every case at each stage: source, geometry, mesh.
+        let about = on_mesh.resultants_about(&mesh, glam::DVec3::from_array(load_report.origin));
+        let mut problems = load_report.problems(crate::loads::FORCE_TOLERANCE, crate::loads::MOMENT_TOLERANCE);
         let per_case: Vec<Value> = load_report
             .cases
             .iter()
             .map(|c| {
-                let m = resultants.get(&c.case).copied().unwrap_or_default();
-                json!({"case": c.case, "name": c.name, "source": c.source, "geometry": c.exported, "mesh": m.to_array(),
-                       "lost": on_mesh.lost.get(&c.case)})
+                let (f, m, scale) = about.get(&c.case).copied().unwrap_or_default();
+                if let Some(what) = crate::loads::compare_resultants(
+                    (c.exported, c.exported_moment),
+                    (f.to_array(), m.to_array()),
+                    c.moment_scale.max(scale),
+                    crate::loads::FORCE_TOLERANCE,
+                    crate::loads::MOMENT_TOLERANCE,
+                ) {
+                    problems.push(format!("загружение {} «{}» на сетке: {what}", c.case, c.name));
+                }
+                json!({"case": c.case, "name": c.name, "source": c.source, "geometry": c.exported, "mesh": f.to_array(),
+                       "source_moment": c.source_moment, "geometry_moment": c.exported_moment, "mesh_moment": m.to_array(),
+                       "moment_scale": c.moment_scale.max(scale), "lost": on_mesh.lost.get(&c.case)})
             })
             .collect();
         Ok(json!({
@@ -573,6 +587,7 @@ impl Service {
             "triangles": mesh.shells.iter().filter(|s| s.nodes.len() == 3).count(),
             "quads": mesh.shells.iter().filter(|s| s.nodes.len() == 4).count(),
             "cases": per_case,
+            "load_problems": problems,
             "cap": cap.as_ref().map(|c| &c.2),
             "skipped": load_report.skipped,
             "warnings": exchange.warnings,

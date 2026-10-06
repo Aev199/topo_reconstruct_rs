@@ -12,7 +12,7 @@
 //! stiffness of the cap grows (the plate factor PLKE), its membrane stiffness
 //! and weight stay.
 use crate::parsers::lira::Material;
-use crate::reconstruction::assembly::cutoff::{floors, Cut};
+use crate::reconstruction::assembly::cutoff::{floors, live_supports, Cut};
 use crate::reconstruction::assembly::edit::State;
 use hashbrown::HashMap;
 use serde::Serialize;
@@ -64,21 +64,24 @@ pub fn with_cap(state: &State, materials: &HashMap<u32, Material>, factor: f64) 
     // Plan sections of what stood on the level: (area, centre, own Ix, own Iy), by the E of the cap.
     let mut parts: Vec<(f64, [f64; 2], f64, f64)> = vec![];
     let mut notes = vec![];
-    for w in &cut.walls {
-        let Some((e, t, _)) = plate(materials, w.stiffness) else { continue };
+    let (walls, columns) = live_supports(state);
+    for (wa, wb, stiffness) in walls {
+        let Some((e, t, _)) = plate(materials, stiffness) else { continue };
         let n = e / e_cap;
-        let (dx, dy) = (w.b[0] - w.a[0], w.b[1] - w.a[1]);
+        let (dx, dy) = (wb.x - wa.x, wb.y - wa.y);
         let l = dx.hypot(dy);
         if l < 1e-9 {
             continue;
         }
         let (c, s) = (dx / l, dy / l);
-        parts.push((n * t * l, [(w.a[0] + w.b[0]) / 2., (w.a[1] + w.b[1]) / 2.], n * (t * l.powi(3) * s * s + l * t.powi(3) * c * c) / 12., n * (t * l.powi(3) * c * c + l * t.powi(3) * s * s) / 12.));
+        parts.push((n * t * l, [(wa.x + wb.x) / 2., (wa.y + wb.y) / 2.], n * (t * l.powi(3) * s * s + l * t.powi(3) * c * c) / 12., n * (t * l.powi(3) * c * c + l * t.powi(3) * s * s) / 12.));
     }
-    for c in &cut.columns {
-        let Some(Material::Bar { e, width, height, .. }) = materials.get(&c.stiffness) else { continue };
-        let a = e / e_cap * width * height;
-        parts.push((a, [c.a[0], c.a[1]], a * a / 12., a * a / 12.));
+    for (p, stiffness) in columns {
+        let Some(Material::Bar { e, width, height, .. }) = materials.get(&stiffness) else { continue };
+        // The modular ratio scales the area and the own moment alike (EI is linear in E).
+        let n = e / e_cap;
+        let a = width * height;
+        parts.push((n * a, [p.x, p.y], n * a * a / 12., n * a * a / 12.));
     }
     let area: f64 = parts.iter().map(|p| p.0).sum();
     if parts.is_empty() || area <= 0. {
