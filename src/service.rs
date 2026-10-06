@@ -509,7 +509,6 @@ impl Service {
         let factor = args.get("force_factor").and_then(Value::as_f64).unwrap_or(crate::plaxis::TONNE_TO_KN);
         let gmsh = crate::gmsh::Gmsh::load().map_err(|e| format!("gmsh_missing: {e}"))?;
         let cut = CutOptions::from(args.get("cut"));
-        let input = self.input.as_ref().ok_or("no model is open")?;
         let materials = self.materials.as_ref().ok_or("no model is open")?;
         let cap = if cut.cap { crate::storeys::with_cap(self.session()?.state(), materials, cut.factor) } else { None };
         let state = cap.as_ref().map_or(self.session()?.state(), |c| &c.0);
@@ -547,24 +546,27 @@ impl Service {
             },
         );
         let on_mesh = crate::mesh_loads::transfer(&mesh, state, &loads, 0.02);
-        let exchange = crate::plaxis::exchange_materials(
-            state,
+        // Materials, sections and thicknesses by the rules of the converter (or the stiffness LIRA analysed with).
+        let section_mode = match args.get("midas_stiffness").and_then(Value::as_str) {
+            Some("lira") => crate::midas_stiffness::Mode::Lira,
+            _ => crate::midas_stiffness::Mode::Converter,
+        };
+        let density_multiplier = args.get("density_multiplier").and_then(Value::as_f64).filter(|m| m.is_finite() && *m >= 0.).unwrap_or(1.);
+        let profiles = crate::parsers::lira::LiraParser::profiles_from(&bytes);
+        let plate_types: std::collections::BTreeSet<u32> = mesh.shells.iter().map(|s| s.stiffness).collect();
+        let bar_types: std::collections::BTreeSet<u32> = mesh.bars.iter().map(|b| b.stiffness).collect();
+        let stiffness = crate::midas_stiffness::build(
             exchange_materials,
-            crate::plaxis::Settings {
-                force_factor: factor,
-                min_edge: self.profile.edge_collapse,
-                stiffness: match args.get("stiffness").and_then(Value::as_str) {
-                    Some("nominal") => crate::plaxis::StiffnessMode::Nominal,
-                    _ => crate::plaxis::StiffnessMode::Effective,
-                },
-            },
-            &input.display().to_string(),
+            &profiles,
+            &plate_types,
+            &bar_types,
+            crate::midas_stiffness::Options { mode: section_mode, density_multiplier },
         );
         let mut cases: Vec<(u32, String)> = set.cases.iter().filter(|(c, _)| selected.contains(c)).cloned().collect();
         if state.cut.is_some() && cut_loads && selected.contains(&crate::loads::CUT_WEIGHT_CASE) {
             cases.push((crate::loads::CUT_WEIGHT_CASE, "Вес отброшенных этажей".into()));
         }
-        let (text, report) = crate::midas::write_mxt(&mesh, &on_mesh, &exchange, &cases);
+        let (text, report) = crate::midas::write_mxt(&mesh, &on_mesh, &stiffness, &cases);
         std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))?;
         // Force and moment of every case at each stage: source, geometry, mesh.
         let about = on_mesh.resultants_about(&mesh, glam::DVec3::from_array(load_report.origin));
@@ -598,8 +600,9 @@ impl Service {
             "load_problems": problems,
             "cap": cap.as_ref().map(|c| &c.2),
             "skipped": load_report.skipped,
-            "warnings": exchange.warnings,
-            "missing_materials": exchange.missing_materials,
+            "warnings": ["LIRA rotation angles of bar sections are not read: the program default local axes (beta 0)"],
+            "stiffness_notes": stiffness.notes,
+            "missing_materials": stiffness.missing,
         }))
     }
 

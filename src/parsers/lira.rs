@@ -46,6 +46,21 @@ pub enum Material {
         density: Option<f64>,
         stiffness: Option<[f64; 4]>,
     },
+    /// A bar of another section of the stiffness block: S1, S2, S3, S5, S6
+    /// (parametric, the dimensions in `shape`), a named profile of the
+    /// block 13 or a type with only the numeric EF, EIy, EIz, GIk
+    /// (`Shape::Explicit`; `section` is `S8` for a rolled profile, `explicit` else).
+    /// `e` is the Young's modulus of the type when it has one; `hint` the
+    /// width and height (m) of an S8 row.
+    Section {
+        section: String,
+        e: Option<f64>,
+        nu: Option<f64>,
+        density: Option<f64>,
+        shape: crate::sections::Shape,
+        stiffness: Option<[f64; 4]>,
+        hint: Option<[f64; 2]>,
+    },
 }
 
 impl LiraParser {
@@ -55,6 +70,42 @@ impl LiraParser {
         let file = File::open(filepath)?;
         let mmap = unsafe { Mmap::map(&file)? };
         Ok(Self::materials_bytes(&mmap))
+    }
+
+    /// The named profiles of the block `{13/` (by the number of the stiffness type).
+    pub fn profiles_from(content: &[u8]) -> HashMap<u32, crate::sections::Profile> {
+        let text = String::from_utf8_lossy(content);
+        let mut out = HashMap::new();
+        let Some(start) = ["{13/", "{ 13/", "{13 /", "{ 13 /"].iter().filter_map(|m| text.find(m).map(|i| i + m.len())).min() else {
+            return out;
+        };
+        let end = text[start..].find('}').map_or(text.len(), |e| start + e);
+        let body = &text[start..end];
+        let value = |block: &str, key: &str| -> Option<String> {
+            let at = block.find(key)?;
+            let rest = &block[at + key.len()..];
+            let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+            if let Some(quoted) = rest.strip_prefix('|') {
+                return Some(quoted.split('|').next()?.trim().to_string());
+            }
+            Some(rest.split_whitespace().next()?.to_string())
+        };
+        for block in body.split('[').skip(1) {
+            let Some((head, rest)) = block.split_once(']') else { continue };
+            let Ok(id) = head.trim().parse::<u32>() else { continue };
+            let section = value(rest, "Section").unwrap_or_default();
+            let builtup = rest.contains("Flange") || rest.contains("Wall");
+            let shape = if builtup {
+                match (value(rest, "FlangeShape"), value(rest, "WallShape")) {
+                    (Some(f), Some(w)) => format!("Flange={f}; Wall={w}"),
+                    _ => value(rest, "Shape").unwrap_or_default(),
+                }
+            } else {
+                value(rest, "Shape").unwrap_or_default()
+            };
+            out.insert(id, crate::sections::Profile { section, shape, builtup });
+        }
+        out
     }
 
     /// Materials of input bytes already read (the opened snapshot).
@@ -119,8 +170,47 @@ impl LiraParser {
                         stiffness: (numeric.len() >= 4 && numeric[0] > 0. && numeric[1] >= 0. && numeric[2] >= 0.)
                             .then(|| [numeric[0], numeric[1], numeric[2], numeric[3]]),
                     }
+                } else if let Some((kind, i)) = ["S1", "S2", "S3", "S5", "S6"]
+                    .iter()
+                    .find_map(|k| words.iter().position(|w| w == k).map(|i| (*k, i)))
+                {
+                    use crate::sections::{cm, s6, Shape};
+                    // E and the dimensions (cm, or m when given below 1) after the marker.
+                    let v: Vec<f64> = words[i + 1..].iter().map_while(|w| number(Some(w))).collect();
+                    let shape = match (kind, v.len()) {
+                        ("S1", n) if n >= 5 => Shape::ISym { h: cm(v[2]), b: cm(v[1]), tw: cm(v[3]), tf: cm(v[4]) },
+                        ("S2", n) if n >= 5 => Shape::T { h: cm(v[2]), b: cm(v[1]), tw: cm(v[3]), tf: cm(v[4]) },
+                        ("S3", n) if n >= 7 => Shape::I { h: v[2] / 100., bt: v[3] / 100., tw: v[1] / 100., tft: v[4] / 100., bb: v[5] / 100., tfb: v[6] / 100. },
+                        ("S5", n) if n >= 5 => Shape::Box { h: cm(v[1]), b: cm(v[2]), t1: cm(v[3]), t2: v[4] / 100. },
+                        ("S6", n) if n >= 3 => s6(v[1], v[2]),
+                        _ => return None,
+                    };
+                    Material::Section {
+                        section: kind.to_string(),
+                        e: v.first().copied().filter(|e| *e > 0.),
+                        nu: after(&words, "Mu", 1).or_else(|| after(&words, "NU", 1)),
+                        density,
+                        shape,
+                        stiffness: None,
+                        hint: None,
+                    }
                 } else {
-                    return None;
+                    // Only the numeric row EF EIy EIz GIk (a rolled profile of the block 13 has S8 after it).
+                    let numeric: Vec<f64> = words.iter().map_while(|w| number(Some(w))).collect();
+                    if numeric.len() < 4 || numeric[0] <= 0. || numeric[1] < 0. || numeric[2] < 0. {
+                        return None;
+                    }
+                    let s8 = words.iter().position(|w| w == "S8");
+                    let hint = s8.and_then(|i| Some([number(words.get(i + 2))? / 100., number(words.get(i + 3))? / 100.]));
+                    Material::Section {
+                        section: if s8.is_some() { "S8".into() } else { "explicit".into() },
+                        e: None,
+                        nu: after(&words, "Mu", 1),
+                        density,
+                        shape: crate::sections::Shape::Explicit,
+                        stiffness: Some([numeric[0], numeric[1], numeric[2], numeric[3]]),
+                        hint,
+                    }
                 };
                 Some((id, material))
             })

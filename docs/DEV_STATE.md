@@ -619,6 +619,28 @@ a dense field of point loads on the first slab above the foundation.
   and keeps its moment about any point by a couple F × shift; counted in `approximated`.
   Line loads checked the same way: none off the structure.
 
+### MIDAS stiffness after Lira_Midas-converter (2026-10-06)
+
+`midas_stiffness::build` (materials, sections, thicknesses of the `.mxt`), `sections` (shapes,
+catalogue `data/sortament.tsv` from the converter's `material.json`: name, kind, h, b, s, t), the
+LIRA parser now reads S1, S2, S3, S5, S6, rows with only EF/EIy/EIz/GIk (S8) and the profiles of
+`{13/` (`LiraParser::profiles_from`). Rules taken over: material per (E, nu, unit weight,
+plate/bar) named `Plate_Beton_p12_h0.2` / `Beam_Steel_p3` after the unit weight class; nu from
+the file, else steel 0.3, concrete 0.2; steel sections E = 206 GPa, 76.98 kN/m3, nu 0.3;
+`DBUSER` sections SB, P, SR, H, T, B by dimensions, profiles of the block 13 from the catalogue
+(DoubleT, Tubing, Pipe, Round, builtup I; designation as the fallback), `_AGT` for rigid rods,
+equal shapes one section, thickness per mm, density multiplier. Two modes in the MIDAS dialog:
+`converter` (nominal, the converter's file) and `lira` (EF/EIy/EIz as a `VALUE` section,
+WLKE/PLKE as an equivalent thickness and E). The cap slab of a cut is always equivalent.
+Where the converter is wrong and was not copied (checked by running it on its test1/test5):
+S0 dimensions are taken from the S0 row (it reads EIy of the numeric row as the width), E is
+not EF, a plate over 1 m thick is not read as cm (Остров: slabs 1.0, 1.2, 1.4 m), S6 and S3
+with a concrete E (1e6..6e6 t/m2) stay concrete (it makes every S6 steel: round concrete
+columns of «Для testa» become steel), a 3-number tube designation is looked up by all three.
+Types with E = 0 (S0 rods of «Для testa», 1279 bars) are reported as without material and not
+written. LIRA reductions (EI x 0.3, PLKE 0.3) are listed in `stiffness_notes` in converter mode.
+PLAXIS still reads S0 and GEI only (bars of other sections: `missing_materials`).
+
 Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:
 None` path of `transfer` gives that); (done: see above).

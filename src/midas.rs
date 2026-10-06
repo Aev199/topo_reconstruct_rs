@@ -6,7 +6,7 @@
 //! angle 0), as in the converter.
 use crate::mesh_loads::MeshLoads;
 use crate::meshing::Mesh;
-use crate::plaxis::Exchange;
+use crate::midas_stiffness::Stiffness;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,78 +56,21 @@ pub fn safe_name(raw: &str, fallback: &str) -> String {
     if out.is_empty() { fallback.to_string() } else { out }
 }
 
-/// Torsion constant of a rectangle b x h (m4).
-fn rectangle_torsion(b: f64, h: f64) -> f64 {
-    let (b, h) = (b.min(h), b.max(h));
-    h * b.powi(3) * (1. / 3. - 0.21 * (b / h) * (1. - b.powi(4) / (12. * h.powi(4))))
-}
-
 /// The file text. `cases` are the load cases to write (number, name); the
-/// materials, sections and thicknesses come from `exchange` (made without
-/// polygons) by the stiffness number of the elements.
-pub fn write_mxt(mesh: &Mesh, loads: &MeshLoads, exchange: &Exchange, cases: &[(u32, String)]) -> (String, Report) {
+/// materials, sections and thicknesses come from `stiffness`
+/// (`midas_stiffness::build`) by the stiffness number of the elements.
+pub fn write_mxt(mesh: &Mesh, loads: &MeshLoads, stiffness: &Stiffness, cases: &[(u32, String)]) -> (String, Report) {
     let mut report = Report { nodes: mesh.nodes.len(), ..Default::default() };
     let mut out: Vec<String> = vec![];
     out.push("*VERSION\n   8.1.5\n".into());
     out.push("*UNIT    ; Unit System\n   KN   , M, BTU, F\n".into());
     out.push("*PROJINFO    ; Project Information\n   USER=TOPO\n   ADDRESS=MIDAS\n".into());
 
-    // Materials: one per stiffness of a plate or a bar.
-    let mut material_of: BTreeMap<(bool, u32), usize> = BTreeMap::new(); // (is_plate, stiffness)
-    let mut material_lines = vec![];
-    let mut names_used: BTreeSet<String> = BTreeSet::new();
-    let unique = |raw: &str, names: &mut BTreeSet<String>| -> String {
-        let base = safe_name(raw, "Mat");
-        let mut name = base.clone();
-        let mut k = 1;
-        while !names.insert(name.to_lowercase()) {
-            k += 1;
-            name = format!("{base}_{k}");
-        }
-        name
-    };
-    for m in &exchange.plate_materials {
-        let id = material_lines.len() + 1;
-        material_of.insert((true, m.stiffness), id);
-        let name = unique(&m.name, &mut names_used);
-        material_lines.push(format!("{id:>5}, USER, {name}, 0, 0, , C, NO, 0, 2, {:.2}, {}, 0, {:.2}, 0", m.e, m.nu, m.gamma));
-    }
-    for m in &exchange.beam_materials {
-        let id = material_lines.len() + 1;
-        material_of.insert((false, m.stiffness), id);
-        let name = unique(&m.name, &mut names_used);
-        material_lines.push(format!("{id:>5}, USER, {name}, 0, 0, , C, NO, 0, 2, {:.2}, {}, 0, {:.2}, 0", m.e, m.nu, m.gamma));
-    }
+    // Materials, sections and thicknesses: `midas_stiffness`.
+    let (material_of, section_of, thickness_of) = (&stiffness.material_of, &stiffness.section_of, &stiffness.thickness_of);
+    let (material_lines, section_lines, thickness_lines) = (&stiffness.material_lines, &stiffness.section_lines, &stiffness.thickness_lines);
     report.materials = material_lines.len();
-
-    // Sections of the bars (one per stiffness), thicknesses of the plates (one per value).
-    let mut section_of: BTreeMap<u32, usize> = BTreeMap::new();
-    let mut section_lines = vec![];
-    for m in &exchange.beam_materials {
-        let id = section_lines.len() + 1;
-        section_of.insert(m.stiffness, id);
-        let name = safe_name(&m.name, "Sect");
-        let j = rectangle_torsion(m.width, m.height);
-        section_lines.push(format!("{id:>5}, VALUE, {name}, CC, 0, 0, 0, 0, 0, 0, YES, H, BUILT, 0, 0, 0, 0, 0, 0, 0, 0, 0"));
-        section_lines.push(format!("       {:.8}, 0, 0, {:.8}, {:.8}, {:.8}, 0, 0, 0, 0", m.a, j, m.i3, m.i2));
-        section_lines.push("       0, 0, 0, 0, 0, 0, 0, 0, 0, 0".into());
-        section_lines.push("       0, 0, 0, 0, 0, 0, 0, 0, 0, 0".into());
-    }
-    report.sections = exchange.beam_materials.len();
-    let mut thickness_of: BTreeMap<u32, usize> = BTreeMap::new();
-    let mut thickness_lines = vec![];
-    let mut thickness_ids: BTreeMap<i64, usize> = BTreeMap::new();
-    let base = exchange.beam_materials.len();
-    for m in &exchange.plate_materials {
-        let key = (m.d * 1e4).round() as i64;
-        let id = *thickness_ids.entry(key).or_insert_with(|| {
-            let id = base + thickness_lines.len() + 1;
-            let name = format!("Plate_{:.3}", m.d).trim_end_matches('0').trim_end_matches('.').to_string();
-            thickness_lines.push(format!("{id:>5}, VALUE, YES, {:.3}, 0, NO, 0, 0, {name}", m.d));
-            id
-        });
-        thickness_of.insert(m.stiffness, id);
-    }
+    report.sections = stiffness.sections;
     report.thicknesses = thickness_lines.len();
 
     // Nodes.
@@ -280,15 +223,11 @@ pub fn write_mxt(mesh: &Mesh, loads: &MeshLoads, exchange: &Exchange, cases: &[(
 mod tests {
     use super::*;
     use crate::meshing::{BarPiece, Shell};
-    use crate::plaxis::{BeamMaterial, PlateMaterial};
-
-    fn exchange() -> Exchange {
-        let mut e = crate::plaxis::empty_exchange();
-        e.plate_materials.push(PlateMaterial { name: "GEI_7_h200".into(), stiffness: 7, e: 2.9e7, nu: 0.2, d: 0.2, gamma: 24.5, notes: vec![] });
-        e.beam_materials.push(BeamMaterial {
-            name: "S0_1_50x80".into(), stiffness: 1, e: 2.9e7, nu: 0.2, width: 0.5, height: 0.8, a: 0.4, i2: 0.0083, i3: 0.0213, gamma: 61.3, notes: vec![],
-        });
-        e
+    
+    fn stiffness() -> Stiffness {
+        let text = "( 3/\n1 S0 2.9e+007 50 80/\n 0 RO 1/\n 0 Mu 0.2/\n7 GEI 2.9e+007 0.2 0.2 RO 2.5 /\n)\n";
+        let materials = crate::parsers::lira::LiraParser::materials_from(text.as_bytes());
+        crate::midas_stiffness::build(&materials, &Default::default(), &[7].into(), &[1].into(), Default::default())
     }
 
     #[test]
@@ -312,9 +251,9 @@ mod tests {
         loads.bar_loads.push(crate::mesh_loads::BarLoad { case: 2, bar: 0, t: [0., 1.], q: [[0., 2., 0.], [0., 2., 0.]] });
         loads.nodal.insert((2, 1), [1., 0., -10., 0., 0., 0.]);
         let cases = vec![(1, "ПОЛЫ".to_string()), (2, "СНЕГ".to_string()), (3, "ПУСТО".to_string())];
-        let (text, report) = write_mxt(&mesh, &loads, &exchange(), &cases);
+        let (text, report) = write_mxt(&mesh, &loads, &stiffness(), &cases);
         assert_eq!((report.nodes, report.bars, report.plates, report.load_cases), (5, 1, 1, 2));
-        assert!(text.contains("*ELEMENT    ; Elements\n     1, BEAM  ,    2,    1,      5,      1, 0\n     2, PLATE ,    1,    2,      1,      2,      3,      4, 0\n"), "{text}");
+        assert!(text.contains("*ELEMENT    ; Elements\n     1, BEAM  ,    1,    1,      5,      1, 0\n     2, PLATE ,    2,    2,      1,      2,      3,      4, 0\n"), "{text}");
         assert!(text.contains("*STLDCASE    ; Static Load Cases\n   POLY, D,\n   SNEG, D,\n"), "{text}");
         assert!(text.contains("*USE-STLD, POLY\n\n*PRESSURE    ; Pressure Loads\n     2, PRES, PLATE, FACE, GZ, 0, 0, 0, NO, -5.0000, 0, 0, 0, 0,\n"), "{text}");
         assert!(text.contains("*CONLOAD    ; Nodal Loads\n     2, 1.000, 0.000, -10.000, 0.000, 0.000, 0.000,\n"), "{text}");

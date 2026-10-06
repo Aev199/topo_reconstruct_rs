@@ -122,9 +122,10 @@
       <label>Единица силы ЛИРА → кН <input id="mid-factor" type="number" step="any" value="9.80665"></label>
       <label>Жёсткость
         <select id="mid-stiffness">
-          <option value="effective">расчётная из ЛИРА (EF, EI, WLKE/PLKE)</option>
-          <option value="nominal">номинальная по размерам сечения</option>
+          <option value="converter">как в конвертере: сечения по размерам (DBUSER), материалы и толщины номинальные</option>
+          <option value="lira">расчётная из ЛИРА: EF, EIy, EIz типа и WLKE/PLKE плит</option>
         </select></label>
+      <label>Множитель удельного веса (0 — собственный вес не считается) <input id="mid-density" type="number" step="any" min="0" value="1"></label>
       <div class="cut-options" hidden>
         <p class="hint">Модель обрезана на отметке <b class="cut-z"></b> м. Отброшенные этажи:</p>
         <label><input class="cut-loads" type="checkbox" checked> нагрузки и вес — на несущие элементы на уровне отсечения</label>

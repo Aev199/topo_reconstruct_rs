@@ -752,7 +752,8 @@ $('export-midas').onclick = async () => {
     size: Number($('mid-size').value) || 0.5,
     quads: $('mid-quads').checked,
     force_factor: Number($('mid-factor').value) || 9.80665,
-    stiffness: $('mid-stiffness').value,
+    midas_stiffness: $('mid-stiffness').value,
+    density_multiplier: Number($('mid-density').value) >= 0 ? Number($('mid-density').value) : 1,
     include_cases: [...body.rows].filter((r) => r.querySelector('.use').checked).map((r) => Number(r.dataset.case)),
     cut: chosenCut($('midas-dialog')),
   }));
@@ -768,8 +769,11 @@ $('export-midas').onclick = async () => {
   const skipped = Object.entries(result.skipped).map(([what, n]) => `${what}: ${n}`).join('; ');
   status(`MIDAS: ${path} — узлов ${r.nodes}, стержней ${r.bars}, пластин ${r.plates} (треугольников ${result.triangles}, четырёхугольников ${result.quads}), `
     + `загружений ${r.load_cases}, расхождение сетка/геометрия: сил до ${(worst * 100).toFixed(1)}%, моментов до ${(worstMoment * 100).toFixed(1)}%`
-    + (skipped ? `, не перенесено — ${skipped}` : '') + (r.warnings.length ? `; ${r.warnings.join('; ')}` : '') + problemsText(result.load_problems),
-    r.warnings.length > 0 || result.load_problems.length > 0);
+    + (skipped ? `, не перенесено — ${skipped}` : '') + (r.warnings.length ? `; ${r.warnings.join('; ')}` : '')
+    + (result.stiffness_notes.length ? `; жёсткости: ${result.stiffness_notes.join('; ')}` : '')
+    + (result.missing_materials.length ? `; без сечения/материала типы ЛИРА ${result.missing_materials.join(', ')} (стержни и пластины не записаны)` : '')
+    + problemsText(result.load_problems),
+    r.warnings.length > 0 || result.load_problems.length > 0 || result.missing_materials.length > 0);
 };
 
 $('undo').onclick = () => busy('Отмена…', async () => { await call('undo'); await refresh(); status('Правка отменена'); });
