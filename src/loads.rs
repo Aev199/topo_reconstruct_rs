@@ -1026,7 +1026,7 @@ impl Context<'_> {
                 }
             }
             if self.settings.cut_loads && self.settings.cases.as_ref().is_none_or(|c| c.contains(&CUT_WEIGHT_CASE)) {
-                if let Some(items) = self.removed_weight() {
+                if let Some(items) = self.removed_weight(&mut report) {
                     removed.insert(CUT_WEIGHT_CASE, items);
                 }
             }
@@ -1584,10 +1584,12 @@ impl Context<'_> {
 
     /// The weight of the elements above the cut (tf, downwards), at their
     /// centres: plates by thickness and density, bars by their density.
-    fn removed_weight(&self) -> Option<Vec<(DVec3, DVec3, DVec3)>> {
+    fn removed_weight(&self, report: &mut Report) -> Option<Vec<(DVec3, DVec3, DVec3)>> {
         let cut = self.state.cut.as_ref()?;
         let materials = self.settings.materials.as_ref()?;
         let mut items = vec![];
+        // Elements above the level whose weight is unknown: no density or no section of their type.
+        let mut unknown = 0;
         for e in &self.mesh.elements {
             let Some(p) = positions(self.mesh, e) else { continue };
             let (lo, hi) = p.iter().fold((f64::MAX, f64::MIN), |(l, h), q| (l.min(q.z), h.max(q.z)));
@@ -1597,7 +1599,10 @@ impl Context<'_> {
             let material = materials.get(&e.stiff_id);
             // The part above the level: the whole element or what the level leaves above it.
             let (centre, weight) = if e.is_shell() {
-                let Some(Material::Plate { thickness, density: Some(rho), .. }) = material else { continue };
+                let Some(Material::Plate { thickness, density: Some(rho), .. }) = material else {
+                    unknown += 1;
+                    continue;
+                };
                 let ring = shell_ring(&p);
                 let part = if lo >= cut.z - 1e-6 { ring } else { clip_ring(&ring, cut.z, false) };
                 if part.len() < 3 {
@@ -1605,7 +1610,14 @@ impl Context<'_> {
                 }
                 { let (area, centre) = area_centroid(&part); (centre, rho * thickness * area) }
             } else if e.is_bar() {
-                let Some(Material::Bar { density: Some(ro), .. }) = material else { continue };
+                // RO of a bar type is the mass per length; S0 bars and the other sections (S1..S6, profiles).
+                let ro = match material {
+                    Some(Material::Bar { density: Some(ro), .. }) | Some(Material::Section { density: Some(ro), .. }) => *ro,
+                    _ => {
+                        unknown += 1;
+                        continue;
+                    }
+                };
                 let (a, b) = if p[0].z <= p[1].z { (p[0], p[1]) } else { (p[1], p[0]) };
                 let start = if a.z >= cut.z - 1e-6 { a } else { a.lerp(b, (cut.z - a.z) / (b.z - a.z)) };
                 ((start + b) / 2., ro * start.distance(b))
@@ -1613,6 +1625,9 @@ impl Context<'_> {
                 continue;
             };
             items.push((centre, DVec3::new(0., 0., -weight), DVec3::ZERO));
+        }
+        if unknown > 0 {
+            *report.skipped.entry("вес отброшенных элементов без плотности (RO) или без жёсткости".into()).or_default() += unknown;
         }
         (!items.is_empty()).then_some(items)
     }
@@ -1636,6 +1651,7 @@ impl Context<'_> {
             match self.settings.materials.as_ref().and_then(|m| m.get(&stiffness)) {
                 Some(Material::Plate { thickness, .. }) if wall => *thickness,
                 Some(Material::Bar { width, height, .. }) if !wall => width * height,
+                Some(Material::Section { shape, .. }) if !wall => shape.area().unwrap_or(0.25),
                 _ => if wall { 0.2 } else { 0.25 },
             }
         };
