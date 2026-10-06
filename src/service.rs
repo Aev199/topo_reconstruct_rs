@@ -418,6 +418,11 @@ impl Service {
             &input.display().to_string(),
         );
         let mut exchange = exchange;
+        // Bars of S1..S6 sections and profiles of the block 13 (the exchange reads S0 bars only).
+        if let Ok(bytes) = self.input_bytes() {
+            let profiles = crate::parsers::lira::LiraParser::profiles_from(&bytes);
+            crate::plaxis::add_section_beams(&mut exchange, exchange_materials, &profiles, stiffness, force_factor);
+        }
         if with_loads {
             self.add_loads(&mut exchange, state, force_factor, combination, cases, cut.loads)?;
         }

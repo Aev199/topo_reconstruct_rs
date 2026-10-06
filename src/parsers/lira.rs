@@ -174,14 +174,14 @@ impl LiraParser {
                     .iter()
                     .find_map(|k| words.iter().position(|w| w == k).map(|i| (*k, i)))
                 {
-                    use crate::sections::{cm, s6, Shape};
-                    // E and the dimensions (cm, or m when given below 1) after the marker.
+                    use crate::sections::{s6, Shape};
+                    // E and the dimensions (cm) after the marker.
                     let v: Vec<f64> = words[i + 1..].iter().map_while(|w| number(Some(w))).collect();
                     let shape = match (kind, v.len()) {
-                        ("S1", n) if n >= 5 => Shape::ISym { h: cm(v[2]), b: cm(v[1]), tw: cm(v[3]), tf: cm(v[4]) },
-                        ("S2", n) if n >= 5 => Shape::T { h: cm(v[2]), b: cm(v[1]), tw: cm(v[3]), tf: cm(v[4]) },
+                        ("S1", n) if n >= 5 => Shape::ISym { h: v[2] / 100., b: v[1] / 100., tw: v[3] / 100., tf: v[4] / 100. },
+                        ("S2", n) if n >= 5 => Shape::T { h: v[2] / 100., b: v[1] / 100., tw: v[3] / 100., tf: v[4] / 100. },
                         ("S3", n) if n >= 7 => Shape::I { h: v[2] / 100., bt: v[3] / 100., tw: v[1] / 100., tft: v[4] / 100., bb: v[5] / 100., tfb: v[6] / 100. },
-                        ("S5", n) if n >= 5 => Shape::Box { h: cm(v[1]), b: cm(v[2]), t1: cm(v[3]), t2: v[4] / 100. },
+                        ("S5", n) if n >= 5 => Shape::Box { h: v[1] / 100., b: v[2] / 100., t1: v[3] / 100., t2: v[4] / 100. },
                         ("S6", n) if n >= 3 => s6(v[1], v[2]),
                         _ => return None,
                     };
@@ -191,7 +191,11 @@ impl LiraParser {
                         nu: after(&words, "Mu", 1).or_else(|| after(&words, "NU", 1)),
                         density,
                         shape,
-                        stiffness: None,
+                        // The numeric row EF EIy EIz GIk before the marker, when the type has one.
+                        stiffness: {
+                            let numeric: Vec<f64> = words.iter().map_while(|w| number(Some(w))).collect();
+                            (numeric.len() >= 4 && numeric[0] > 0. && numeric[1] >= 0. && numeric[2] >= 0.).then(|| [numeric[0], numeric[1], numeric[2], numeric[3]])
+                        },
                         hint: None,
                     }
                 } else {

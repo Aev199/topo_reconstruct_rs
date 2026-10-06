@@ -930,6 +930,77 @@ fn exchange_with(
     }
 }
 
+/// Bars of the types that are not S0 (S1, S2, S3, S5, S6, rolled profiles of the block 13, types with only
+/// EF, EIy, EIz, GIk) get their beam materials, by the rules of the MIDAS export
+/// (`midas_stiffness::bar_spec`: E, nu, unit weight, steel and concrete). Area and moments of inertia: the
+/// numeric row of the type in the effective mode, else the profile of the catalogue, else the shape.
+pub fn add_section_beams(
+    exchange: &mut Exchange,
+    materials: &HashMap<u32, Material>,
+    profiles: &HashMap<u32, crate::sections::Profile>,
+    mode: StiffnessMode,
+    force_factor: f64,
+) {
+    let types: std::collections::BTreeSet<u32> = exchange.beams.iter().filter(|b| b.material.is_none()).map(|b| b.stiffness).collect();
+    let mut names: BTreeMap<u32, String> = BTreeMap::new();
+    for id in types {
+        let Some(spec) = crate::midas_stiffness::bar_spec(id, materials, profiles) else { continue };
+        let profile = profiles.get(&id);
+        let e_t = spec.young_kn / TONNE_TO_KN;
+        let mut notes = vec![];
+        let (a, i3, i2) = match (mode, spec.numeric) {
+            (StiffnessMode::Effective, Some([ef, eiy, eiz, _])) => {
+                notes.push("EA, EIy, EIz from the LIRA type; GIk not transferable (PLAXIS derives J)".to_string());
+                (ef / e_t, (eiy / e_t).max(1e-12), (eiz / e_t).max(1e-12))
+            }
+            _ => match (profile.and_then(crate::sections::profile_properties), spec.shape.inertia()) {
+                (Some(p), _) => {
+                    notes.push("section properties of the catalogue profile".to_string());
+                    (p.area, p.ix, p.iy)
+                }
+                (None, Some((ix, iy))) => (spec.area.unwrap_or(0.), ix, iy),
+                (None, None) => continue,
+            },
+        };
+        if a <= 0. {
+            continue;
+        }
+        if spec.steel {
+            notes.push("steel: E 206 GPa, 76.98 kN/m3, nu 0.3 (the rules of the MIDAS export)".to_string());
+        }
+        if spec.from_row {
+            notes.push("E taken as EF / A of the type".to_string());
+        }
+        // Height along the LIRA Z1 axis, width along Y1; without dimensions the box of the same A and I.
+        let (height, width) = spec.shape.extent().unwrap_or_else(|| {
+            let h = (12. * i3 / a).sqrt();
+            (h, a / h)
+        });
+        let name = format!("{}_{id}", crate::midas::safe_name(&spec.shape.name(id, profile), "Bar"));
+        exchange.beam_materials.push(BeamMaterial {
+            name: name.clone(),
+            stiffness: id,
+            e: e_t * force_factor,
+            nu: spec.nu,
+            width,
+            height,
+            a,
+            i2,
+            i3,
+            // The weight is by the area (PLAXIS: gamma x A); a rigid rod has none.
+            gamma: spec.gamma_kn / TONNE_TO_KN * force_factor,
+            notes,
+        });
+        names.insert(id, name);
+    }
+    for beam in exchange.beams.iter_mut().filter(|b| b.material.is_none()) {
+        if let Some(name) = names.get(&beam.stiffness) {
+            beam.material = Some(name.clone());
+        }
+    }
+    exchange.missing_materials.retain(|id| !names.contains_key(id));
+}
+
 /// An exchange without objects (materials are added by the caller).
 pub fn empty_exchange() -> Exchange {
     Exchange {

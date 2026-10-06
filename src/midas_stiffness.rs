@@ -23,7 +23,7 @@
 //! above 1 m is not read as centimetres, and E of a type with an EF row is not
 //! taken as EF.
 use crate::parsers::lira::Material;
-use crate::sections::{profile_shape, Profile, Shape};
+use crate::sections::{profile_properties, profile_shape, Profile, Shape};
 use hashbrown::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -109,6 +109,8 @@ struct MaterialSpec {
     gamma: f64,
     /// Thickness of a plate, for the name.
     thickness: f64,
+    /// A rigid rod: a weightless material of its own.
+    rigid: bool,
 }
 
 /// The section of one bar type: the line without the number and a name.
@@ -118,6 +120,93 @@ struct SectionSpec {
     dbuser: bool,
     /// The lines after `YES, ` (the first) and the data lines of a VALUE block.
     lines: Vec<String>,
+}
+
+/// What a stiffness type of a bar is made of: the shape, E, nu and unit weight.
+#[derive(Debug, Clone)]
+pub struct BarSpec {
+    pub shape: Shape,
+    /// The numeric row EF, EIy, EIz, GIk of the type (tf, tf m2), when it has one.
+    pub numeric: Option<[f64; 4]>,
+    /// E (kN/m2), nu, unit weight (kN/m3; 0 for a rigid rod).
+    pub young_kn: f64,
+    pub nu: f64,
+    pub gamma_kn: f64,
+    /// Area (m2) of the section: the catalogue's for a profile, else of the shape.
+    pub area: Option<f64>,
+    pub steel: bool,
+    pub rigid: bool,
+    /// E was taken from EF / A (the E of the section row disagrees with the row EF).
+    pub from_row: bool,
+    /// The type has no E at all (only EF, EIy, EIz, GIk and no dimensions): steel is assumed.
+    pub assumed_e: bool,
+    /// A profile of the block 13 that is not in the catalogue.
+    pub from_designation: bool,
+}
+
+/// The shape, E, nu and unit weight of a bar type by the converter's rules (see the module).
+pub fn bar_spec(id: u32, materials: &HashMap<u32, Material>, profiles: &HashMap<u32, Profile>) -> Option<BarSpec> {
+    let profile = profiles.get(&id);
+    let material = materials.get(&id);
+    // The shape, E (t/m2), nu, linear weight RO (t/m) and the numeric EF, EIy, EIz, GIk of the type.
+    let (mut shape, file_e, file_nu, ro, numeric) = match material {
+        Some(&Material::Bar { e, nu, width, height, density, stiffness }) => (Shape::Rect { h: height, b: width }, Some(e), nu, density, stiffness),
+        Some(Material::Section { e, nu, density, shape, stiffness, .. }) => (shape.clone(), *e, *nu, *density, *stiffness),
+        _ if profile.is_some() => (Shape::Explicit, None, None, None, None),
+        _ => return None,
+    };
+    let mut from_designation = false;
+    if let Some(p) = profile {
+        match profile_shape(p) {
+            Some(found) => shape = found,
+            None => from_designation = true,
+        }
+    }
+    let area = match profile.and_then(profile_properties) {
+        Some(p) => Some(p.area),
+        None => shape.area(),
+    };
+    // E of the type (t/m2): LIRA analyses with the numeric row EF, EIy, EIz, GIk when there is one,
+    // so the type's E is EF / A of its section; the E written on the S line is kept when it agrees
+    // (S0 rows) and replaced when it does not (the piles of S6 rows with E = 720000 whose EF belongs
+    // to E of 4e6).
+    let (mut e_type, mut from_row) = (file_e, false);
+    if let (Some([ef, ..]), Some(a)) = (numeric, area) {
+        if a > 0. && ef > 0. {
+            let by_row = ef / a;
+            if file_e.is_none_or(|e| (by_row / e - 1.).abs() > 0.02) {
+                from_row = file_e.is_some();
+                e_type = Some(by_row);
+            }
+        }
+    }
+    // Steel by the kind of the section (S1, S2, S3, S5, S6, S8) or a catalogue profile, unless E of
+    // the type is a concrete one; a rectangular S0 bar is never steel by its kind. A type without E
+    // (only EF, EIy, EIz, GIk and no dimensions) is taken as a steel one.
+    let steel_kind = match material {
+        Some(Material::Bar { .. }) => false,
+        Some(Material::Section { section, .. }) => section != "explicit",
+        _ => true,
+    };
+    let steel = (steel_kind || profile.is_some() || e_type.is_none()) && !e_type.is_some_and(|e| CONCRETE_E.contains(&e));
+    // Rigid rods (АЖТ): E > 1e8 t/m2 and 1 x 1 m; a weightless material of their own.
+    let rigid = matches!(material, Some(Material::Bar { e, width, height, .. }) if *e > 1e8 && (width - 1.).abs() < 1e-12 && (height - 1.).abs() < 1e-12);
+    let (young_kn, nu, gamma_kn);
+    if steel {
+        (young_kn, nu, gamma_kn) = (STEEL_E, STEEL_NU, STEEL_GAMMA);
+    } else {
+        young_kn = e_type.map_or(STEEL_E, |e| e * G);
+        gamma_kn = match (ro, area) {
+            (Some(ro), Some(a)) if a > 0. => ro * G / a,
+            _ => CONCRETE_GAMMA,
+        };
+        nu = file_nu.unwrap_or_else(|| match class(gamma_kn) {
+            "Steel" => STEEL_NU,
+            "Beton" => CONCRETE_NU,
+            _ => DEFAULT_NU,
+        });
+    }
+    Some(BarSpec { shape, numeric, young_kn, nu, gamma_kn: if rigid { 0. } else { gamma_kn }, area, steel, rigid, from_row, assumed_e: e_type.is_none(), from_designation })
 }
 
 /// Builds the materials, sections and thicknesses for the stiffness types
@@ -135,7 +224,7 @@ pub fn build(
     let mut specs: BTreeMap<(bool, u32), MaterialSpec> = BTreeMap::new();
     let mut section_specs: BTreeMap<u32, SectionSpec> = BTreeMap::new();
     let mut plate_thickness: BTreeMap<u32, f64> = BTreeMap::new();
-    let (mut steel_forced, mut reduced_ignored, mut from_designation) = (vec![], vec![], vec![]);
+    let (mut steel_forced, mut reduced_ignored, mut from_designation, mut from_row_ef, mut assumed_e) = (vec![], vec![], vec![], vec![], vec![]);
     let mut equivalent: Vec<u32> = vec![];
 
     for &id in plates {
@@ -161,73 +250,33 @@ pub fn build(
                 reduced_ignored.push(id);
             }
         }
-        specs.insert((true, id), MaterialSpec { plate: true, young, nu, gamma: (gamma * multiplier).max(0.01), thickness: t });
+        specs.insert((true, id), MaterialSpec { plate: true, young, nu, gamma: (gamma * multiplier).max(0.01), thickness: t, rigid: false });
         plate_thickness.insert(id, t);
     }
 
     for &id in bars {
+        let Some(spec) = bar_spec(id, materials, profiles) else {
+            out.missing.insert(id);
+            continue;
+        };
         let profile = profiles.get(&id);
-        let material = materials.get(&id);
-        // The shape, E (t/m2), nu, linear weight RO (t/m) and the numeric EF, EIy, EIz, GIk of the type.
-        let (shape, file_e, file_nu, ro, numeric) = match material {
-            Some(&Material::Bar { e, nu, width, height, density, stiffness }) => {
-                (Shape::Rect { h: height, b: width }, Some(e), nu, density, stiffness)
-            }
-            Some(Material::Section { e, nu, density, shape, stiffness, .. }) => (shape.clone(), *e, *nu, *density, *stiffness),
-            _ if profile.is_some() => (Shape::Explicit, None, None, None, None),
-            _ => {
-                out.missing.insert(id);
-                continue;
-            }
-        };
-        let mut shape = shape;
-        if let Some(p) = profile {
-            match profile_shape(p) {
-                Some(found) => shape = found,
-                None => from_designation.push(id),
-            }
+        let (shape, numeric, young_kn, nu, rigid) = (spec.shape.clone(), spec.numeric, spec.young_kn, spec.nu, spec.rigid);
+        if spec.from_designation {
+            from_designation.push(id);
         }
-        // Steel by the kind of the section (S1, S2, S3, S5, S6, S8) or a catalogue profile, unless
-        // E of the type is a concrete one; a rectangular S0 bar is never steel by its kind.
-        let steel_kind = match material {
-            Some(Material::Bar { .. }) => false,
-            Some(Material::Section { section, .. }) => section != "explicit",
-            _ => true,
-        };
-        // A type without E (only EF, EIy, EIz, GIk) is taken as a steel one.
-        let steel = (steel_kind || profile.is_some() || file_e.is_none()) && !file_e.is_some_and(|e| CONCRETE_E.contains(&e));
-        let nominal_a = shape.area();
-        let young_kn;
-        let mut nu;
-        let mut gamma;
-        if steel {
-            young_kn = STEEL_E;
-            nu = STEEL_NU;
-            gamma = STEEL_GAMMA;
+        if spec.from_row {
+            from_row_ef.push(id);
+        }
+        if spec.assumed_e {
+            assumed_e.push(id);
+        }
+        if spec.steel {
             steel_forced.push(id);
-        } else {
-            young_kn = match file_e {
-                Some(e) => e * G,
-                None => STEEL_E,
-            };
-            gamma = match (ro, nominal_a) {
-                (Some(ro), Some(a)) if a > 0. => ro * G / a,
-                _ => CONCRETE_GAMMA,
-            };
-            nu = file_nu.unwrap_or(DEFAULT_NU);
-            if file_nu.is_none() {
-                match class(gamma) {
-                    "Steel" => nu = STEEL_NU,
-                    "Beton" => nu = CONCRETE_NU,
-                    _ => {}
-                }
-            }
         }
-        gamma = (gamma * multiplier).max(0.01);
-        specs.insert((false, id), MaterialSpec { plate: false, young: young_kn, nu, gamma, thickness: 0. });
+        let gamma = if rigid { 0. } else { (spec.gamma_kn * multiplier).max(0.01) };
+        specs.insert((false, id), MaterialSpec { plate: false, young: young_kn, nu, gamma, thickness: 0., rigid });
 
         // The section.
-        let rigid = matches!(material, Some(Material::Bar { e, width, height, .. }) if *e > 1e8 && (width - 1.).abs() < 1e-12 && (height - 1.).abs() < 1e-12);
         let mut name = crate::midas::safe_name(&shape.name(id, profile), &format!("Section-{id}"));
         if rigid {
             name += "_AGT";
@@ -269,9 +318,9 @@ pub fn build(
     }
 
     // Materials: one per signature, the number follows the lowest LIRA type of the group.
-    let mut groups: BTreeMap<(i64, i64, i64, bool), Vec<(bool, u32)>> = BTreeMap::new();
+    let mut groups: BTreeMap<(i64, i64, i64, bool, bool), Vec<(bool, u32)>> = BTreeMap::new();
     for (&key, spec) in &specs {
-        let sig = ((spec.young * 100.).round() as i64, (spec.nu * 1e6).round() as i64, (spec.gamma * 1e4).round() as i64, spec.plate);
+        let sig = ((spec.young * 100.).round() as i64, (spec.nu * 1e6).round() as i64, (spec.gamma * 1e4).round() as i64, spec.plate, spec.rigid);
         groups.entry(sig).or_default().push(key);
     }
     let mut ordered: Vec<(u32, Vec<(bool, u32)>)> = groups.into_values().map(|g| (g.iter().map(|k| k.1).min().unwrap_or(0), g)).collect();
@@ -280,7 +329,7 @@ pub fn build(
     for (number, (first, group)) in ordered.iter().enumerate() {
         let id = number + 1;
         let spec = &specs[&group[0]];
-        let mut name = format!("{}_{}_p{first}", if spec.plate { "Plate" } else { "Beam" }, class(spec.gamma));
+        let mut name = if spec.rigid { format!("AGT_p{first}") } else { format!("{}_{}_p{first}", if spec.plate { "Plate" } else { "Beam" }, class(spec.gamma)) };
         if spec.plate {
             // The thickness in the name when the group has one thickness.
             let ts: BTreeSet<i64> = group.iter().map(|k| (specs[k].thickness * 1e4).round() as i64).collect();
@@ -352,6 +401,12 @@ pub fn build(
     }
     if !equivalent.is_empty() {
         out.notes.push(format!("плиты с WLKE/PLKE заменены эквивалентной толщиной и E (мембрана, изгиб и вес сохранены), типы: {}", list(&equivalent)));
+    }
+    if !from_row_ef.is_empty() {
+        out.notes.push(format!("E типа взят как EF / A по строке жёсткости (E в строке сечения не согласуется с EF), типы: {}", list(&from_row_ef)));
+    }
+    if !assumed_e.is_empty() {
+        out.notes.push(format!("у типа нет E и размеров (только EF, EIy, EIz, GIk): принят модуль стали, типы: {}", list(&assumed_e)));
     }
     if !from_designation.is_empty() {
         out.notes.push(format!("профиль не найден в сортаменте, размеры по обозначению или номинальные, типы: {}", list(&from_designation)));
@@ -425,7 +480,7 @@ mod tests {
         let m = s.material_lines.join("\n");
         assert!(m.contains("Beam_Beton_p6"), "{m}");
         assert!(m.contains("23240") || m.contains("2324"), "E = 2.37e6 t/m2 x 9.80665 = 23 242 000 kN/m2: {m}");
-        assert!(s.section_lines[0].contains("SR, 1, 0.2800"), "{:?}", s.section_lines);
+        assert!(s.section_lines[0].contains("SR, 2, 0.2800"), "{:?}", s.section_lines);
         assert!(s.notes.iter().all(|n| !n.contains("сталь")), "{:?}", s.notes);
     }
 
@@ -460,13 +515,40 @@ mod tests {
     }
 
     #[test]
+    fn a_pile_with_a_stiffness_row_takes_e_from_ef_over_a_and_stays_concrete() {
+        // «Для testa», type 392: EF = 2.77735e6 t, S6 line "720000 92 0" (D = 92 cm). E of the row is EF / A = 4.18e6 t/m2.
+        let text = "( 3/\n392 2.77735e+006 141350 141350 191790 0 0 /\n 0 RO 2.22695/\n 0 S6 720000 92 0/\n 0 Mu 0.2/\n)\n";
+        let materials = LiraParser::materials_from(text.as_bytes());
+        let ids: BTreeSet<u32> = [392].into();
+        let s = build(&materials, &HashMap::new(), &BTreeSet::new(), &ids, Options::default());
+        // The solid round section of 92 cm, not a 1413 m rod.
+        assert!(s.section_lines[0].contains("SR, 2, 0.9200"), "{:?}", s.section_lines);
+        let a = std::f64::consts::PI / 4. * 0.92 * 0.92;
+        let e = 2.77735e6 / a * 9.80665;
+        assert!(s.material_lines[0].contains(&format!("{e:.2}")) && s.material_lines[0].contains("Beam_"), "{:?} (E = {e:.2})", s.material_lines);
+        assert!(s.notes.iter().all(|n| !n.contains("сталь")) && s.notes.iter().any(|n| n.contains("EF / A")), "{:?}", s.notes);
+    }
+
+    #[test]
+    fn the_s0_row_of_the_converters_test5_is_10_by_10_cm_with_its_e() {
+        // "1 30000 7.5 7.5 73804 / S0 3.00001e+006 10 10": the converter writes 0.075 and E = EF x g.
+        let text = "( 3/\n1 30000 7.50001 7.50001 73804.1 0 0 /\n 0 RO 0.025/\n 0 S0 3.00001e+006 10 10/\n 0 Mu 0.2/\n)\n";
+        let materials = LiraParser::materials_from(text.as_bytes());
+        let ids: BTreeSet<u32> = [1].into();
+        let s = build(&materials, &HashMap::new(), &BTreeSet::new(), &ids, Options::default());
+        assert!(s.section_lines[0].contains("SB, 2, 0.1000, 0.1000"), "{:?}", s.section_lines);
+        assert!(s.material_lines[0].contains("29420009.80") || s.material_lines[0].contains("294200"), "{:?}", s.material_lines);
+        assert!(s.material_lines[0].contains(", 24.52, 0"), "{:?}", s.material_lines);
+    }
+
+    #[test]
     fn a_rigid_rod_is_named_agt_and_the_density_multiplier_applies() {
         let text = "( 3/\n1 S0 1e+009 100 100/\n 0 RO 2.5/\n)\n";
         let materials = LiraParser::materials_from(text.as_bytes());
         let ids: BTreeSet<u32> = [1].into();
         let s = build(&materials, &HashMap::new(), &BTreeSet::new(), &ids, Options { mode: Mode::Converter, density_multiplier: 0. });
         assert!(s.section_lines[0].contains("_AGT"), "{:?}", s.section_lines);
-        // 0 x the weight: the minimum of 0.01 kN/m3 of the converter.
-        assert!(s.material_lines[0].contains(", 0.01, 0"), "{:?}", s.material_lines);
+        // A rigid rod: a weightless material of its own, as in the converter's corrected writer.
+        assert!(s.material_lines[0].contains("AGT_p1") && s.material_lines[0].contains(", 0.00, 0"), "{:?}", s.material_lines);
     }
 }

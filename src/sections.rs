@@ -4,8 +4,6 @@
 //! (`data/sortament.tsv`: name, kind, h, b, s, t in mm) and builtup I sections.
 //! Dimensions in metres.
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::OnceLock;
 
 /// Shape of a bar section.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -41,14 +39,10 @@ pub struct Profile {
     pub builtup: bool,
 }
 
-/// Dimension of cm or m, as the LIRA rows mix both: values above 1 are cm.
-pub fn cm(v: f64) -> f64 {
-    if v > 1. { v / 100. } else { v }
-}
-
-/// `Pipe`, `Rod` or `Round` for a LIRA S6 row: outer and inner diameters (cm or m).
+/// `Pipe` or `Round` for a LIRA S6 row: outer and inner diameters (cm, as the
+/// dimensions of every LIRA section row; the converter takes values up to 1 as metres).
 pub fn s6(d_outer: f64, d_inner: f64) -> Shape {
-    let (d, inner) = (cm(d_outer), cm(d_inner));
+    let (d, inner) = (d_outer / 100., d_inner / 100.);
     let tw = (d - inner) / 2.;
     if inner > 0. && tw > 1e-4 && d > inner {
         Shape::Pipe { d, t: tw }
@@ -69,6 +63,47 @@ impl Shape {
             Shape::I { h, bt, tw, tft, bb, tfb } => bt * tft + bb * tfb + (h - tft - tfb) * tw,
             Shape::Box { h, b, t1, t2 } => h * b - (h - 2. * t2).max(0.) * (b - 2. * t1).max(0.),
             Shape::Tube { h, b, t } => h * b - (h - 2. * t).max(0.) * (b - 2. * t).max(0.),
+            Shape::Explicit => return None,
+        })
+    }
+
+    /// Second moments (m4) about the horizontal axis (the bending of the height `h`, the strong
+    /// one) and the vertical axis, for the section standing as drawn; `None` without dimensions.
+    pub fn inertia(&self) -> Option<(f64, f64)> {
+        let pi = std::f64::consts::PI;
+        Some(match *self {
+            Shape::Rect { h, b } => (b * h.powi(3) / 12., h * b.powi(3) / 12.),
+            Shape::Round { d } => (pi * d.powi(4) / 64., pi * d.powi(4) / 64.),
+            Shape::Pipe { d, t } => (pi * (d.powi(4) - (d - 2. * t).powi(4)) / 64., pi * (d.powi(4) - (d - 2. * t).powi(4)) / 64.),
+            Shape::Tube { h, b, t } => ((b * h.powi(3) - (b - 2. * t) * (h - 2. * t).powi(3)) / 12., (h * b.powi(3) - (h - 2. * t) * (b - 2. * t).powi(3)) / 12.),
+            Shape::Box { h, b, t1, t2 } => ((b * h.powi(3) - (b - 2. * t1) * (h - 2. * t2).powi(3)) / 12., (h * b.powi(3) - (h - 2. * t2) * (b - 2. * t1).powi(3)) / 12.),
+            Shape::ISym { h, b, tw, tf } => return Shape::I { h, bt: b, tw, tft: tf, bb: b, tfb: tf }.inertia(),
+            Shape::I { h, bt, tw, tft, bb, tfb } => {
+                // Parts from the bottom: bottom flange, web, top flange.
+                let hw = h - tft - tfb;
+                let parts = [(bb * tfb, tfb / 2., bb * tfb.powi(3) / 12.), (tw * hw, tfb + hw / 2., tw * hw.powi(3) / 12.), (bt * tft, h - tft / 2., bt * tft.powi(3) / 12.)];
+                let a: f64 = parts.iter().map(|p| p.0).sum();
+                let yc = parts.iter().map(|p| p.0 * p.1).sum::<f64>() / a;
+                let ix = parts.iter().map(|p| p.2 + p.0 * (p.1 - yc).powi(2)).sum();
+                (ix, tft * bt.powi(3) / 12. + tfb * bb.powi(3) / 12. + hw * tw.powi(3) / 12.)
+            }
+            Shape::T { h, b, tw, tf } => {
+                let hw = h - tf;
+                let parts = [(tw * hw, hw / 2., tw * hw.powi(3) / 12.), (b * tf, h - tf / 2., b * tf.powi(3) / 12.)];
+                let a: f64 = parts.iter().map(|p| p.0).sum();
+                let yc = parts.iter().map(|p| p.0 * p.1).sum::<f64>() / a;
+                (parts.iter().map(|p| p.2 + p.0 * (p.1 - yc).powi(2)).sum(), tf * b.powi(3) / 12. + hw * tw.powi(3) / 12.)
+            }
+            Shape::Explicit => return None,
+        })
+    }
+
+    /// Height and width (m) of the bounding box of the section.
+    pub fn extent(&self) -> Option<(f64, f64)> {
+        Some(match *self {
+            Shape::Rect { h, b } | Shape::ISym { h, b, .. } | Shape::T { h, b, .. } | Shape::Box { h, b, .. } | Shape::Tube { h, b, .. } => (h, b),
+            Shape::Round { d } | Shape::Pipe { d, .. } => (d, d),
+            Shape::I { h, bt, bb, .. } => (h, bt.max(bb)),
             Shape::Explicit => return None,
         })
     }
@@ -95,7 +130,8 @@ impl Shape {
         Some(match *self {
             Shape::Rect { h, b } => format!("SB, 2, {h:.4}, {b:.4}, 0, 0, 0, 0, 0, 0, 0, 0"),
             Shape::Pipe { d, t } => format!("P, 2, {d:.4}, {t:.4}, 0, 0, 0, 0, 0, 0, 0, 0"),
-            Shape::Round { d } => format!("SR, 1, {d:.4}, 0, 0, 0, 0, 0, 0, 0, 0, 0"),
+            // "SR, 2" as the converter's corrected writer has it (its base writer wrote "SR, 1").
+            Shape::Round { d } => format!("SR, 2, {d:.4}, 0, 0, 0, 0, 0, 0, 0, 0, 0"),
             Shape::ISym { h, b, tw, tf } => format!("H, 2, {h:.4}, {b:.4}, {tw:.4}, {tf:.4}, {b:.4}, {tf:.4}, 0, 0, 0, 0"),
             Shape::T { h, b, tw, tf } => format!("T, 2, {h:.4}, {b:.4}, {tw:.4}, {tf:.4}, 0, 0, 0, 0, 0, 0"),
             Shape::I { h, bt, tw, tft, bb, tfb } => format!("H, 2, {h:.4}, {bt:.4}, {tw:.4}, {tft:.4}, {bb:.4}, {tfb:.4}, 0, 0, 0, 0"),
@@ -128,144 +164,9 @@ impl Shape {
     }
 }
 
-struct Entry {
-    name: String,
-    kind: String,
-    h: Option<f64>,
-    b: Option<f64>,
-    s: Option<f64>,
-    t: Option<f64>,
-}
-
-/// Kinds of the catalogue that are I sections (the converter's `_SORTAMENT_TO_SECTION_TYPE`).
-fn is_i_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "нормальный (балочный)"
-            | "балочный нормальный"
-            | "балочный широкополочный"
-            | "широкополочный"
-            | "с уклоном полок"
-            | "с параллельными гранями полок"
-            | "колонный"
-            | "дополнительной серии балочный"
-            | "дополнительной серии колонный"
-            | "экономичный с параллельными гранями полок"
-            | "легкой серии с параллельными гранями полок"
-            | "специальный"
-            | "свайный"
-            | "дополнительной серии"
-    )
-}
-
-struct Catalogue {
-    entries: Vec<Entry>,
-    by_name: HashMap<String, usize>,
-    by_prefix: HashMap<String, Vec<usize>>,
-}
-
-fn catalogue() -> &'static Catalogue {
-    static CATALOGUE: OnceLock<Catalogue> = OnceLock::new();
-    CATALOGUE.get_or_init(|| {
-        let mut entries = vec![];
-        for line in include_str!("../data/sortament.tsv").lines() {
-            let f: Vec<&str> = line.split('\t').collect();
-            if f.len() < 6 {
-                continue;
-            }
-            let num = |s: &str| s.trim().parse::<f64>().ok();
-            entries.push(Entry { name: f[0].to_string(), kind: f[1].to_string(), h: num(f[2]), b: num(f[3]), s: num(f[4]), t: num(f[5]) });
-        }
-        let mut by_name = HashMap::new();
-        let mut by_prefix: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, e) in entries.iter().enumerate() {
-            by_name.insert(e.name.clone(), i);
-            let prefix = numeric_prefix(&e.name);
-            if !prefix.is_empty() {
-                by_prefix.entry(prefix).or_default().push(i);
-            }
-        }
-        Catalogue { entries, by_name, by_prefix }
-    })
-}
-
-/// `18Б1` -> `18`, `100x5` -> `100`.
-fn numeric_prefix(name: &str) -> String {
-    name.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect()
-}
-
-/// A designation with the cyrillic x/ch and the multiplication sign as `x`.
-fn ascii_x(s: &str) -> String {
-    s.replace(['х', 'Х', '×', 'X'], "x")
-}
-
-impl Catalogue {
-    fn exact(&self, name: &str) -> Option<usize> {
-        let variants = [
-            name.to_string(),
-            name.replace(" x ", "x"),
-            name.replace(" x ", "х"),
-            name.replace('х', "x"),
-            name.replace('x', "х"),
-        ];
-        variants.iter().find_map(|v| self.by_name.get(v).copied())
-    }
-
-    /// A tube from `100 x 5` (round, or square `100x100x5`) or `120 x 80 x 5` (rectangular).
-    fn tube(&self, shape: &str, square: bool) -> Option<usize> {
-        let numbers: Vec<f64> = ascii_x(shape).split('x').filter_map(|p| p.trim().parse().ok()).collect();
-        if numbers.len() == 3 {
-            let name = |v: f64| format!("{}", if (v - v.round()).abs() < 1e-9 { format!("{}", v.round() as i64) } else { format!("{v}") });
-            let search = format!("{}x{}x{}", name(numbers[0]), name(numbers[1]), name(numbers[2]));
-            return self.exact(&search);
-        }
-        if numbers.len() < 2 {
-            return None;
-        }
-        let (a, t) = (numbers[0], numbers[1]);
-        let search = if square { format!("{}x{}x{}", a as i64, a as i64, t as i64) } else { format!("{}x{}", a as i64, t as i64) };
-        if let Some(&i) = self.by_name.get(&search) {
-            return Some(i);
-        }
-        let prefix = format!("{}", a as i64);
-        let kind = if square { "квадрат" } else { "Труба круглая" };
-        self.by_prefix.get(&prefix)?.iter().copied().find(|&i| {
-            let e = &self.entries[i];
-            e.kind.to_lowercase().contains(&kind.to_lowercase()) && e.t.is_some_and(|c| (c - t).abs() < 0.5)
-        })
-    }
-
-    /// The `lookup_by_section_info` of the converter.
-    fn lookup(&self, section: &str, shape: &str) -> Option<usize> {
-        let (section, shape) = (section.to_lowercase(), shape.trim());
-        if let Some(i) = self.exact(shape) {
-            return Some(i);
-        }
-        if section.contains("doublet") || section.contains("двут") {
-            if let Some(&i) = self.by_name.get(&format!("{shape}.0")) {
-                if is_i_kind(&self.entries[i].kind) {
-                    return Some(i);
-                }
-            }
-            let candidates = self.by_prefix.get(&numeric_prefix(shape))?;
-            if let Some(&i) = candidates.iter().find(|&&i| self.entries[i].name.replace(".0", "") == shape) {
-                return Some(i);
-            }
-            return candidates.iter().copied().find(|&i| is_i_kind(&self.entries[i].kind)).or(candidates.first().copied());
-        }
-        if section.contains("tubing") || section.contains("tube") {
-            return self.tube(shape, true);
-        }
-        if section.contains("pipe") {
-            return self.tube(shape, false);
-        }
-        None
-    }
-}
-
 /// Dimensions in mm of `a x b`: `100 x 5` -> `[100, 5]`.
 fn dimensions(shape: &str) -> Option<Vec<f64>> {
-    ascii_x(shape).split('x').map(|p| p.trim().parse::<f64>().ok()).collect()
+    crate::sortament::ascii_x(shape).split('x').map(|p| p.trim().parse::<f64>().ok()).collect()
 }
 
 /// The shape of a named profile of the block 13; `None` when it cannot be
@@ -289,9 +190,7 @@ pub fn profile_shape(profile: &Profile) -> Option<Shape> {
     if section == "round" {
         return dimensions(&profile.shape).and_then(|d| d.first().copied()).map(|d| Shape::Round { d: d / 1000. });
     }
-    let cat = catalogue();
-    if let Some(i) = cat.lookup(&profile.section, &profile.shape) {
-        let e = &cat.entries[i];
+    if let Some(e) = crate::sortament::lookup(&profile.section, &profile.shape) {
         let h = e.h? / 1000.;
         if e.kind == "Труба круглая" || section.contains("pipe") {
             let t = e.t.or(e.s).unwrap_or(5.) / 1000.;
@@ -319,6 +218,26 @@ pub fn profile_shape(profile: &Profile) -> Option<Shape> {
         return Some(Shape::Pipe { d: d[0] / 1000., t: d[1] / 1000. });
     }
     None
+}
+
+/// Section properties of a profile from the catalogue (m2, m4, kg/m).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Properties {
+    pub area: f64,
+    /// Second moment about the strong axis (parallel to the flanges) and the weak one.
+    pub ix: f64,
+    pub iy: f64,
+    pub mass: f64,
+}
+
+/// The catalogue properties of a named profile: exact area and moments of inertia
+/// (with the fillets), not those of the simplified shape of `profile_shape`.
+pub fn profile_properties(profile: &Profile) -> Option<Properties> {
+    if profile.builtup || profile.section == "DoubleTBuiltup" || profile.section.eq_ignore_ascii_case("round") {
+        return None;
+    }
+    let e = crate::sortament::lookup(&profile.section, &profile.shape)?;
+    Some(Properties { area: e.area? / 1e4, ix: e.ix? / 1e8, iy: e.iy? / 1e8, mass: e.mass.unwrap_or(0.) })
 }
 
 #[cfg(test)]
@@ -366,6 +285,19 @@ mod tests {
         assert!(matches!(profile_shape(&profile("Pipe", "273 x 20")), Some(Shape::Pipe { .. })));
         assert!(matches!(profile_shape(&profile("Pipe", "244.5х8")), Some(Shape::Pipe { .. })));
         assert!(matches!(profile_shape(&profile("Tubing", "120 x 80 x 5")), Some(Shape::Tube { .. })));
+    }
+
+    #[test]
+    fn moments_of_inertia_of_the_shapes() {
+        // I 18Б1 by its simplified dimensions (no fillets): within 8 % of the catalogue's 1063 cm4 and 81.9 cm4.
+        let i = Shape::I { h: 0.177, bt: 0.091, tw: 0.0043, tft: 0.0065, bb: 0.091, tfb: 0.0065 };
+        let (ix, iy) = i.inertia().unwrap();
+        assert!((ix * 1e8 / 1063. - 1.).abs() < 0.08 && (iy * 1e8 / 81.9 - 1.).abs() < 0.12, "{} {}", ix * 1e8, iy * 1e8);
+        let (rx, ry) = Shape::Rect { h: 0.5, b: 0.3 }.inertia().unwrap();
+        assert!((rx - 0.3 * 0.125 / 12.).abs() < 1e-12 && (ry - 0.5 * 0.027 / 12.).abs() < 1e-12);
+        let (t, _) = Shape::Tube { h: 0.1, b: 0.1, t: 0.005 }.inertia().unwrap();
+        // 100 x 100 x 5 without fillets: (0.1^4 - 0.09^4) / 12 = 286.6 cm4.
+        assert!((t * 1e8 - 286.58).abs() < 0.01, "{}", t * 1e8);
     }
 
     #[test]

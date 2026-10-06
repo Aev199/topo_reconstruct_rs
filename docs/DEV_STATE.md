@@ -632,14 +632,32 @@ the file, else steel 0.3, concrete 0.2; steel sections E = 206 GPa, 76.98 kN/m3,
 equal shapes one section, thickness per mm, density multiplier. Two modes in the MIDAS dialog:
 `converter` (nominal, the converter's file) and `lira` (EF/EIy/EIz as a `VALUE` section,
 WLKE/PLKE as an equivalent thickness and E). The cap slab of a cut is always equivalent.
-Where the converter is wrong and was not copied (checked by running it on its test1/test5):
-S0 dimensions are taken from the S0 row (it reads EIy of the numeric row as the width), E is
-not EF, a plate over 1 m thick is not read as cm (Остров: slabs 1.0, 1.2, 1.4 m), S6 and S3
-with a concrete E (1e6..6e6 t/m2) stay concrete (it makes every S6 steel: round concrete
-columns of «Для testa» become steel), a 3-number tube designation is looked up by all three.
+Re-check after the converter's developer disputed the first list (2026-10-06): the converter
+really uses the subclass `MidasWriter` of `writers/__init__.py`, which fixes the plate thickness
+(a GEI thickness is in metres: 1.2 and 1.4 m are read right), `SR, 2` for a solid round bar,
+weightless `AGT_p..` materials for rigid rods and one UDL per beam. Two claims of the first list
+were wrong and are withdrawn: the thickness over 1 m, and the tube designation of three numbers
+(`120 x 80 x 5` is found by the exact name). What stands, each reproduced by running the converter
+(`LiraMidasConverter().convert`) on its own test files and on «Для testa»:
+(1) a type with the numeric row EF EIy EIz GIk before `S0` (test1.txt, test5.txt, LIRA 2022): the
+section is read from EIy of the row (`Rect_3316.280_X_929.475` for 90 x 170 cm; 0.075 instead of
+0.10 in test5), E = EF x g (294 199 instead of 29.4e6 kN/m2: 100 times too soft in test5) and the
+unit weight from a zero (0.01 kN/m3: no self-weight);
+(2) S6 is always steel: the concrete columns D 28..70 cm of «Для testa» (E = 2.37e6 t/m2) get
+E = 206 GPa and 76.98 kN/m3 (their elements use `Beam_Steel_p1`);
+(3) piles of S6 rows with a numeric row (types 392-395: `S6 720000 92 0`) become `Rod_D1413.5`,
+a 1.4 km rod (the first number of the row after EF is read as the diameter).
+What is done instead: the S0 dimensions are those of the S0 row; E of a type with a numeric row is
+EF / A of its section (kept when the S line agrees within 2 %, noted when it does not); steel only
+when that E is not a concrete one (1e6..6e6 t/m2); S6 with a numeric row reads the dimensions
+after the marker. Dimensions of S1, S2, S5, S6 are cm (the converter takes values up to 1 as m).
 Types with E = 0 (S0 rods of «Для testa», 1279 bars) are reported as without material and not
 written. LIRA reductions (EI x 0.3, PLKE 0.3) are listed in `stiffness_notes` in converter mode.
-PLAXIS still reads S0 and GEI only (bars of other sections: `missing_materials`).
+The catalogue is part of the program (`src/sortament.rs`, `data/sortament.tsv`: 5720 rolled
+profiles with h, b, s, t, R, A, M, Ix, Iy), compiled into the executable; the properties of a
+catalogue profile are used by the PLAXIS export and by the cap slab.
+PLAXIS: bars of S1..S6 and of the profiles of the block 13 now get beam materials
+(`plaxis::add_section_beams`).
 
 Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:

@@ -14,4 +14,5 @@ pub mod plaxis;
 pub mod reconstruction;
 pub mod sections;
 pub mod service;
+pub mod sortament;
 pub mod storeys;

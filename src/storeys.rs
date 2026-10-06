@@ -77,11 +77,20 @@ pub fn with_cap(state: &State, materials: &HashMap<u32, Material>, factor: f64) 
         parts.push((n * t * l, [(wa.x + wb.x) / 2., (wa.y + wb.y) / 2.], n * (t * l.powi(3) * s * s + l * t.powi(3) * c * c) / 12., n * (t * l.powi(3) * c * c + l * t.powi(3) * s * s) / 12.));
     }
     for (p, stiffness) in columns {
-        let Some(Material::Bar { e, width, height, .. }) = materials.get(&stiffness) else { continue };
+        // E (t/m2), area and own moments of the column (a rectangle: a square of that area).
+        let (e, a, own) = match materials.get(&stiffness) {
+            Some(Material::Bar { e, width, height, .. }) => (*e, width * height, (width * height).powi(2) / 12.),
+            Some(Material::Section { .. }) => {
+                // S1..S6 sections and piles: E, steel or concrete, by the rules of the MIDAS export.
+                let Some(spec) = crate::midas_stiffness::bar_spec(stiffness, materials, &Default::default()) else { continue };
+                let (Some(a), Some((ix, iy))) = (spec.area, spec.shape.inertia()) else { continue };
+                (spec.young_kn / 9.80665, a, ix.min(iy))
+            }
+            _ => continue,
+        };
         // The modular ratio scales the area and the own moment alike (EI is linear in E).
         let n = e / e_cap;
-        let a = width * height;
-        parts.push((n * a, [p.x, p.y], n * a * a / 12., n * a * a / 12.));
+        parts.push((n * a, [p.x, p.y], n * own, n * own));
     }
     let area: f64 = parts.iter().map(|p| p.0).sum();
     if parts.is_empty() || area <= 0. {
