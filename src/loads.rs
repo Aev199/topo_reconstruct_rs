@@ -385,6 +385,9 @@ struct SupportK {
     size: f64,
     /// Second moment of a column about a horizontal axis (m4), isotropic.
     inertia: f64,
+    /// Factors of a wall: WLKE (in-plane, axial) and PLKE (out of plane) of its plate type.
+    membrane: f64,
+    bending: f64,
 }
 
 /// What a support takes: the horizontal force (t) and the vertical load at its start and end
@@ -491,7 +494,7 @@ fn stiffness_shares(supports: &[SupportK], items: &[(DVec3, DVec3, DVec3)], z: f
     let length = |s: &SupportK| s.a.distance(s.b);
     let mid = |s: &SupportK| (s.a + s.b) / 2.;
     // Axial stiffness: a column E A, a wall E t per unit length.
-    let kz = |s: &SupportK| if s.wall { s.e * s.size * length(s) } else { s.e * s.size };
+    let kz = |s: &SupportK| if s.wall { s.e * s.size * s.membrane * length(s) } else { s.e * s.size };
     let total_k: f64 = supports.iter().map(kz).sum();
     if total_k <= 0. {
         return None;
@@ -527,8 +530,8 @@ fn stiffness_shares(supports: &[SupportK], items: &[(DVec3, DVec3, DVec3)], z: f
             let u = DVec2::new((s.b.x - s.a.x) / l, (s.b.y - s.a.y) / l);
             let n = DVec2::new(-u.y, u.x);
             let (t, a) = (s.size, s.size * l);
-            let kp = lateral_stiffness(s.e, t * l.powi(3) / 12., a / 1.2, h);
-            let kn = lateral_stiffness(s.e, l * t.powi(3) / 12., a / 1.2, h);
+            let kp = lateral_stiffness(s.e, s.membrane * t * l.powi(3) / 12., s.membrane * a / 1.2, h);
+            let kn = lateral_stiffness(s.e, s.bending * l * t.powi(3) / 12., a / 1.2, h);
             kg.push([kp * u.x * u.x + kn * n.x * n.x, kp * u.x * u.y + kn * n.x * n.y, kp * u.y * u.y + kn * n.y * n.y]);
         } else {
             let k = lateral_stiffness(s.e, s.inertia, s.size / 1.2, h);
@@ -558,7 +561,7 @@ fn stiffness_shares(supports: &[SupportK], items: &[(DVec3, DVec3, DVec3)], z: f
         let (ux, uy) = (d[0] - d[2] * m.y, d[1] + d[2] * m.x);
         let horizontal = DVec2::new(k[0] * ux + k[1] * uy, k[1] * ux + k[2] * uy);
         let vertical = if s.wall {
-            [s.e * s.size * settlement(s.a), s.e * s.size * settlement(s.b)]
+            [s.e * s.size * s.membrane * settlement(s.a), s.e * s.size * s.membrane * settlement(s.b)]
         } else {
             [s.e * s.size * settlement(s.a), 0.]
         };
@@ -1240,7 +1243,7 @@ impl Context<'_> {
                     removed.insert(CUT_WEIGHT_CASE, items);
                 }
             }
-            self.cut_loads(&removed, &mut loads, &mut source, &mut report);
+            self.cut_loads(&removed, &mut loads, &mut source, &mut lost, &mut report);
         }
         if let Some(combination) = &self.settings.combination {
             // One case of the weighted sum; cases without a factor are dropped.
@@ -1772,7 +1775,10 @@ impl Context<'_> {
                         // The centre of the group is off the plate: the member nearest to it.
                         at = members.iter().map(|&i| pool[i].0).min_by(|x, y| x.distance(at).total_cmp(&y.distance(at))).unwrap_or(at);
                     }
-                    loads.push(Load::Point { case, at: at.to_array(), force: (f * factor).to_array(), moment: [0.; 3] });
+                    // The couple that keeps the moment of the merged forces whatever their directions and
+                    // wherever the point had to be put (forces of different directions, a centre off the plate).
+                    let couple: DVec3 = members.iter().map(|&i| (pool[i].0 - at).cross(pool[i].1)).sum();
+                    loads.push(Load::Point { case, at: at.to_array(), force: (f * factor).to_array(), moment: (couple * factor).to_array() });
                 }
                 *report.approximated.entry("давление на часть пластины заменено точечными силами".into()).or_default() += 1;
             }
@@ -1852,6 +1858,7 @@ impl Context<'_> {
         removed: &BTreeMap<u32, Vec<(DVec3, DVec3, DVec3)>>,
         loads: &mut Vec<Load>,
         source: &mut Tally,
+        lost: &mut BTreeMap<u32, Lost>,
         report: &mut Report,
     ) {
         let Some(cut) = self.state.cut.as_ref().filter(|_| self.settings.cut_loads) else { return };
@@ -1870,24 +1877,38 @@ impl Context<'_> {
         let materials = self.settings.materials.as_ref();
         let (walls, columns) = crate::reconstruction::assembly::cutoff::live_supports(self.state);
         for (a, b, stiffness) in walls {
-            let (e, t) = match materials.and_then(|m| m.get(&stiffness)) {
-                Some(Material::Plate { e, thickness, .. }) => (*e, *thickness),
-                _ => (2.9e6, 0.2),
+            let (e, t, km, kb) = match materials.and_then(|m| m.get(&stiffness)) {
+                Some(Material::Plate { e, thickness, membrane, bending, .. }) => (*e, *thickness, membrane.unwrap_or(1.), bending.unwrap_or(1.)),
+                _ => (2.9e6, 0.2, 1., 1.),
             };
             supports.push((a, b, weight_of(stiffness, true) * a.distance(b), true));
-            stiff.push(SupportK { a, b, wall: true, e, size: t, inertia: 0. });
+            stiff.push(SupportK { a, b, wall: true, e, size: t, inertia: 0., membrane: km, bending: kb });
         }
         for (p, stiffness) in columns {
+            // E, area and moment of inertia of the type as LIRA analyses it: with its numeric row EF, EIy, EIz
+            // when it has one (E A = EF, E I = the mean of EIy and EIz), else the nominal section.
+            let nominal = |e: f64, area: f64, inertia: f64, row: Option<[f64; 4]>| match row {
+                Some([ef, eiy, eiz, _]) if ef > 0. && area > 0. => {
+                    let e_eff = ef / area;
+                    (e_eff, area, ((eiy + eiz) / 2. / e_eff).max(1e-12))
+                }
+                _ => (e, area, inertia),
+            };
             let (e, area, inertia) = match materials.and_then(|m| m.get(&stiffness)) {
-                Some(Material::Bar { e, width, height, .. }) => (*e, width * height, (width * height).powi(2) / 12.),
+                Some(Material::Bar { e, width, height, stiffness: row, .. }) => nominal(*e, width * height, (width * height).powi(2) / 12., *row),
                 Some(Material::Section { .. }) => match crate::midas_stiffness::bar_spec(stiffness, materials.map(|m| &**m).unwrap_or(&Default::default()), &Default::default()) {
-                    Some(spec) => (spec.young_kn / 9.80665, spec.area.unwrap_or(0.25), spec.shape.inertia().map_or(0.25_f64.powi(2) / 12., |(x, y)| (x + y) / 2.)),
+                    Some(spec) => nominal(
+                        spec.young_kn / 9.80665,
+                        spec.area.unwrap_or(0.25),
+                        spec.shape.inertia().map_or(0.25_f64.powi(2) / 12., |(x, y)| (x + y) / 2.),
+                        spec.numeric,
+                    ),
                     None => (2.9e6, 0.25, 0.25_f64.powi(2) / 12.),
                 },
                 _ => (2.9e6, 0.25, 0.25_f64.powi(2) / 12.),
             };
             supports.push((p, p, weight_of(stiffness, false), false));
-            stiff.push(SupportK { a: p, b: p, wall: false, e, size: area, inertia });
+            stiff.push(SupportK { a: p, b: p, wall: false, e, size: area, inertia, membrane: 1., bending: 1. });
         }
         let keep: Vec<bool> = supports.iter().map(|s| s.2 > 0.).collect();
         let mut index = 0;
@@ -1913,6 +1934,12 @@ impl Context<'_> {
             }
             if supports.is_empty() {
                 *report.skipped.entry("нагрузки отброшенных этажей: нет несущих элементов на уровне отсечения".into()).or_default() += items.len();
+                // They are known loads that reach nothing: counted as lost, so that the readiness check flags them.
+                for &(p, f, m) in items {
+                    let entry = lost.entry(case).or_default();
+                    entry.add(source.origin, p, f * factor);
+                    entry.moment += m * factor;
+                }
                 continue;
             }
             for &(p, f, m) in items {
@@ -2457,6 +2484,21 @@ impl Context<'_> {
                 if polygons.is_empty() {
                     continue;
                 }
+                // The elements of the group may reach beyond the reconstructed surface (its contour moved by the
+                // repair): the force of the group is kept by a pressure raised in the ratio of the areas, up to
+                // 1.5; a larger part outside the geometry is lost (counted, and flagged by the report).
+                let region_area: f64 = polygons.iter().map(|p| polygon_area(&p.iter().map(|&x| DVec3::from_array(x)).collect::<Vec<_>>())).sum();
+                let mut sigma = sigma;
+                if region_area > 0. && region_area < area * (1. - 1e-6) {
+                    if area / region_area <= 1.5 {
+                        sigma *= area / region_area;
+                        *report.approximated.entry("давление увеличено в отношении площади элементов к площади в геометрии (равнодействующая сохранена)".into()).or_default() += 1;
+                    } else {
+                        let centre = members.iter().map(|&i| self.kept_part(items[i].0).map_or(DVec3::ZERO, |k| k.1) * items[i].2).sum::<DVec3>() / area;
+                        lost.entry(case).or_default().add(source.origin, centre, sigma * (area - region_area) * factor);
+                        *report.skipped.entry("давление на часть пластины за пределами геометрии".into()).or_default() += 1;
+                    }
+                }
                 loads.push(Load::Surface {
                     case,
                     surface: s,
@@ -2605,7 +2647,7 @@ impl Context<'_> {
 mod tests {
     fn column(x: f64, y: f64, e: f64, area: f64) -> SupportK {
         let a = DVec3::new(x, y, 0.);
-        SupportK { a, b: a, wall: false, e, size: area, inertia: area * area / 12. }
+        SupportK { a, b: a, wall: false, e, size: area, inertia: area * area / 12., membrane: 1., bending: 1. }
     }
 
     fn sums(supports: &[SupportK], shares: &[Share]) -> (DVec3, DVec3) {
@@ -2641,9 +2683,21 @@ mod tests {
     }
 
     #[test]
+    fn a_wall_with_reduced_membrane_stiffness_takes_less_in_proportion() {
+        // Two equal walls along x, WLKE 1 and 0.5; a load at the stiffness centre: q 2 : 1.
+        let wall = |y: f64, km: f64| SupportK { a: DVec3::new(0., y, 0.), b: DVec3::new(6., y, 0.), wall: true, e: 3e6, size: 0.25, inertia: 0., membrane: km, bending: 1. };
+        let supports = [wall(0., 1.), wall(4., 0.5)];
+        // The stiffness centre: y = 4 x 0.5 / 1.5 = 4/3.
+        let items = [(DVec3::new(3., 4. / 3., 0.), DVec3::new(0., 0., -90.), DVec3::ZERO)];
+        let (shares, _) = stiffness_shares(&supports, &items, 0., 3.).unwrap();
+        let force = |s: &Share| s.vertical[0] * 6.;
+        assert!((force(&shares[0]) + 60.).abs() < 1e-6 && (force(&shares[1]) + 30.).abs() < 1e-6, "{shares:?}");
+    }
+
+    #[test]
     fn force_and_moment_of_the_items_are_kept_by_the_stiffness_shares() {
         // A wall along x (6 m), a wall along y (4 m) and two columns; loads of both directions and a moment.
-        let wall = |a: [f64; 2], b: [f64; 2]| SupportK { a: DVec3::new(a[0], a[1], 0.), b: DVec3::new(b[0], b[1], 0.), wall: true, e: 3e6, size: 0.25, inertia: 0. };
+        let wall = |a: [f64; 2], b: [f64; 2]| SupportK { a: DVec3::new(a[0], a[1], 0.), b: DVec3::new(b[0], b[1], 0.), wall: true, e: 3e6, size: 0.25, inertia: 0., membrane: 1., bending: 1. };
         let supports = [wall([0., 0.], [6., 0.]), wall([0., 0.], [0., 4.]), column(6., 4., 3e6, 0.3), column(3., 5., 2.5e6, 0.2)];
         let items = [
             (DVec3::new(1., 7., 30.), DVec3::new(10., -4., -80.), DVec3::new(0.5, 0., 0.)),

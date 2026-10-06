@@ -441,3 +441,43 @@ fn both_distributions_keep_force_and_overturning_moment_of_the_cut_off_part() {
         assert!((DVec3::from_array(c.exported) - DVec3::from_array(c.source)).length() < 1e-6, "{distribution:?}: {c:?}");
     }
 }
+
+#[test]
+fn separate_contours_do_not_load_the_gap_between_them() {
+    use glam::DVec3;
+    use topo_reconstruct_rs::loads::Load;
+    let s = session();
+    let (_, surface) = slab_mesh(&s);
+    // Three separate 1 x 4 strips of the 6 x 4 element (x = 0..1, 2.5..3.5, 5..6) at 10 kN/m2: 120 kN, not the whole 240 kN.
+    let strip = |x0: f64, x1: f64| vec![[x0, 0., 0.], [x1, 0., 0.], [x1, 4., 0.], [x0, 4., 0.]];
+    let (f, m, scale, _) = mesh_resultant(vec![Load::Surface { case: 1, surface, polygons: vec![strip(0., 1.), strip(2.5, 3.5), strip(5., 6.)], sigma: [0., 0., -10.] }]);
+    assert!((f - DVec3::new(0., 0., -120.)).length() < 1e-4, "{f:?}");
+    // Moment about the origin: strips at x = 0.5, 3, 5.5 (40 kN each): M_y = 40 (0.5 + 3 + 5.5) = 360, M_x = 120 x 2 = 240 (sign of r x F).
+    assert!((m - DVec3::new(-240., 360., 0.)).length() < 1e-3 * scale.max(1.), "{m:?}");
+}
+
+#[test]
+fn loads_that_reach_no_support_are_a_problem_of_the_report() {
+    use topo_reconstruct_rs::loads::{self, FORCE_TOLERANCE, MOMENT_TOLERANCE};
+    let text = loaded_tower();
+    let mut s = session_of(&text);
+    s.apply(Edit::CutAbove { z: 3. }, "cut").unwrap();
+    // Every support at the level goes: the wall and the column.
+    let model = &s.state().model;
+    let wall = (0..model.surfaces().len()).find(|&i| model.planes()[model.surfaces()[i].plane].normal()[2].abs() < 0.5).expect("the wall");
+    s.apply(Edit::DeleteSurface { surface: wall }, "delete").unwrap();
+    let bars: Vec<usize> = (0..s.state().axes.len()).collect();
+    s.apply(Edit::DeleteBars { bars }, "delete").unwrap();
+    let mesh = topo_reconstruct_rs::parsers::lira::LiraParser::mesh_from(text.as_bytes()).unwrap();
+    let set = topo_reconstruct_rs::parsers::loads::parse(text.as_bytes());
+    let (_, report) = loads::transfer(
+        s.state(),
+        &[],
+        &mesh,
+        &set,
+        loads::Settings { force_factor: 10., snap: 0.05, max_groups: 40, combination: None, cases: None, materials: None, cut_loads: true, cut_distribution: Default::default() },
+    );
+    assert!(report.skipped.keys().any(|k| k.contains("нет несущих элементов")), "{:?}", report.skipped);
+    let problems = report.problems(FORCE_TOLERANCE, MOMENT_TOLERANCE);
+    assert!(problems.iter().any(|p| p.contains("загружение 2")), "{problems:?}");
+}

@@ -307,15 +307,18 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                         .map(|r| Polygon::new(LineString::from(r.iter().map(|p| Coord { x: p.x, y: p.y }).collect::<Vec<_>>()), vec![]))
                         .collect(),
                 );
-                let all_convex = rings.iter().all(|r| {
-                    let n = r.len();
-                    let cross = |i: usize| {
-                        let (a, b, c) = (r[i], r[(i + 1) % n], r[(i + 2) % n]);
-                        (b - a).perp_dot(c - b)
-                    };
-                    let tol = 1e-12;
-                    (0..n).all(|i| cross(i) >= -tol) || (0..n).all(|i| cross(i) <= tol)
-                });
+                let convex: Vec<bool> = rings
+                    .iter()
+                    .map(|r| {
+                        let n = r.len();
+                        let cross = |i: usize| {
+                            let (a, b, c) = (r[i], r[(i + 1) % n], r[(i + 2) % n]);
+                            (b - a).perp_dot(c - b)
+                        };
+                        let tol = 1e-12;
+                        (0..n).all(|i| cross(i) >= -tol) || (0..n).all(|i| cross(i) <= tol)
+                    })
+                    .collect();
                 let mut found = false;
                 for &(shell, c) in shells_of.get(surface).map(Vec::as_slice).unwrap_or(&[]) {
                     let corners: Vec<DVec2> = mesh.shells[shell]
@@ -328,16 +331,15 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                     if boxes.iter().all(|b| hi.x < b.0.x || lo.x > b.1.x || hi.y < b.0.y || lo.y > b.1.y) {
                         continue;
                     }
-                    let flags: Vec<bool> = corners.iter().map(|q| rings.iter().any(|r| inside(r, *q))).collect();
-                    let centre_in = rings.iter().any(|r| inside(r, c));
-                    // Whole inside (the pieces of the contour tile the region), else the exact part.
+                    // Whole inside: ONE convex contour holds every corner and the centre. Corners in different
+                    // contours prove nothing (the gap between separate contours is free): the exact part then.
                     let mut nodal = false;
                     // The element's own centre of area (the average of the corners is not).
                     let element_centre = Polygon::new(LineString::from(corners.iter().map(|p| Coord { x: p.x, y: p.y }).collect::<Vec<_>>()), vec![])
                         .centroid()
                         .map_or(c, |p| DVec2::new(p.x(), p.y()));
-                    // All corners and the centre inside prove full coverage only for convex contours.
-                    let fraction = if flags.iter().all(|f| *f) && centre_in && all_convex {
+                    let whole = rings.iter().zip(&convex).any(|(r, convex)| *convex && corners.iter().all(|q| inside(r, *q)) && inside(r, c));
+                    let fraction = if whole {
                         1.
                     } else {
                         let element = Polygon::new(LineString::from(corners.iter().map(|p| Coord { x: p.x, y: p.y }).collect::<Vec<_>>()), vec![]);

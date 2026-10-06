@@ -23,7 +23,7 @@
 //! above 1 m is not read as centimetres, and E of a type with an EF row is not
 //! taken as EF.
 use crate::parsers::lira::Material;
-use crate::sections::{profile_properties, profile_shape, Profile, Shape};
+use crate::sections::{profile_properties, profile_shape, Profile, Properties, Shape};
 use hashbrown::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -142,6 +142,8 @@ pub struct BarSpec {
     pub assumed_e: bool,
     /// A profile of the block 13 that is not in the catalogue.
     pub from_designation: bool,
+    /// The exact area and moments of inertia of a catalogue profile (fillets included).
+    pub catalogue: Option<Properties>,
 }
 
 /// The shape, E, nu and unit weight of a bar type by the converter's rules (see the module).
@@ -162,7 +164,8 @@ pub fn bar_spec(id: u32, materials: &HashMap<u32, Material>, profiles: &HashMap<
             None => from_designation = true,
         }
     }
-    let area = match profile.and_then(profile_properties) {
+    let catalogue = profile.and_then(profile_properties);
+    let area = match catalogue {
         Some(p) => Some(p.area),
         None => shape.area(),
     };
@@ -206,7 +209,7 @@ pub fn bar_spec(id: u32, materials: &HashMap<u32, Material>, profiles: &HashMap<
             _ => DEFAULT_NU,
         });
     }
-    Some(BarSpec { shape, numeric, young_kn, nu, gamma_kn: if rigid { 0. } else { gamma_kn }, area, steel, rigid, from_row, assumed_e: e_type.is_none(), from_designation })
+    Some(BarSpec { shape, numeric, young_kn, nu, gamma_kn: if rigid { 0. } else { gamma_kn }, area, steel, rigid, from_row, assumed_e: e_type.is_none(), from_designation, catalogue })
 }
 
 /// Builds the materials, sections and thicknesses for the stiffness types
@@ -224,7 +227,7 @@ pub fn build(
     let mut specs: BTreeMap<(bool, u32), MaterialSpec> = BTreeMap::new();
     let mut section_specs: BTreeMap<u32, SectionSpec> = BTreeMap::new();
     let mut plate_thickness: BTreeMap<u32, f64> = BTreeMap::new();
-    let (mut steel_forced, mut reduced_ignored, mut from_designation, mut from_row_ef, mut assumed_e) = (vec![], vec![], vec![], vec![], vec![]);
+    let (mut steel_forced, mut reduced_ignored, mut from_designation, mut from_row_ef, mut assumed_e, mut exact_catalogue) = (vec![], vec![], vec![], vec![], vec![], vec![]);
     let mut equivalent: Vec<u32> = vec![];
 
     for &id in plates {
@@ -285,7 +288,7 @@ pub fn build(
         let value_block = |a: f64, iy: f64, iz: f64, j: f64| -> Vec<String> {
             vec![
                 "H, BUILT, 0, 0, 0, 0, 0, 0, 0, 0, 0".to_string(),
-                format!("       {a:.8}, 0, 0, {j:.8}, {iy:.8}, {iz:.8}, 0, 0, 0, 0"),
+                format!("       {a:.12}, 0, 0, {j:.12}, {iy:.12}, {iz:.12}, 0, 0, 0, 0"),
                 "       0, 0, 0, 0, 0, 0, 0, 0, 0, 0".into(),
                 "       0, 0, 0, 0, 0, 0, 0, 0, 0, 0".into(),
             ]
@@ -295,6 +298,19 @@ pub fn build(
             let (ef, eiy, eiz, gik) = (ef * G, eiy * G, eiz * G, gik * G);
             let j = if gik > 0. { gik / g } else { match shape { Shape::Rect { h, b } => rectangle_torsion(b, h), _ => 0. } };
             (false, value_block(ef / young_kn, (eiy / young_kn).max(1e-12), (eiz / young_kn).max(1e-12), j))
+        } else if let (Some(p), true) = (spec.catalogue, matches!(shape, Shape::I { .. } | Shape::Tube { .. })) {
+            // A rolled profile: the exact area and moments of the catalogue (fillets and slopes included), which the
+            // sharp-cornered dimensions of a DBUSER section lose (up to 28 % of the moment of inertia).
+            let j = shape.torsion().unwrap_or(0.);
+            exact_catalogue.push(id);
+            (false, value_block(p.area, p.ix, p.iy, j))
+        } else if let (Shape::Box { t1, t2, .. }, Some((ix, iy)), Some(a)) = (&shape, shape.inertia(), spec.area) {
+            if (t1 - t2).abs() > 1e-9 {
+                // A box of two thicknesses: the order of its sizes in a DBUSER line is not certain, the values are.
+                (false, value_block(a, ix, iy, shape.torsion().unwrap_or(0.)))
+            } else {
+                (true, vec![shape.dbuser_body().unwrap_or_default()])
+            }
         } else if let Some(body) = shape.dbuser_body() {
             if let (Some([ef, eiy, eiz, _]), Shape::Rect { h, b }) = (numeric, &shape) {
                 // Nominal geometry: a reduction of the type in LIRA is not carried.
@@ -405,6 +421,9 @@ pub fn build(
     if !from_row_ef.is_empty() {
         out.notes.push(format!("E типа взят как EF / A по строке жёсткости (E в строке сечения не согласуется с EF), типы: {}", list(&from_row_ef)));
     }
+    if !exact_catalogue.is_empty() {
+        out.notes.push(format!("прокатные профили записаны сечением по значениям (A, Iy, Iz каталога с радиусами скруглений), типы: {}", list(&exact_catalogue)));
+    }
     if !assumed_e.is_empty() {
         out.notes.push(format!("у типа нет E и размеров (только EF, EIy, EIz, GIk): принят модуль стали, типы: {}", list(&assumed_e)));
     }
@@ -438,16 +457,20 @@ mod tests {
         let text = s.section_lines.join("\n");
         // Lines of the converter's output for test5.txt (its first section is a different one: it reads the S0 row wrongly).
         for expected in [
-            "DBUSER, DoubleT_18, CC, 0, 0, 0, 0, 0, 0, YES, H, 2, 0.1800, 0.0900, 0.0051, 0.0081, 0.0900, 0.0081, 0, 0, 0, 0",
             "DBUSER, I-Shape_0.150_X_0.15, CC, 0, 0, 0, 0, 0, 0, YES, H, 2, 0.1500, 0.1500, 0.0300, 0.0200, 0.1000, 0.0200, 0, 0, 0, 0",
-            "DBUSER, Tube_100x5, CC, 0, 0, 0, 0, 0, 0, YES, B, 2, 0.1000, 0.1000, 0.0050, 0.0050, 0.0050, 0.0050, 0, 0, 0, 0",
             "DBUSER, Pipe_180x36, CC, 0, 0, 0, 0, 0, 0, YES, P, 2, 0.1800, 0.0360, 0, 0, 0, 0, 0, 0, 0, 0",
             "DBUSER, Flange100_x_22_Wall200_x_10, CC, 0, 0, 0, 0, 0, 0, YES, H, 2, 0.2440, 0.1000, 0.0100, 0.0220, 0.1000, 0.0220, 0, 0, 0, 0",
-            "DBUSER, Box_0.200_X_0.2, CC, 0, 0, 0, 0, 0, 0, YES, B, 2, 0.2000, 0.2000, 0.0200, 0.0200, 0.0300, 0.0300, 0, 0, 0, 0",
             "DBUSER, Pipe_0.200_x_0.01, CC, 0, 0, 0, 0, 0, 0, YES, P, 2, 0.2000, 0.0100, 0, 0, 0, 0, 0, 0, 0, 0",
         ] {
             assert!(text.contains(expected), "{expected}\n{text}");
         }
+        // The rolled profiles (DoubleT 18, Tubing 100 x 5) are VALUE sections of the catalogue's area and inertia
+        // (the converter writes DBUSER dimensions: it loses the fillets, 3.5 % of the area of the tube and more elsewhere).
+        assert!(text.contains("VALUE, DoubleT_18") && text.contains("0.002340000000, 0, 0,"), "{text}");
+        assert!(text.contains("VALUE, Tube_100x5") && text.contains("0.001836000000, 0, 0,"), "{text}");
+        // The box of two thicknesses (S5 20 20 2 3) is a VALUE section of its real area (the converter's B line
+        // has the sizes in an order MIDAS may read otherwise): A = 0.2 x 0.2 - 0.14 x 0.16 = 0.0176 m2.
+        assert!(text.contains("VALUE, Box_0.200_X_0.2") && text.contains("0.017600000000, 0, 0,"), "{text}");
         // The S0 row 10 x 10 cm: its own dimensions, not EIy of the numeric row.
         assert!(text.contains("DBUSER, Rect_0.100_X_0.1, CC, 0, 0, 0, 0, 0, 0, YES, SB, 2, 0.1000, 0.1000"), "{text}");
         // Steel sections of the converter's materials; the plate 3e6 t/m2 is concrete (Plate_Beton_p2_h0.18).
@@ -509,7 +532,7 @@ mod tests {
         let lira = build(&materials, &HashMap::new(), &BTreeSet::new(), &ids, Options { mode: Mode::Lira, density_multiplier: 1. });
         assert!(lira.section_lines[0].starts_with("    1, VALUE, Rect_0.900_X_1.7"), "{:?}", lira.section_lines);
         // A = EF / E = 1.53 m2, Iyy = EIy / E = 0.110543 m4, Izz = 0.030983 m4.
-        assert!(lira.section_lines[1].contains("1.53000000, 0, 0,") && lira.section_lines[1].contains("0.11054267, 0.03098250"), "{:?}", lira.section_lines);
+        assert!(lira.section_lines[1].contains("1.530000000000, 0, 0,") && lira.section_lines[1].contains("0.110542666667, 0.030982500000"), "{:?}", lira.section_lines);
         // The unit weight of the bar: RO 3.825 t/m over 1.53 m2 = 2.5 t/m3.
         assert!(lira.material_lines[0].contains(", 24.52, 0"), "{:?}", lira.material_lines);
     }
@@ -539,6 +562,45 @@ mod tests {
         assert!(s.section_lines[0].contains("SB, 2, 0.1000, 0.1000"), "{:?}", s.section_lines);
         assert!(s.material_lines[0].contains("29420009.80") || s.material_lines[0].contains("294200"), "{:?}", s.material_lines);
         assert!(s.material_lines[0].contains(", 24.52, 0"), "{:?}", s.material_lines);
+    }
+
+    #[test]
+    fn rolled_profiles_keep_the_exact_area_and_inertia_of_the_catalogue() {
+        // 40Б1 (normal beam), 45x45x8 (a thick square tube with big corner radii) and 120x40x8 (rectangular):
+        // the sharp-cornered dimensions miss area and inertia by 22 %, 23 % / 53 % and 20 %.
+        for (section, shape, name) in [("DoubleT", "40Б1", "40Б1"), ("Tubing", "45 x 45 x 8", "45x45x8"), ("Tubing", "120 x 40 x 8", "120x40x8")] {
+            let entry = crate::sortament::find(name).unwrap_or_else(|| panic!("{name}"));
+            let text = "( 3/\n9 49154.4 270.979 17.3511 0.39419 0 0 /\n0 RO 0.0184/\n0 S8 13 9 18 0 0/\n)\n";
+            let materials = LiraParser::materials_from(text.as_bytes());
+            let profiles: HashMap<u32, Profile> = [(9, Profile { section: section.into(), shape: shape.into(), builtup: false })].into_iter().collect();
+            let ids: BTreeSet<u32> = [9].into();
+            let s = build(&materials, &profiles, &BTreeSet::new(), &ids, Options::default());
+            assert_eq!(s.section_lines.len(), 4, "{name}: {:?}", s.section_lines);
+            let numbers: Vec<f64> = s.section_lines[1].split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            // A, Asy, Asz, Ixx, Iyy, Izz.
+            assert!((numbers[0] - entry.area.unwrap() / 1e4).abs() < 1e-9, "{name}: {numbers:?}");
+            assert!((numbers[4] - entry.ix.unwrap() / 1e8).abs() < 1e-12 && (numbers[5] - entry.iy.unwrap() / 1e8).abs() < 1e-12, "{name}: {numbers:?}");
+            assert!(numbers[3] > 0., "{name}: J {numbers:?}");
+        }
+    }
+
+    #[test]
+    fn small_inertias_are_not_rounded_to_zero_and_a_box_of_two_thicknesses_is_a_value_section() {
+        // A 1 cm round bar: I = 4.9e-10 m4 is below the 8 digits of the old output.
+        let text = "( 3/\n1 1e+007 1 1 0 0 0 /\n 0 S0 3e+006 1 1/\n 0 RO 0.00025/\n)\n";
+        let materials = LiraParser::materials_from(text.as_bytes());
+        let ids: BTreeSet<u32> = [1].into();
+        let s = build(&materials, &HashMap::new(), &BTreeSet::new(), &ids, Options { mode: Mode::Lira, density_multiplier: 1. });
+        let numbers: Vec<f64> = s.section_lines[1].split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        assert!(numbers[4] > 0. && numbers[5] > 0., "{:?}", s.section_lines);
+        // S5 20 x 30 cm, webs 2 cm and flanges 3 cm: a VALUE section of the real area (not the order of a DBUSER line).
+        let text = "( 3/\n5 S5 3e+006 20 30 2 3/\n 0 RO 0.1/\n)\n";
+        let materials = LiraParser::materials_from(text.as_bytes());
+        let ids: BTreeSet<u32> = [5].into();
+        let s = build(&materials, &HashMap::new(), &BTreeSet::new(), &ids, Options::default());
+        // h = 0.2, b = 0.3, the first thickness (2 cm) of the webs, the second (3 cm) of the flanges.
+        let area = 0.2 * 0.3 - (0.2 - 0.06) * (0.3 - 0.04);
+        assert!(s.section_lines[0].contains("VALUE") && s.section_lines[1].contains(&format!("{area:.12}")), "{:?} (A = {area})", s.section_lines);
     }
 
     #[test]

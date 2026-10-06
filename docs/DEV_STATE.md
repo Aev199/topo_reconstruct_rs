@@ -676,6 +676,31 @@ the cap slab redistributes further in the model. A singular system (supports on 
 part of the moment it can (reported). Not verified against the full model: compare settlements of the
 full and the cut model.
 
+### Audit of b992204 (2026-10-06)
+
+- Losses of 2.6-4.1 % in «тест 5/6» were not lost elements: a group of plates reached beyond the
+  reconstructed surface (its contour moved by the repair) and the pressure was applied to the
+  smaller area. The pressure is now raised in the ratio of the areas (up to 1.5; more is a loss,
+  counted and flagged): «тест 5» within 0.2 %, «тест 6» within 0.2 % (was 4.1 %).
+- Separate pressure contours loaded a whole element when its corners lay in different contours
+  (+150 %): the whole-element shortcut needs ONE convex contour holding all corners and the centre.
+- After the supports at the cut level are deleted, the known loads of the cut part are lost
+  loads (force and moment) of the report, so `problems` flags them.
+- Merged point loads of a plate carry the couple that keeps the moment whatever the directions of
+  the forces and wherever the point had to go.
+- Cut-off distribution by stiffness uses the stiffness LIRA analysed with: EF, EIy, EIz of a column
+  type (E A = EF), WLKE/PLKE of a wall plate.
+- Sections: rolled profiles of the catalogue (I, rectangular and square tubes) are VALUE sections of the
+  catalogue's exact A and I (the sharp-cornered dimensions missed the area by up to 22 % and the inertia by
+  28 %, tubes with large corner radii by 23 % / 53 %); a box of two thicknesses (S5) is a VALUE section too, as
+  the order of the sizes in a DBUSER `B` line is not confirmed. VALUE blocks print 12 digits (small inertias
+  were rounded to 0). A catalogue designation never takes an entry of another kind (`25x3` is a round pipe
+  and an angle; `Tubing 100 x 5` is a square tube, not a pipe). S5 reading (the first thickness t1 of the
+  webs, the second of the flanges) follows the converter and is not confirmed against LIRA.
+- Not changed: the overestimate of an edge load on a 10-20 mm mesh (a mesh finer than the geometry's
+  repair tolerance), the point-load merge when the resultant has to leave the plate (the couple keeps the
+  moment, but the load acts at another place).
+
 Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:
 None` path of `transfer` gives that); (done: see above).

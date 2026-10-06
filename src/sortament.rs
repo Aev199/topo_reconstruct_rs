@@ -128,10 +128,11 @@ impl Catalogue {
         }
         let (a, t) = (numbers[0], numbers[1]);
         let search = if square { format!("{}x{}x{}", a as i64, a as i64, t as i64) } else { format!("{}x{}", a as i64, t as i64) };
-        if let Some(&i) = self.by_name.get(&search) {
+        let kind = if square { "квадрат" } else { "труба круглая" };
+        // A name can belong to another kind too (`25x3` is a round pipe and an angle): the kind decides.
+        if let Some(&i) = self.by_name.get(&search).filter(|&&i| self.entries[i].kind.to_lowercase().contains(kind)) {
             return Some(i);
         }
-        let kind = if square { "квадрат" } else { "труба круглая" };
         self.by_prefix.get(&format!("{}", a as i64))?.iter().copied().find(|&i| {
             let e = &self.entries[i];
             e.kind.to_lowercase().contains(kind) && e.t.is_some_and(|c| (c - t).abs() < 0.5)
@@ -141,7 +142,20 @@ impl Catalogue {
     /// The `lookup_by_section_info` of the converter.
     fn lookup(&self, section: &str, shape: &str) -> Option<usize> {
         let (section, shape) = (section.to_lowercase(), shape.trim());
-        if let Some(i) = self.exact(shape) {
+        // The kind of entry the section names: a designation like `100x5` is a round pipe in the catalogue, `100 x 5` of a
+        // `Tubing` is a square tube 100x100x5: an exact hit of another kind is no hit.
+        let right_kind = |kind: &str| {
+            if section.contains("pipe") {
+                kind.to_lowercase().contains("труба круглая")
+            } else if section.contains("tub") {
+                kind.contains("квадрат") || kind.contains("прямоугол")
+            } else if section.contains("doublet") || section.contains("двут") {
+                is_i_kind(kind)
+            } else {
+                true
+            }
+        };
+        if let Some(i) = self.exact(shape).filter(|&i| right_kind(&self.entries[i].kind)) {
             return Some(i);
         }
         if section.contains("doublet") || section.contains("двут") {
@@ -178,6 +192,11 @@ pub fn find(name: &str) -> Option<&'static Entry> {
     cat.exact(name).map(|i| &cat.entries[i])
 }
 
+/// All entries.
+pub fn entries() -> &'static [Entry] {
+    &catalogue().entries
+}
+
 /// Number of entries.
 pub fn len() -> usize {
     catalogue().entries.len()
@@ -186,6 +205,28 @@ pub fn len() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tubing_designation_never_finds_a_round_pipe_and_a_pipe_never_a_square_tube() {
+        let mut collisions = 0;
+        for e in entries().iter().filter(|e| e.kind == "Труба круглая") {
+            // "108x4" as the designation of a Tubing means the square tube 108 x 108 x 4.
+            let designation = e.name.replace('x', " x ");
+            if let Some(found) = lookup("Tubing", &designation) {
+                assert!(found.kind.contains("квадрат") || found.kind.contains("прямоугол"), "{} -> {}", designation, found.name);
+                collisions += 1;
+            }
+        }
+        // The round pipes whose numbers also name a square tube exist (this is the collision), and none is returned for it.
+        assert!(entries().iter().any(|e| e.kind == "Труба круглая"));
+        let _ = collisions;
+        for e in entries().iter().filter(|e| e.kind.contains("квадрат")) {
+            let designation = format!("{} x {}", e.h.unwrap_or(0.), e.t.unwrap_or(0.));
+            if let Some(found) = lookup("Pipe", &designation) {
+                assert!(found.kind.to_lowercase().contains("труба круглая"), "{designation} -> {}", found.name);
+            }
+        }
+    }
 
     #[test]
     fn the_catalogue_is_complete_and_has_the_section_properties() {

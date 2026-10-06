@@ -98,6 +98,33 @@ impl Shape {
         })
     }
 
+    /// Torsion constant (m4): exact for the solid round, the ring and the rectangle (series), Bredt's for the
+    /// closed tubes and boxes (mean line), the thin-wall sum for the open I and T sections.
+    pub fn torsion(&self) -> Option<f64> {
+        let pi = std::f64::consts::PI;
+        Some(match *self {
+            Shape::Rect { h, b } => {
+                let (b, h) = (b.min(h), b.max(h));
+                h * b.powi(3) * (1. / 3. - 0.21 * (b / h) * (1. - b.powi(4) / (12. * h.powi(4))))
+            }
+            Shape::Round { d } => pi * d.powi(4) / 32.,
+            Shape::Pipe { d, t } => pi * (d.powi(4) - (d - 2. * t).powi(4)) / 32.,
+            Shape::Tube { h, b, t } => {
+                let (bm, hm) = (b - t, h - t);
+                4. * (bm * hm).powi(2) * t / (2. * (bm + hm))
+            }
+            Shape::Box { h, b, t1, t2 } => {
+                // Webs t1 (height h), flanges t2 (width b), along the mean line.
+                let (bm, hm) = (b - t1, h - t2);
+                4. * (bm * hm).powi(2) / (2. * bm / t2 + 2. * hm / t1)
+            }
+            Shape::ISym { h, b, tw, tf } => (2. * b * tf.powi(3) + (h - 2. * tf) * tw.powi(3)) / 3.,
+            Shape::I { h, bt, tw, tft, bb, tfb } => (bt * tft.powi(3) + bb * tfb.powi(3) + (h - tft - tfb) * tw.powi(3)) / 3.,
+            Shape::T { h, b, tw, tf } => (b * tf.powi(3) + (h - tf) * tw.powi(3)) / 3.,
+            Shape::Explicit => return None,
+        })
+    }
+
     /// Height and width (m) of the bounding box of the section.
     pub fn extent(&self) -> Option<(f64, f64)> {
         Some(match *self {
