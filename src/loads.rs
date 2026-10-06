@@ -84,6 +84,11 @@ pub struct CaseReport {
     /// reconstructed geometry (absorbed, removed or deleted), not counted in
     /// `source`.
     pub not_in_geometry: [f64; 3],
+    /// The same loads: moment about `Report::origin`, sum of |F| and sum of
+    /// |F| |r| (opposite forces do not cancel in the last two).
+    pub not_in_geometry_moment: [f64; 3],
+    pub not_in_geometry_abs: f64,
+    pub not_in_geometry_scale: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -95,6 +100,31 @@ pub struct Report {
     pub skipped: BTreeMap<String, usize>,
     /// What was transferred approximately.
     pub approximated: BTreeMap<String, usize>,
+}
+
+/// What rests on plates that are not in the geometry: force, moment about the
+/// report origin, and the scales of both (sums of |F| and |F||r|), so that
+/// opposite forces (a couple) cannot hide each other.
+#[derive(Debug, Clone, Copy, Default)]
+struct Lost {
+    force: DVec3,
+    moment: DVec3,
+    abs: f64,
+    scale: f64,
+}
+
+impl Lost {
+    fn add(&mut self, origin: DVec3, at: DVec3, force: DVec3) {
+        let r = at - origin;
+        self.force += force;
+        self.moment += r.cross(force);
+        self.abs += force.length();
+        self.scale += force.length() * r.length();
+    }
+
+    fn scaled(&self, w: f64) -> Lost {
+        Lost { force: self.force * w, moment: self.moment * w, abs: self.abs * w.abs(), scale: self.scale * w.abs() }
+    }
 }
 
 /// Tolerances of the load check: relative to the resultant force, and to the
@@ -136,9 +166,11 @@ impl Report {
             if let Some(what) = compare_resultants((c.source, c.source_moment), (c.exported, c.exported_moment), c.moment_scale, force_tol, moment_tol) {
                 out.push(format!("загружение {} «{}»: {what}", c.case, c.name));
             }
-            let missing = DVec3::from_array(c.not_in_geometry).length();
-            if missing > 1e-3 && missing > force_tol * DVec3::from_array(c.source).length() {
-                out.push(format!("загружение {} «{}»: {:.1} кН приложено к элементам, которых нет в геометрии", c.case, c.name, missing));
+            let missing = c.not_in_geometry_abs;
+            let source_force = DVec3::from_array(c.source).length();
+            let moment_lost = DVec3::from_array(c.not_in_geometry_moment).length() > moment_tol * (c.moment_scale + c.not_in_geometry_scale).max(1e-9);
+            if missing > 1e-3 && (missing > force_tol * (source_force + missing) || moment_lost) {
+                out.push(format!("загружение {} «{}»: нагрузка {:.1} кН (сумма модулей) приложена к элементам, которых нет в геометрии", c.case, c.name, missing));
             }
         }
         out
@@ -258,6 +290,27 @@ fn polygon_area(p: &[DVec3]) -> f64 {
         .sum::<DVec3>()
         .length()
         / 2.
+}
+
+/// Area and centroid of a planar polygon (any winding, concave allowed; the
+/// signed fan triangles along the ring normal). The vertex average is not the
+/// centre of an oblique quad.
+fn area_centroid(p: &[DVec3]) -> (f64, DVec3) {
+    if p.len() < 3 {
+        return (0., p.iter().sum::<DVec3>() / p.len().max(1) as f64);
+    }
+    let normal: DVec3 = (1..p.len() - 1).map(|i| (p[i] - p[0]).cross(p[i + 1] - p[0])).sum();
+    if normal.length() < 1e-18 {
+        return (0., p.iter().sum::<DVec3>() / p.len() as f64);
+    }
+    let normal = normal.normalize();
+    let (mut area, mut first) = (0., DVec3::ZERO);
+    for i in 1..p.len() - 1 {
+        let t = (p[i] - p[0]).cross(p[i + 1] - p[0]).dot(normal) / 2.;
+        area += t;
+        first += (p[0] + p[i] + p[i + 1]) / 3. * t;
+    }
+    (area, first / area)
 }
 
 /// The perimeter order of a shell element's nodes, as indices. A quad
@@ -639,7 +692,7 @@ impl Context<'_> {
         let mut bar_lines: BTreeMap<(u32, usize), Vec<(f64, f64, DVec3, DVec3)>> = BTreeMap::new();
         let mut edge_lines: BTreeMap<u32, Vec<(DVec3, DVec3, DVec3, DVec3)>> = BTreeMap::new();
         // Resultants of loads on plates that are not in the geometry.
-        let mut lost: BTreeMap<u32, DVec3> = BTreeMap::new();
+        let mut lost: BTreeMap<u32, Lost> = BTreeMap::new();
         let mut stamps: Vec<Stamp> = vec![];
         // Loads on what was cut off: (position, force, moment) in tf, tf m.
         let mut removed: BTreeMap<u32, Vec<(DVec3, DVec3, DVec3)>> = BTreeMap::new();
@@ -701,7 +754,7 @@ impl Context<'_> {
                     let part = if whole { ring.clone() } else { clip_ring(&ring, level, false) };
                     let area = polygon_area(&part);
                     if area > 0. {
-                        removed.entry(case).or_default().push((part.iter().sum::<DVec3>() / part.len() as f64, p.vector * area, DVec3::ZERO));
+                        removed.entry(case).or_default().push((area_centroid(&part).1, p.vector * area, DVec3::ZERO));
                     }
                     if whole {
                         gone.push(e);
@@ -817,9 +870,14 @@ impl Context<'_> {
                 })
                 .collect();
             source = source.scaled_into(&weight, COMBINATION);
-            let mut merged_lost: BTreeMap<u32, DVec3> = BTreeMap::new();
-            for (&case, &v) in &lost {
-                *merged_lost.entry(COMBINATION).or_default() += v * weight(case);
+            let mut merged_lost: BTreeMap<u32, Lost> = BTreeMap::new();
+            for (&case, v) in &lost {
+                let w = v.scaled(weight(case));
+                let e = merged_lost.entry(COMBINATION).or_default();
+                e.force += w.force;
+                e.moment += w.moment;
+                e.abs += w.abs;
+                e.scale += w.scale;
             }
             lost = merged_lost;
         }
@@ -959,7 +1017,10 @@ impl Context<'_> {
                 source_moment: sm.to_array(),
                 exported_moment: em.to_array(),
                 moment_scale: ss.max(es),
-                not_in_geometry: lost.get(&case).copied().unwrap_or_default().to_array(),
+                not_in_geometry: lost.get(&case).map_or([0.; 3], |l| l.force.to_array()),
+                not_in_geometry_moment: lost.get(&case).map_or([0.; 3], |l| l.moment.to_array()),
+                not_in_geometry_abs: lost.get(&case).map_or(0., |l| l.abs),
+                not_in_geometry_scale: lost.get(&case).map_or(0., |l| l.scale),
             });
         }
         (loads, report)
@@ -1123,7 +1184,7 @@ impl Context<'_> {
         simplify: Simplify,
         loads: &mut Vec<Load>,
         source: &mut Tally,
-        lost: &mut BTreeMap<u32, DVec3>,
+        lost: &mut BTreeMap<u32, Lost>,
         report: &mut Report,
     ) {
         let factor = self.settings.force_factor;
@@ -1132,22 +1193,21 @@ impl Context<'_> {
         for (&e, pressure) in elements {
             let Some(positions) = element(self.mesh, e).and_then(|el| positions(self.mesh, el)) else { continue };
             let ring = shell_ring(&positions);
-            let area = polygon_area(&ring);
-            let centre = ring.iter().sum::<DVec3>() / ring.len() as f64;
+            let (area, centre) = area_centroid(&ring);
             let Some(&s) = self.surface_of_element.get(&e) else {
                 if pressure.vector.length() > 1e-15 {
                     *report.skipped.entry("нагрузка на пластины, которых нет в геометрии".into()).or_default() += 1;
-                    *lost.entry(case).or_default() += pressure.vector * area * factor;
+                    lost.entry(case).or_default().add(source.origin, centre, pressure.vector * area * factor);
                 }
                 continue;
             };
             if pressure.vector.length() < 1e-15 {
                 continue;
             }
-            // Only the part of an element below the cut is in the geometry.
-            let kept = self.kept_fraction(e);
-            source.add(case, centre, pressure.vector * area * kept * factor, DVec3::ZERO);
-            by_surface.entry(s).or_default().push((e, pressure.vector, area * kept, centre));
+            // Only the part of an element below the cut is in the geometry: its own area and centroid.
+            let Some((kept, centre, _)) = self.kept_part(e) else { continue };
+            source.add(case, centre, pressure.vector * kept * factor, DVec3::ZERO);
+            by_surface.entry(s).or_default().push((e, pressure.vector, kept, centre));
         }
         for (s, items) in by_surface {
             let polygons = surface_polygons(model, s, self.settings.snap).0;
@@ -1256,16 +1316,17 @@ impl Context<'_> {
         }
     }
 
-    /// The part of a source element below the level of the cut (1 without a cut).
-    fn kept_fraction(&self, e: u32) -> f64 {
-        let Some(cut) = self.state.cut.as_ref() else { return 1. };
-        let Some(p) = element(self.mesh, e).and_then(|el| positions(self.mesh, el)) else { return 1. };
+    /// The part of a source element in the geometry: its area and centroid
+    /// (below the level of the cut; the whole element without a cut), and the
+    /// full area of the element.
+    fn kept_part(&self, e: u32) -> Option<(f64, DVec3, f64)> {
+        let p = element(self.mesh, e).and_then(|el| positions(self.mesh, el))?;
         let ring = shell_ring(&p);
-        let full = polygon_area(&ring);
-        if full <= 0. {
-            return 1.;
-        }
-        polygon_area(&clip_ring(&ring, cut.z, true)) / full
+        let (full, centre) = area_centroid(&ring);
+        let Some(cut) = self.state.cut.as_ref() else { return Some((full, centre, full)) };
+        let part = clip_ring(&ring, cut.z, true);
+        let (area, centre) = area_centroid(&part);
+        Some((area, centre, full))
     }
 
     /// The weight of the elements above the cut (tf, downwards), at their
@@ -1289,7 +1350,7 @@ impl Context<'_> {
                 if part.len() < 3 {
                     continue;
                 }
-                (part.iter().sum::<DVec3>() / part.len() as f64, rho * thickness * polygon_area(&part))
+                { let (area, centre) = area_centroid(&part); (centre, rho * thickness * area) }
             } else if e.is_bar() {
                 let Some(Material::Bar { density: Some(ro), .. }) = material else { continue };
                 let (a, b) = if p[0].z <= p[1].z { (p[0], p[1]) } else { (p[1], p[0]) };
@@ -1569,7 +1630,7 @@ impl Context<'_> {
                     value,
                     direction: direction.normalize_or_zero(),
                     area,
-                    level: (p.iter().sum::<DVec3>() / p.len() as f64).dot(direction.normalize_or_zero()),
+                    level: area_centroid(p).1.dot(direction.normalize_or_zero()),
                 });
             }
             (5, _) => skip(report, "произвольная трапециевидная нагрузка на пластину"),
@@ -1790,7 +1851,7 @@ impl Context<'_> {
         elements: &HashMap<u32, Pressure>,
         loads: &mut Vec<Load>,
         source: &mut Tally,
-        lost: &mut BTreeMap<u32, DVec3>,
+        lost: &mut BTreeMap<u32, Lost>,
         report: &mut Report,
     ) {
         let factor = self.settings.force_factor;
@@ -1800,16 +1861,14 @@ impl Context<'_> {
         for (&e, pressure) in elements {
             let Some(&s) = self.surface_of_element.get(&e) else {
                 // Not in the geometry (absorbed, removed or deleted).
-                let area = element(self.mesh, e)
+                let (area, centre) = element(self.mesh, e)
                     .and_then(|el| positions(self.mesh, el))
-                    .map_or(0., |p| polygon_area(&shell_ring(&p)));
+                    .map_or((0., DVec3::ZERO), |p| area_centroid(&shell_ring(&p)));
                 *report.skipped.entry("нагрузка на пластины, которых нет в геометрии".into()).or_default() += 1;
-                *lost.entry(case).or_default() += pressure.vector * area * factor;
+                lost.entry(case).or_default().add(source.origin, centre, pressure.vector * area * factor);
                 continue;
             };
-            let positions = element(self.mesh, e).and_then(|el| positions(self.mesh, el));
-            let area = positions.as_ref().map_or(0., |p| polygon_area(&shell_ring(p))) * self.kept_fraction(e);
-            let centre = positions.as_ref().map_or(DVec3::ZERO, |p| p.iter().sum::<DVec3>() / p.len() as f64);
+            let (area, centre, _) = self.kept_part(e).unwrap_or((0., DVec3::ZERO, 0.));
             source.add(case, centre, pressure.vector * area * factor, DVec3::ZERO);
             by_surface.entry(s).or_default().push((e, pressure.vector, area));
         }

@@ -216,6 +216,64 @@ impl ShellIndex {
     }
 }
 
+/// The distinct edges of the shell elements by the cells of a grid (a line
+/// load along an element edge finds the edges on its line).
+struct EdgeIndex {
+    cell: f64,
+    edges: Vec<[usize; 2]>,
+    cells: std::collections::HashMap<[i64; 3], Vec<usize>>,
+}
+
+impl EdgeIndex {
+    fn new(mesh: &Mesh) -> Self {
+        let mut seen: std::collections::BTreeSet<(usize, usize)> = Default::default();
+        let mut edges = vec![];
+        for s in &mesh.shells {
+            for i in 0..s.nodes.len() {
+                let (a, b) = (s.nodes[i], s.nodes[(i + 1) % s.nodes.len()]);
+                if seen.insert((a.min(b), a.max(b))) {
+                    edges.push([a, b]);
+                }
+            }
+        }
+        let total: f64 = edges.iter().map(|e| point(mesh, e[0]).distance(point(mesh, e[1]))).sum();
+        let cell = if edges.is_empty() { 1. } else { (total / edges.len() as f64 * 2.).max(1e-3) };
+        let mut cells: std::collections::HashMap<[i64; 3], Vec<usize>> = Default::default();
+        for (i, e) in edges.iter().enumerate() {
+            let (a, b) = (point(mesh, e[0]), point(mesh, e[1]));
+            let (lo, hi) = (ShellIndex::key(cell, a.min(b)), ShellIndex::key(cell, a.max(b)));
+            for x in lo[0]..=hi[0] {
+                for y in lo[1]..=hi[1] {
+                    for z in lo[2]..=hi[2] {
+                        cells.entry([x, y, z]).or_default().push(i);
+                    }
+                }
+            }
+        }
+        EdgeIndex { cell, edges, cells }
+    }
+
+    /// The edges whose cells the segment `a`-`b` passes (a superset of those on it).
+    fn near(&self, a: DVec3, b: DVec3) -> Vec<[usize; 2]> {
+        let steps = ((a.distance(b) / (self.cell / 4.)).ceil() as usize).clamp(1, 1_000_000);
+        let mut found: std::collections::BTreeSet<usize> = Default::default();
+        for k in 0..=steps {
+            let p = a.lerp(b, k as f64 / steps as f64);
+            let key = ShellIndex::key(self.cell, p);
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(list) = self.cells.get(&[key[0] + dx, key[1] + dy, key[2] + dz]) {
+                            found.extend(list.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+        found.into_iter().map(|i| self.edges[i]).collect()
+    }
+}
+
 /// Carry `loads` (kN, m; the loads of `loads::transfer` without a combination)
 /// onto the mesh. `tolerance` is the distance within which a load line or
 /// point belongs to an element.
@@ -229,21 +287,7 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
         let c = shell.nodes.iter().map(|&n| point(mesh, n)).sum::<DVec3>() / shell.nodes.len() as f64;
         shells_of.entry(shell.surface).or_default().push((i, DVec2::from_array(plane.project(c.to_array()))));
     }
-    let mut edges_on_boundary: Vec<[usize; 2]> = vec![];
-    {
-        let mut count: BTreeMap<(usize, usize), usize> = BTreeMap::new();
-        for s in &mesh.shells {
-            for i in 0..s.nodes.len() {
-                let (a, b) = (s.nodes[i], s.nodes[(i + 1) % s.nodes.len()]);
-                *count.entry((a.min(b), a.max(b))).or_default() += 1;
-            }
-        }
-        edges_on_boundary.extend(count.into_iter().filter(|(_, n)| *n == 1).map(|((a, b), _)| [a, b]));
-    }
-    let shell_nodes: Vec<usize> = {
-        let set: std::collections::BTreeSet<usize> = mesh.shells.iter().flat_map(|s| s.nodes.iter().copied()).collect();
-        set.into_iter().collect()
-    };
+    let edge_index = EdgeIndex::new(mesh);
     let index = ShellIndex::new(mesh);
     for load in loads {
         match load {
@@ -263,6 +307,15 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                         .map(|r| Polygon::new(LineString::from(r.iter().map(|p| Coord { x: p.x, y: p.y }).collect::<Vec<_>>()), vec![]))
                         .collect(),
                 );
+                let all_convex = rings.iter().all(|r| {
+                    let n = r.len();
+                    let cross = |i: usize| {
+                        let (a, b, c) = (r[i], r[(i + 1) % n], r[(i + 2) % n]);
+                        (b - a).perp_dot(c - b)
+                    };
+                    let tol = 1e-12;
+                    (0..n).all(|i| cross(i) >= -tol) || (0..n).all(|i| cross(i) <= tol)
+                });
                 let mut found = false;
                 for &(shell, c) in shells_of.get(surface).map(Vec::as_slice).unwrap_or(&[]) {
                     let corners: Vec<DVec2> = mesh.shells[shell]
@@ -279,7 +332,12 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                     let centre_in = rings.iter().any(|r| inside(r, c));
                     // Whole inside (the pieces of the contour tile the region), else the exact part.
                     let mut nodal = false;
-                    let fraction = if flags.iter().all(|f| *f) && centre_in {
+                    // The element's own centre of area (the average of the corners is not).
+                    let element_centre = Polygon::new(LineString::from(corners.iter().map(|p| Coord { x: p.x, y: p.y }).collect::<Vec<_>>()), vec![])
+                        .centroid()
+                        .map_or(c, |p| DVec2::new(p.x(), p.y()));
+                    // All corners and the centre inside prove full coverage only for convex contours.
+                    let fraction = if flags.iter().all(|f| *f) && centre_in && all_convex {
                         1.
                     } else {
                         let element = Polygon::new(LineString::from(corners.iter().map(|p| Coord { x: p.x, y: p.y }).collect::<Vec<_>>()), vec![]);
@@ -287,13 +345,13 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                         let covered = element.intersection(&region);
                         let fraction = if area > 0. { (covered.unsigned_area() / area).clamp(0., 1.) } else { 0. };
                         // A constant pressure acts at the element centre: when the covered
-                        // part lies well off it (a small patch in a large element), the load
+                        // part lies off it (more than 1 % of the diagonal) (a small patch in a large element), the load
                         // goes to the nodes by the position of its centroid, which keeps the
                         // moment too.
                         if fraction > 1e-9 && fraction < 1. {
                             if let Some(centroid) = covered.centroid() {
                                 let diagonal = (hi - lo).length();
-                                if (DVec2::new(centroid.x(), centroid.y()) - c).length() > 0.1 * diagonal {
+                                if (DVec2::new(centroid.x(), centroid.y()) - element_centre).length() > 0.01 * diagonal {
                                     let at = DVec3::from_array(plane.lift([centroid.x(), centroid.y()]));
                                     if let Some(weights) = index.locate(mesh, at, tolerance.max(1e-6)) {
                                         let force = DVec3::from_array(*sigma) * covered.unsigned_area();
@@ -360,47 +418,37 @@ pub fn transfer(mesh: &Mesh, state: &State, loads: &[Load], tolerance: f64) -> M
                 if bars > 0 {
                     continue;
                 }
-                // Along a plate edge: the boundary nodes on the line take their share.
-                let mut chain: Vec<(f64, usize)> = vec![];
-                for e in &edges_on_boundary {
-                    for &n in e {
-                        let (d, t) = segment_distance(point(mesh, n), a, b);
-                        if d <= tolerance && !chain.iter().any(|x| x.1 == n) {
-                            chain.push((t, n));
-                        }
+                // Along plate edges (a free edge, a wall standing on a slab, the cut level of a
+                // tower): every edge on the line takes the part of the load over it, as
+                // consistent nodal forces of the linear load and the linear shape of the edge, which
+                // keep its force and its moment. What no edge lies under is lost.
+                let on_line = |n: usize| line_distance(point(mesh, n), a, b);
+                let mut covered = DVec3::ZERO;
+                for [m, n] in edge_index.near(a, b) {
+                    let ((dm, tm), (dn, tn)) = (on_line(m), on_line(n));
+                    if dm > tolerance || dn > tolerance || (tn - tm).abs() < 1e-12 {
+                        continue;
                     }
-                }
-                if chain.len() < 2 {
-                    // Not a free edge (a wall standing on a slab, the cut level of a tower):
-                    // the shell nodes along the line.
-                    chain.clear();
-                    for &n in &shell_nodes {
-                        let (d, t) = segment_distance(point(mesh, n), a, b);
-                        if d <= tolerance {
-                            chain.push((t, n));
-                        }
+                    let (lo, hi) = (tm.min(tn).max(0.), tm.max(tn).min(1.));
+                    if (hi - lo) * length < 1e-9 {
+                        continue;
                     }
+                    // Over [lo, hi] the load is qa + (qb - qa) t; shape of node m is (tn - t) / (tn - tm).
+                    let q = |t: f64| qa.lerp(qb, t);
+                    let (ql, qh) = (q(lo), q(hi));
+                    let width = (hi - lo) * length;
+                    let force = (ql + qh) / 2. * width;
+                    // ∫ q N_m dl with N_m = (tn - t)/(tn - tm): at the ends of the covered part.
+                    let (nl, nh) = ((tn - lo) / (tn - tm), (tn - hi) / (tn - tm));
+                    let on_m = width * (ql * (2. * nl + nh) + qh * (nl + 2. * nh)) / 6.;
+                    add_force(&mut out, *case, m, on_m, DVec3::ZERO);
+                    add_force(&mut out, *case, n, force - on_m, DVec3::ZERO);
+                    covered += force;
                 }
-                chain.sort_by(|x, y| x.0.total_cmp(&y.0));
-                if chain.len() < 2 {
-                    let f = (qa + qb) / 2. * length;
-                    *out.lost.entry(*case).or_default() = (DVec3::from_array(out.lost.get(case).copied().unwrap_or_default()) + f).to_array();
-                    continue;
-                }
-                // Trapezoidal weights of the nodes along the line, scaled to the resultant.
                 let resultant = (qa + qb) / 2. * length;
-                let mut shares: Vec<(usize, DVec3)> = vec![];
-                for w in chain.windows(2) {
-                    let (t0, t1) = (w[0].0, w[1].0);
-                    let q = qa + (qb - qa) * ((t0 + t1) / 2.);
-                    let f = q * ((t1 - t0) * length);
-                    shares.push((w[0].1, f / 2.));
-                    shares.push((w[1].1, f / 2.));
-                }
-                let total: DVec3 = shares.iter().map(|s| s.1).sum();
-                let scale = if total.length() > 1e-12 { resultant.length() / total.length() } else { 1. };
-                for (n, f) in shares {
-                    add_force(&mut out, *case, n, f * scale, DVec3::ZERO);
+                let missing = resultant - covered;
+                if missing.length() > 1e-9 * resultant.length().max(1e-12) {
+                    *out.lost.entry(*case).or_default() = (DVec3::from_array(out.lost.get(case).copied().unwrap_or_default()) + missing).to_array();
                 }
             }
             Load::Point { case, at, force, moment } => {

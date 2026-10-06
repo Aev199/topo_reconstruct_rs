@@ -538,7 +538,6 @@ impl Service {
             },
         );
         let on_mesh = crate::mesh_loads::transfer(&mesh, state, &loads, 0.02);
-        let resultants = on_mesh.resultants(&mesh);
         let exchange = crate::plaxis::exchange_materials(
             state,
             exchange_materials,

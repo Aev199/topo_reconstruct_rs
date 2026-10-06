@@ -569,6 +569,28 @@ an engineering approximation to be calibrated by the user.
 - Still unverified: real import into PLAXIS 3D 2022 and MIDAS Civil, comparison
   with an independent reference model (user side).
 
+### Re-audit of e8e4693: fixes R1–R7 (2026-10-06)
+
+- R1: centres of source loads, removed weight and stamps are centres of area
+  (`area_centroid`, signed fan), not the vertex average; for an element across
+  the cut level the source tally uses the centroid of the kept part
+  (`kept_part`), so the reference no longer shares the error of the export.
+- R2: a wall in `live_supports` needs a non-horizontal surface with an edge on its
+  line (the top edge of a deleted wall stays on the slab).
+- R3/R5: a line load along plate edges is carried by every edge on its line (grid
+  index of distinct shell edges) as consistent nodal forces of the linear load
+  over the covered part: partial and triangular loads keep force and moment;
+  what lies over no edge goes to `lost`.
+- R4: the whole-coverage shortcut of pressure patches applies to convex contours
+  only; concave ones use the exact intersection.
+- R6: a covered part more than 1 % of the diagonal off the element centre goes to
+  the nodes by its centroid (moment kept). Smaller offsets remain a constant
+  pressure (moment error ≤ 1 % of the diagonal × force).
+- R7: plates outside the geometry are tallied with force, moment, sum of |F| and
+  sum of |F||r| (`not_in_geometry_*`): a couple that sums to zero is a problem.
+- Known approximation: trapezoidal pressure on a plate replaced by its mean
+  (counted in `approximated`; its source tally is the same mean).
+
 Next (user's plan): MIDAS pipeline = every load except the
 self-weight as its own load case with the source contours (`combination:
 None` path of `transfer` gives that); (done: see above).

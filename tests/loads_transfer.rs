@@ -255,6 +255,9 @@ fn a_report_names_lost_force_and_lost_moment() {
         exported_moment,
         moment_scale: 200.,
         not_in_geometry: [0.; 3],
+        not_in_geometry_moment: [0.; 3],
+        not_in_geometry_abs: 0.,
+        not_in_geometry_scale: 0.,
     };
     let report = |c| Report { origin: [0.; 3], cases: vec![c], ..Default::default() };
     assert!(report(case([0., 0., -100.], [0., 50., 0.])).problems(FORCE_TOLERANCE, MOMENT_TOLERANCE).is_empty());
@@ -263,4 +266,53 @@ fn a_report_names_lost_force_and_lost_moment() {
     // Everything exported as zero while the source is not.
     assert_eq!(report(case([0.; 3], [0.; 3])).problems(FORCE_TOLERANCE, MOMENT_TOLERANCE).len(), 1);
     assert!(compare_resultants(([0.; 3], [0.; 3]), ([0.; 3], [0.; 3]), 0., 0.02, 0.05).is_none());
+}
+
+#[test]
+fn a_couple_on_plates_outside_the_geometry_is_a_problem_although_its_force_sums_to_zero() {
+    use topo_reconstruct_rs::loads::{CaseReport, Report, FORCE_TOLERANCE, MOMENT_TOLERANCE};
+    let case = CaseReport {
+        case: 1,
+        name: "PAIR".into(),
+        loads: 0,
+        source: [0.; 3],
+        exported: [0.; 3],
+        source_moment: [0.; 3],
+        exported_moment: [0.; 3],
+        moment_scale: 0.,
+        // +240 kN at x = -3 and -240 kN at x = 3: no force, M = 1440 kN m.
+        not_in_geometry: [0.; 3],
+        not_in_geometry_moment: [0., 1440., 0.],
+        not_in_geometry_abs: 480.,
+        not_in_geometry_scale: 1440.,
+    };
+    let report = Report { origin: [0.; 3], cases: vec![case], ..Default::default() };
+    assert_eq!(report.problems(FORCE_TOLERANCE, MOMENT_TOLERANCE).len(), 1);
+}
+
+/// Two quads tiling 6 x 2 m: the left one is oblique, (0,0) (4,0) (1,2) (0,2).
+fn oblique(second_loaded: bool) -> String {
+    let rows = if second_loaded { "1 16 3 1 1 /\n2 16 3 1 1 /\n" } else { "1 16 3 1 1 /\n" };
+    format!(
+        "( 0/ 1; OBLIQUE/ 2; 5/\n39;\n1: P ;\n/\n)\n( 1/\n41 1 1 2 5 4 /\n41 1 2 3 6 5 /\n)\n\
+         ( 3/\n1 GEI 0.305915 0.17 0.2 RO 0.254929 /\n)\n( 4/\n0 0 0 /\n4 0 0 /\n6 0 0 /\n0 2 0 /\n1 2 0 /\n6 2 0 /\n)\n\
+         ( 6/\n{rows})\n( 7/\n1 2 0 /\n)\n"
+    )
+}
+
+#[test]
+fn the_centre_of_an_oblique_quad_is_its_centre_of_area() {
+    // 2 tf/m2 on 5 m2: 100 kN at the centre of area (1.4, 0.8), not at the corner average (1.25, 1).
+    let exact = DVec3::new(1.4, 0.8, 0.);
+    for combine in [false, true] {
+        let text = oblique(false);
+        let combination = combine.then(|| loads::Combination { factors: [(1, 1.)].into_iter().collect(), simplify: Some(loads::Simplify::default()) });
+        let (list, report) = run_with(&text, if combine { "obl_c" } else { "obl" }, combination);
+        let c = &report.cases[0];
+        let force = DVec3::new(0., 0., -100.);
+        let expected = (exact - DVec3::from_array(report.origin)).cross(force);
+        assert!(near(c.source_moment, expected.to_array(), 1e-6), "{combine}: {:?} vs {expected:?}", c.source_moment);
+        assert!(near(c.exported_moment, expected.to_array(), 1e-6), "{combine}: {c:?} {list:?}");
+        assert!(report.problems(loads::FORCE_TOLERANCE, loads::MOMENT_TOLERANCE).is_empty());
+    }
 }

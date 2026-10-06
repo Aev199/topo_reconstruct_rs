@@ -514,7 +514,12 @@ pub fn live_supports(state: &State) -> (Vec<(DVec3, DVec3, u32)>, Vec<(DVec3, u3
     let vertices = model.vertices();
     let tol = (model.precision() * 10.).max(1e-6);
     let mut lines = vec![];
-    let used: Vec<usize> = (0..model.surfaces().len()).flat_map(|s| model.surface_edges(s).collect::<Vec<_>>()).collect();
+    // A wall stands while a surface that is not a floor (its plane is not horizontal) has an edge
+    // on its line: the top edge of a deleted wall stays on the slab above it, and is no wall.
+    let used: Vec<usize> = (0..model.surfaces().len())
+        .filter(|&s| model.planes()[model.surfaces()[s].plane].normal()[2].abs() < 0.7)
+        .flat_map(|s| model.surface_edges(s).collect::<Vec<_>>())
+        .collect();
     for w in &cut.walls {
         let (Some(a), Some(b)) = (vertices.get(w.a), vertices.get(w.b)) else { continue };
         let (a, b) = (DVec3::from_array(*a), DVec3::from_array(*b));

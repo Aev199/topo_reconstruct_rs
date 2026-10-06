@@ -321,3 +321,77 @@ fn supports_follow_the_live_geometry_after_edits() {
     // The wall is still there.
     assert_eq!(live_supports(s.state()).0.len(), 1);
 }
+
+#[test]
+fn a_deleted_wall_is_no_support_even_though_its_top_edge_stays_on_the_slab() {
+    use topo_reconstruct_rs::reconstruction::assembly::cutoff::live_supports;
+    let mut s = session();
+    s.apply(Edit::CutAbove { z: 3. }, "cut").unwrap();
+    assert_eq!(live_supports(s.state()).0.len(), 1);
+    let model = &s.state().model;
+    let wall = (0..model.surfaces().len())
+        .find(|&i| model.planes()[model.surfaces()[i].plane].normal()[2].abs() < 0.5)
+        .expect("the wall");
+    s.apply(Edit::DeleteSurface { surface: wall }, "delete").unwrap();
+    assert!(live_supports(s.state()).0.is_empty(), "{:?}", live_supports(s.state()).0);
+}
+
+fn mesh_resultant(loads: Vec<topo_reconstruct_rs::loads::Load>) -> (glam::DVec3, glam::DVec3, f64, topo_reconstruct_rs::mesh_loads::MeshLoads) {
+    use glam::DVec3;
+    use topo_reconstruct_rs::mesh_loads;
+    let s = session();
+    let (mesh, _) = slab_mesh(&s);
+    let on_mesh = mesh_loads::transfer(&mesh, s.state(), &loads, 0.02);
+    let (f, m, scale) = on_mesh.resultants_about(&mesh, DVec3::ZERO).values().next().copied().unwrap_or_default();
+    (f, m, scale, on_mesh)
+}
+
+#[test]
+fn a_load_over_part_of_a_plate_edge_keeps_force_and_moment() {
+    use glam::DVec3;
+    use topo_reconstruct_rs::loads::Load;
+    // Edge y = 0 of the one 6 x 4 element: 10 kN/m over x = 1.5 .. 4.5 only.
+    let (f, m, scale, on_mesh) = mesh_resultant(vec![Load::Line { case: 1, start: [1.5, 0., 0.], end: [4.5, 0., 0.], q_start: [0., 0., -10.], q_end: [0., 0., -10.] }]);
+    assert!(on_mesh.lost.is_empty(), "{:?}", on_mesh.lost);
+    assert!((f - DVec3::new(0., 0., -30.)).length() < 1e-9, "{f:?}");
+    assert!((m - DVec3::new(0., 90., 0.)).length() < 1e-9 * scale.max(1.), "{m:?}");
+}
+
+#[test]
+fn a_triangular_edge_load_keeps_its_moment() {
+    use glam::DVec3;
+    use topo_reconstruct_rs::loads::Load;
+    // q = -2 x along the whole edge: F = -36, M_y = 144.
+    let (f, m, _, _) = mesh_resultant(vec![Load::Line { case: 1, start: [0., 0., 0.], end: [6., 0., 0.], q_start: [0., 0., 0.], q_end: [0., 0., -12.] }]);
+    assert!((f - DVec3::new(0., 0., -36.)).length() < 1e-9, "{f:?}");
+    assert!((m - DVec3::new(0., 144., 0.)).length() < 1e-9, "{m:?}");
+}
+
+#[test]
+fn a_concave_contour_does_not_cover_what_its_notch_leaves_free() {
+    use glam::DVec3;
+    use topo_reconstruct_rs::loads::Load;
+    let s = session();
+    let (_, surface) = slab_mesh(&s);
+    // The slab (6 x 4) under 10 kN/m2 except a notch x 2.5 .. 3.5, y 2.5 .. 4 (1.5 m2) entering from the edge.
+    let ring = [[-1., -1., 0.], [7., -1., 0.], [7., 5., 0.], [3.5, 5., 0.], [3.5, 2.5, 0.], [2.5, 2.5, 0.], [2.5, 5., 0.], [-1., 5., 0.]];
+    let (f, m, scale, _) = mesh_resultant(vec![Load::Surface { case: 1, surface, polygons: vec![ring.to_vec()], sigma: [0., 0., -10.] }]);
+    assert!((f - DVec3::new(0., 0., -225.)).length() < 1e-6, "{f:?}");
+    // First moments: (67.5, 43.125) m3.
+    assert!((m - DVec3::new(-431.25, 675., 0.)).length() < 1e-6 * scale.max(1.), "{m:?}");
+}
+
+#[test]
+fn a_patch_a_little_off_the_centre_still_keeps_its_moment() {
+    use glam::DVec3;
+    use topo_reconstruct_rs::loads::Load;
+    let s = session();
+    let (_, surface) = slab_mesh(&s);
+    // x = 0 .. 5.7 of the 6 x 4 element: the centroid is 0.15 m off its centre.
+    let ring = vec![[0., 0., 0.], [5.7, 0., 0.], [5.7, 4., 0.], [0., 4., 0.]];
+    let (f, m, _, _) = mesh_resultant(vec![Load::Surface { case: 1, surface, polygons: vec![ring], sigma: [0., 0., -10.] }]);
+    let area = 5.7 * 4.;
+    assert!((f.z + 10. * area).abs() < 1e-5, "{f:?}");
+    // M = r x F: M_x = y F = 2 (-10 A), M_y = -x F = 2.85 (10 A).
+    assert!((m - DVec3::new(-20. * area, 28.5 * area, 0.)).length() < 1e-5, "{m:?}");
+}
